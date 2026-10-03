@@ -1,0 +1,22 @@
+services:
+  ai-route:
+    build:
+      context: .
+      args:
+        # 国内构建可改为 https://goproxy.cn,direct
+        GOPROXY: https://proxy.golang.org,direct
+    image: ai-route:latest
+    container_name: ai-route
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?请在 .env 中设置 ADMIN_TOKEN}
+      TZ: Asia/Shanghai
+      # 需要走代理访问上游时：
+      # HTTPS_PROXY: http://host.docker.internal:7890
+    volumes:
+      - ai-route-data:/data
+
+volumes:
+  ai-route-data:

@@ -1,0 +1,840 @@
+// Package gateway serves the OpenAI / Anthropic compatible endpoints and
+// routes each request through a public model's ordered list of targets,
+// falling back to the next target when one fails.
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"ai-route/internal/convert"
+	"ai-route/internal/store"
+)
+
+const maxBodyBytes = 64 << 20
+
+type Gateway struct {
+	store   *store.Store
+	Breaker *Breaker
+	client  *http.Client
+
+	touchMu sync.Mutex
+	touched map[int64]time.Time
+}
+
+func New(s *store.Store) *Gateway {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	return &Gateway{
+		store:   s,
+		Breaker: NewBreaker(s.GetSettings),
+		client:  &http.Client{Transport: transport},
+		touched: map[int64]time.Time{},
+	}
+}
+
+// Register mounts the public API routes.
+func (g *Gateway) Register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		g.handle(w, r, convert.ProtoOpenAI)
+	})
+	mux.HandleFunc("POST /chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		g.handle(w, r, convert.ProtoOpenAI)
+	})
+	mux.HandleFunc("POST /v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		g.handle(w, r, convert.ProtoAnthropic)
+	})
+	mux.HandleFunc("POST /v1/messages/count_tokens", g.countTokens)
+	mux.HandleFunc("POST /v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		g.handle(w, r, convert.ProtoEmbeddings)
+	})
+	mux.HandleFunc("POST /embeddings", func(w http.ResponseWriter, r *http.Request) {
+		g.handle(w, r, convert.ProtoEmbeddings)
+	})
+	mux.HandleFunc("GET /v1/models", g.listModels)
+	mux.HandleFunc("GET /models", g.listModels)
+}
+
+// ---------- auth ----------
+
+func clientKey(r *http.Request) string {
+	if k := r.Header.Get("x-api-key"); k != "" {
+		return strings.TrimSpace(k)
+	}
+	auth := r.Header.Get("Authorization")
+	if len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+func (g *Gateway) authenticate(r *http.Request, snap *store.Snapshot) (*store.APIKey, int, string) {
+	raw := clientKey(r)
+	if raw == "" {
+		return nil, http.StatusUnauthorized, "missing API key"
+	}
+	k, ok := snap.Keys[raw]
+	if !ok || !k.Enabled {
+		return nil, http.StatusUnauthorized, "invalid API key"
+	}
+	if k.ExpiresAt > 0 && time.Now().UnixMilli() > k.ExpiresAt {
+		return nil, http.StatusUnauthorized, "API key expired"
+	}
+	g.touch(k.ID)
+	return k, 0, ""
+}
+
+func (g *Gateway) touch(id int64) {
+	g.touchMu.Lock()
+	last := g.touched[id]
+	if time.Since(last) < time.Minute {
+		g.touchMu.Unlock()
+		return
+	}
+	g.touched[id] = time.Now()
+	g.touchMu.Unlock()
+	go g.store.TouchKey(id)
+}
+
+func keyAllows(k *store.APIKey, model string) bool {
+	if k == nil || len(k.AllowedModels) == 0 {
+		return true
+	}
+	for _, m := range k.AllowedModels {
+		if m == model {
+			return true
+		}
+	}
+	return false
+}
+
+func writeError(w http.ResponseWriter, proto string, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(convert.ErrorBody(proto, status, msg))
+}
+
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ip, _, _ := strings.Cut(xff, ",")
+		return strings.TrimSpace(ip)
+	}
+	if xr := r.Header.Get("X-Real-IP"); xr != "" {
+		return xr
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// ---------- routing ----------
+
+type candidate struct {
+	target   string // prefix/model
+	prefix   string
+	model    string
+	provider *store.Provider
+	proto    string
+	openTill time.Time
+}
+
+func splitTarget(t string) (string, string) {
+	prefix, model, _ := strings.Cut(t, "/")
+	return prefix, model
+}
+
+// chooseProtocol picks the upstream protocol; "" means the provider cannot
+// serve this kind of request (embeddings need an OpenAI endpoint).
+func chooseProtocol(p *store.Provider, model, inbound string) string {
+	if inbound == convert.ProtoEmbeddings {
+		if p.OpenAIBaseURL == "" {
+			return ""
+		}
+		return convert.ProtoEmbeddings
+	}
+	if f := p.ForcedProtocol(model); f != "" {
+		return f
+	}
+	if inbound == convert.ProtoOpenAI && p.OpenAIBaseURL != "" || inbound == convert.ProtoAnthropic && p.AnthropicBaseURL != "" {
+		return inbound
+	}
+	if p.OpenAIBaseURL != "" {
+		return convert.ProtoOpenAI
+	}
+	return convert.ProtoAnthropic
+}
+
+// plan orders the targets: healthy ones in configured order, then cooled-down
+// ones (soonest recovery first) as a last resort.
+func (g *Gateway) plan(snap *store.Snapshot, m *store.Model, inbound string) []candidate {
+	var healthy, cooling []candidate
+	for _, t := range m.Targets {
+		prefix, model := splitTarget(t)
+		p, ok := snap.Providers[prefix]
+		if !ok || !p.Enabled {
+			continue
+		}
+		c := candidate{target: t, prefix: prefix, model: model, provider: p, proto: chooseProtocol(p, model, inbound)}
+		if c.proto == "" {
+			continue
+		}
+		c.openTill = g.Breaker.OpenUntil(prefix, t)
+		if c.openTill.IsZero() {
+			healthy = append(healthy, c)
+		} else {
+			cooling = append(cooling, c)
+		}
+	}
+	sort.SliceStable(cooling, func(i, j int) bool { return cooling[i].openTill.Before(cooling[j].openTill) })
+	return append(healthy, cooling...)
+}
+
+func (g *Gateway) handle(w http.ResponseWriter, r *http.Request, inbound string) {
+	snap := g.store.Snapshot()
+	key, status, msg := g.authenticate(r, snap)
+	if key == nil {
+		writeError(w, inbound, status, msg)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		writeError(w, inbound, http.StatusBadRequest, "failed to read body: "+err.Error())
+		return
+	}
+	if len(body) > maxBodyBytes {
+		writeError(w, inbound, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	g.route(w, r, inbound, body, key)
+}
+
+// route resolves the public model and tries its targets in order.
+func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, body []byte, key *store.APIKey) (entry *store.RequestLog) {
+	start := time.Now()
+	snap := g.store.Snapshot()
+	entry = &store.RequestLog{
+		CreatedAt: start.UnixMilli(),
+		KeyID:     key.ID,
+		KeyName:   key.Name,
+		Inbound:   inbound,
+		ClientIP:  clientIP(r),
+	}
+	defer func() {
+		entry.LatencyMs = time.Since(start).Milliseconds()
+		g.store.AddLog(entry)
+	}()
+
+	info, err := convert.ParseRequestInfo(body)
+	if err != nil {
+		entry.HTTPStatus, entry.Error = 400, "invalid JSON body"
+		writeError(w, inbound, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if inbound == convert.ProtoEmbeddings {
+		info.Stream = false
+	}
+	entry.RequestedModel, entry.Stream = info.Model, info.Stream
+	m := snap.ResolveModel(info.Model)
+	if m == nil {
+		entry.HTTPStatus, entry.Error = 404, "model not found"
+		writeError(w, inbound, http.StatusNotFound, fmt.Sprintf("model %q is not configured on this gateway", info.Model))
+		return
+	}
+	entry.PublicModel = m.Name
+	if !keyAllows(key, m.Name) {
+		entry.HTTPStatus, entry.Error = 403, "model not allowed for key"
+		writeError(w, inbound, http.StatusForbidden, fmt.Sprintf("this API key may not use model %q", m.Name))
+		return
+	}
+	cands := g.plan(snap, m, inbound)
+	if len(cands) == 0 {
+		entry.HTTPStatus, entry.Error = 503, "no enabled targets"
+		writeError(w, inbound, http.StatusServiceUnavailable, fmt.Sprintf("model %q has no enabled upstream targets", m.Name))
+		return
+	}
+
+	lastStatus, lastMsg := http.StatusBadGateway, ""
+	st := snap.Settings
+	for i, c := range cands {
+		var res tryResult
+		// transient errors are retried on the same target before switching,
+		// so a network blip doesn't move the conversation to another plan
+		// (losing its prompt cache). Cooling targets get a single shot.
+		maxRetries := st.MaxRetries
+		if !c.openTill.IsZero() {
+			maxRetries = 0
+		}
+		for retry := 0; ; retry++ {
+			res = g.try(r.Context(), w, r, c, inbound, body, info.Stream, m.Name, st)
+			res.attempt.Cooling = !c.openTill.IsZero()
+			res.attempt.Retry = retry
+			entry.Attempts = append(entry.Attempts, res.attempt)
+			if res.committed || res.clientGone || !res.retryable || retry >= maxRetries {
+				break
+			}
+			delay := time.Duration(st.RetryBackoffMs) * time.Millisecond << retry
+			if res.retryAfter > delay {
+				delay = res.retryAfter
+			}
+			log.Printf("[%s] target %s failed (%d), retry %d/%d in %s: %s", m.Name, c.target, res.attempt.HTTPStatus, retry+1, maxRetries, delay, truncate(res.attempt.Error, 200))
+			if !sleepCtx(r.Context(), delay) {
+				res.clientGone = true
+				break
+			}
+		}
+		if res.clientGone {
+			entry.HTTPStatus, entry.Error = 499, "client disconnected"
+			entry.Provider, entry.UpstreamModel, entry.UpstreamProtocol = c.prefix, c.model, c.proto
+			return
+		}
+		if res.committed {
+			entry.Provider, entry.UpstreamModel, entry.UpstreamProtocol = c.prefix, c.model, c.proto
+			entry.Success = res.streamErr == ""
+			entry.HTTPStatus = 200
+			entry.Error = res.streamErr
+			if res.aborted && entry.Error == "" {
+				entry.Error = "client disconnected mid-stream"
+			}
+			entry.TTFBMs = res.ttfb
+			entry.InputTokens, entry.OutputTokens, entry.CachedTokens = res.usage.Input, res.usage.Output, res.usage.Cached
+			entry.Fallback = i > 0
+			if res.streamErr == "" {
+				g.Breaker.Success(c.prefix, c.target)
+			} else {
+				g.Breaker.Failure(c.prefix, c.target, failSoft, 0, res.streamErr)
+			}
+			return
+		}
+		g.Breaker.Failure(c.prefix, c.target, res.kind, res.retryAfter, res.attempt.Error)
+		lastStatus, lastMsg = res.attempt.HTTPStatus, res.attempt.Error
+		log.Printf("[%s] target %s failed (%d): %s", m.Name, c.target, res.attempt.HTTPStatus, truncate(res.attempt.Error, 200))
+	}
+	if lastStatus < 400 {
+		lastStatus = http.StatusBadGateway
+	}
+	var parts []string
+	for _, a := range entry.Attempts {
+		parts = append(parts, fmt.Sprintf("%s: %s", a.Target, truncate(a.Error, 300)))
+	}
+	entry.HTTPStatus = lastStatus
+	entry.Error = lastMsg
+	writeError(w, inbound, lastStatus, "all upstream targets failed: "+strings.Join(parts, " | "))
+	return entry
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// maxRetryAfter is the longest Retry-After we wait for on the same target;
+// longer waits mean the plan is exhausted, so we switch instead.
+const maxRetryAfter = 10 * time.Second
+
+func retryableStatus(status int, retryAfter time.Duration) bool {
+	switch status {
+	case 408, 500, 502, 503, 504, 520, 522, 524, 529:
+		return true
+	case 429:
+		return retryAfter <= maxRetryAfter
+	}
+	return false
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// ---------- one upstream attempt ----------
+
+type tryResult struct {
+	committed  bool // response (or stream) was sent to the client
+	clientGone bool // client went away before anything was committed
+	retryable  bool // transient failure worth retrying on the same target
+	aborted    bool // client went away after the stream was committed
+	attempt    store.Attempt
+	kind       failKind
+	retryAfter time.Duration
+	usage      convert.Usage
+	ttfb       int64
+	streamErr  string // error after the stream was committed
+}
+
+func openaiURL(base string) string {
+	if strings.HasSuffix(base, "/chat/completions") {
+		return base
+	}
+	return base + "/chat/completions"
+}
+
+func embeddingsURL(base string) string {
+	if strings.HasSuffix(base, "/embeddings") {
+		return base
+	}
+	return strings.TrimSuffix(base, "/chat/completions") + "/embeddings"
+}
+
+func anthropicURL(base string) string {
+	switch {
+	case strings.HasSuffix(base, "/messages"):
+		return base
+	case strings.HasSuffix(base, "/v1"):
+		return base + "/messages"
+	default:
+		return base + "/v1/messages"
+	}
+}
+
+// buildUpstream converts the client body for the candidate and creates the request.
+func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound string, body []byte, st store.Settings, path string) (*http.Request, bool, error) {
+	var upBody []byte
+	var err error
+	clientUsage := false
+	switch {
+	case c.proto == inbound:
+		upBody, clientUsage, err = convert.RewriteModel(body, c.model, c.proto)
+	case inbound == convert.ProtoOpenAI:
+		upBody, err = convert.OpenAIToAnthropicRequest(body, c.model, st.DefaultMaxTokens)
+		clientUsage = convert.ClientWantsUsage(body)
+	default:
+		upBody, err = convert.AnthropicToOpenAIRequest(body, c.model)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var url string
+	switch c.proto {
+	case convert.ProtoEmbeddings:
+		url = embeddingsURL(c.provider.OpenAIBaseURL)
+	case convert.ProtoOpenAI:
+		url = openaiURL(c.provider.OpenAIBaseURL)
+	default:
+		url = anthropicURL(c.provider.AnthropicBaseURL)
+		if path != "" {
+			url = strings.TrimSuffix(url, "/messages") + path
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(upBody)))
+	if err != nil {
+		return nil, false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	clientUA := ""
+	if r != nil {
+		clientUA = r.Header.Get("User-Agent")
+	}
+	req.Header.Set("User-Agent", upstreamUA(c.provider, clientUA))
+	if c.proto == convert.ProtoAnthropic {
+		req.Header.Set("x-api-key", c.provider.APIKey)
+		req.Header.Set("Authorization", "Bearer "+c.provider.APIKey)
+		ver := ""
+		if r != nil && inbound == convert.ProtoAnthropic {
+			ver = r.Header.Get("anthropic-version")
+			if beta := r.Header.Get("anthropic-beta"); beta != "" {
+				req.Header.Set("anthropic-beta", beta)
+			}
+		}
+		if ver == "" {
+			ver = "2023-06-01"
+		}
+		req.Header.Set("anthropic-version", ver)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+c.provider.APIKey)
+	}
+	for k, v := range c.provider.Headers {
+		if v == "" {
+			req.Header.Del(k)
+		} else {
+			req.Header.Set(k, v)
+		}
+	}
+	return req, clientUsage, nil
+}
+
+// defaultUA is sent when neither the client nor the provider supplies one.
+const defaultUA = "ai-route/1.0"
+
+// upstreamUA applies the provider's User-Agent policy. Some plans only
+// accept specific clients, so by default the real client UA is forwarded.
+func upstreamUA(p *store.Provider, clientUA string) string {
+	if p.UAMode == "override" && p.UserAgent != "" {
+		return p.UserAgent
+	}
+	if clientUA != "" {
+		return clientUA
+	}
+	if p.UserAgent != "" {
+		return p.UserAgent
+	}
+	return defaultUA
+}
+
+func parseRetryAfter(h string) time.Duration {
+	if h == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(h)); err == nil {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		return time.Until(t)
+	}
+	return 0
+}
+
+func upstreamErrorMessage(body []byte) string {
+	var e struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+		Msg     string          `json:"msg"`
+	}
+	if json.Unmarshal(body, &e) == nil {
+		if !isNullOrEmpty(e.Error) {
+			var inner struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(e.Error, &inner) == nil && inner.Message != "" {
+				return inner.Message
+			}
+			return string(e.Error)
+		}
+		if e.Message != "" {
+			return e.Message
+		}
+		if e.Msg != "" {
+			return e.Msg
+		}
+	}
+	return strings.TrimSpace(string(body))
+}
+
+func isNullOrEmpty(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return s == "" || s == "null"
+}
+
+func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Request, c candidate, inbound string, body []byte, stream bool, publicModel string, st store.Settings) (res tryResult) {
+	start := time.Now()
+	res.attempt = store.Attempt{Target: c.target, Protocol: c.proto}
+	defer func() { res.attempt.LatencyMs = time.Since(start).Milliseconds() }()
+
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	timeout := time.Duration(c.provider.TimeoutSeconds) * time.Second
+	timedOut := false
+	var timerMu sync.Mutex
+	timer := time.AfterFunc(timeout, func() {
+		timerMu.Lock()
+		timedOut = true
+		timerMu.Unlock()
+		cancel()
+	})
+	defer timer.Stop()
+	isTimeout := func() bool { timerMu.Lock(); defer timerMu.Unlock(); return timedOut }
+
+	fail := func(status int, kind failKind, msg string) tryResult {
+		res.attempt.HTTPStatus = status
+		res.attempt.Error = msg
+		res.kind = kind
+		return res
+	}
+	netFail := func(err error) tryResult {
+		if parent.Err() != nil {
+			res.clientGone = true
+			res.attempt.Error = "client disconnected"
+			return res
+		}
+		if isTimeout() {
+			// we already waited the full timeout: switch rather than wait again
+			return fail(504, failSoft, fmt.Sprintf("timeout after %s", timeout))
+		}
+		res.retryable = true
+		return fail(502, failSoft, err.Error())
+	}
+
+	req, clientUsage, err := buildUpstream(ctx, r, c, inbound, body, st, "")
+	if err != nil {
+		return fail(400, failIgnore, "build request: "+err.Error())
+	}
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return netFail(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		res.retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+		res.retryable = retryableStatus(resp.StatusCode, res.retryAfter)
+		msg := fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(upstreamErrorMessage(b), 1000))
+		if resp.StatusCode == 404 || resp.StatusCode == 405 {
+			// usually a wrong base URL (e.g. missing /v1): show what we called
+			msg += " (POST " + req.URL.String() + ")"
+		}
+		return fail(resp.StatusCode, classifyStatus(resp.StatusCode), msg)
+	}
+	res.attempt.HTTPStatus = resp.StatusCode
+
+	if !stream {
+		b, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		if err != nil {
+			return netFail(err)
+		}
+		if err := convert.ValidateResponse(b, c.proto); err != nil {
+			res.retryable = true
+			return fail(502, failSoft, err.Error())
+		}
+		var out []byte
+		switch {
+		case c.proto == inbound:
+			out, res.usage = b, convert.ExtractUsage(b, c.proto)
+		case inbound == convert.ProtoOpenAI:
+			out, res.usage, err = convert.AnthropicToOpenAIResponse(b, publicModel)
+		default:
+			out, res.usage, err = convert.OpenAIToAnthropicResponse(b, publicModel)
+		}
+		if err != nil {
+			return fail(502, failSoft, "convert response: "+err.Error())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Route-Target", c.target)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(out)
+		res.committed = true
+		res.ttfb = time.Since(start).Milliseconds()
+		return res
+	}
+
+	// streaming: peek the first event before committing so that an upstream
+	// that fails right away can still be replaced by the next target.
+	reader := convert.NewSSEReader(resp.Body)
+	first, err := reader.Next()
+	if err != nil {
+		res.retryable = true
+		if errors.Is(err, io.EOF) {
+			raw := strings.TrimSpace(reader.Raw.String())
+			if raw != "" {
+				return fail(502, failSoft, "non-SSE response: "+truncate(upstreamErrorMessage([]byte(raw)), 1000))
+			}
+			return fail(502, failSoft, "empty stream")
+		}
+		return netFail(err)
+	}
+	if msg, isErr := convert.StreamErrorMessage(first, c.proto); isErr {
+		res.retryable = true
+		return fail(502, failSoft, "stream error: "+msg)
+	}
+
+	var conv convert.StreamConverter
+	switch {
+	case c.proto == inbound && inbound == convert.ProtoOpenAI:
+		conv = convert.NewOpenAIPassthrough(clientUsage)
+	case c.proto == inbound:
+		conv = convert.NewAnthropicPassthrough()
+	case inbound == convert.ProtoOpenAI:
+		conv = convert.NewAnthropicToOpenAIStream(publicModel, clientUsage)
+	default:
+		conv = convert.NewOpenAIToAnthropicStream(publicModel)
+	}
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	h.Set("X-Route-Target", c.target)
+	w.WriteHeader(http.StatusOK)
+	res.committed = true
+	res.ttfb = time.Since(start).Milliseconds()
+	rc := http.NewResponseController(w)
+
+	emit := func(evs []convert.SSEEvent) bool {
+		for _, e := range evs {
+			if err := convert.WriteSSE(w, e); err != nil {
+				return false
+			}
+		}
+		if len(evs) > 0 {
+			_ = rc.Flush()
+		}
+		return true
+	}
+
+	ev := first
+	for {
+		if !emit(conv.Process(ev)) {
+			res.aborted = true
+			break
+		}
+		timer.Reset(timeout) // idle timeout while waiting for the upstream
+		ev, err = reader.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if conv.Complete() || conv.Err() != "" {
+					emit(conv.Finish())
+				} else {
+					res.streamErr = "upstream stream ended before completion"
+					emit(streamErrorEvents(inbound, res.streamErr))
+				}
+			} else if parent.Err() != nil {
+				res.aborted = true
+			} else {
+				if isTimeout() {
+					res.streamErr = fmt.Sprintf("stream idle timeout after %s", timeout)
+				} else {
+					res.streamErr = "stream interrupted: " + err.Error()
+				}
+				emit(streamErrorEvents(inbound, res.streamErr))
+			}
+			break
+		}
+	}
+	res.usage = conv.Usage()
+	if res.streamErr == "" && conv.Err() != "" {
+		res.streamErr = "upstream stream error: " + conv.Err()
+	}
+	return res
+}
+
+func streamErrorEvents(proto, msg string) []convert.SSEEvent {
+	if proto == convert.ProtoAnthropic {
+		b, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": msg}})
+		return []convert.SSEEvent{{Event: "error", Data: string(b)}}
+	}
+	b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": "server_error"}})
+	return []convert.SSEEvent{{Data: string(b)}, {Data: "[DONE]"}}
+}
+
+// ---------- models & count_tokens ----------
+
+func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
+	snap := g.store.Snapshot()
+	proto := convert.ProtoOpenAI
+	if r.Header.Get("anthropic-version") != "" {
+		proto = convert.ProtoAnthropic
+	}
+	key, status, msg := g.authenticate(r, snap)
+	if key == nil {
+		writeError(w, proto, status, msg)
+		return
+	}
+	var data []map[string]any
+	for _, m := range snap.Models {
+		if !m.Enabled || !keyAllows(key, m.Name) {
+			continue
+		}
+		if proto == convert.ProtoAnthropic {
+			data = append(data, map[string]any{
+				"type": "model", "id": m.Name, "display_name": m.Name,
+				"created_at":  time.UnixMilli(m.CreatedAt).UTC().Format(time.RFC3339),
+				"tags":        m.Tags,
+				"description": m.Description,
+			})
+		} else {
+			// tags / description are extensions; OpenAI clients ignore them
+			data = append(data, map[string]any{
+				"id": m.Name, "object": "model", "created": m.CreatedAt / 1000, "owned_by": "ai-route",
+				"tags": m.Tags, "description": m.Description,
+			})
+		}
+	}
+	if data == nil {
+		data = []map[string]any{}
+	}
+	var out map[string]any
+	if proto == convert.ProtoAnthropic {
+		out = map[string]any{"data": data, "has_more": false}
+		if len(data) > 0 {
+			out["first_id"], out["last_id"] = data[0]["id"], data[len(data)-1]["id"]
+		}
+	} else {
+		out = map[string]any{"object": "list", "data": data}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// countTokens forwards to the first healthy Anthropic-capable target and
+// falls back to a rough local estimate.
+func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
+	snap := g.store.Snapshot()
+	key, status, msg := g.authenticate(r, snap)
+	if key == nil {
+		writeError(w, convert.ProtoAnthropic, status, msg)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	if err != nil {
+		writeError(w, convert.ProtoAnthropic, 400, err.Error())
+		return
+	}
+	info, _ := convert.ParseRequestInfo(body)
+	if m := snap.ResolveModel(info.Model); m != nil && keyAllows(key, m.Name) {
+		for _, c := range g.plan(snap, m, convert.ProtoAnthropic) {
+			if c.proto != convert.ProtoAnthropic || !c.openTill.IsZero() {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+			req, _, err := buildUpstream(ctx, r, c, convert.ProtoAnthropic, body, snap.Settings, "/messages/count_tokens")
+			if err == nil {
+				resp, err := g.client.Do(req)
+				if err == nil {
+					b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					resp.Body.Close()
+					if resp.StatusCode == 200 && strings.Contains(string(b), "input_tokens") {
+						cancel()
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write(b)
+						return
+					}
+				}
+			}
+			cancel()
+			break
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": estimateTokens(body)})
+}
+
+func estimateTokens(body []byte) int {
+	n := 0
+	for _, r := range string(body) {
+		if r > 0x2E80 {
+			n += 3 // CJK: roughly one token per char
+		} else {
+			n++
+		}
+	}
+	return n/4 + 1
+}
