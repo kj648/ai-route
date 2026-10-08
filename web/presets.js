@@ -13,6 +13,7 @@
 //   protocols  per-model protocol overrides (glob -> openai|anthropic)
 //   headers    extra request headers the vendor asks for
 //   ua         { mode: 'passthrough'|'override', value, note }
+//   currency   currency the vendor bills in (default CNY), used for unit prices
 //   verified   false = not fully confirmed from official docs
 //
 // Sources: vendor docs and the cc-switch preset files (checked 2026-10).
@@ -36,7 +37,7 @@ const PRESETS = [
     ua: { mode: 'passthrough', note: '只放行编码工具（实测 claude-cli、claude-code、Kilo-Code 可用）；官方禁止篡改 User-Agent，违者可能暂停权益。请保持“透传客户端”。' },
   },
   {
-    id: 'kimi-code-global', name: 'Kimi Code（海外）', category: 'coding', prefix: 'kimi-intl', keywords: 'moonshot kimi global international',
+    id: 'kimi-code-global', currency: 'USD', name: 'Kimi Code（海外）', category: 'coding', prefix: 'kimi-intl', keywords: 'moonshot kimi global international',
     openai: 'https://api.kimi.ai/coding/v1', anthropic: 'https://api.kimi.ai/coding',
     models: ['k3', 'k3-256k', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
     docs: 'https://www.kimi.com/code/docs/en/', keyUrl: 'https://www.kimi.ai/code',
@@ -51,7 +52,7 @@ const PRESETS = [
     note: 'OpenAI 协议务必用 /api/coding/paas/v4，配成通用 /api/paas/v4 不扣套餐额度、按量计费。条款限官方列出的编码工具使用。',
   },
   {
-    id: 'zai-coding', name: 'Z.ai GLM Coding Plan', category: 'coding', prefix: 'zai', keywords: 'glm zhipu international',
+    id: 'zai-coding', currency: 'USD', name: 'Z.ai GLM Coding Plan', category: 'coding', prefix: 'zai', keywords: 'glm zhipu international',
     openai: 'https://api.z.ai/api/coding/paas/v4', anthropic: 'https://api.z.ai/api/anthropic',
     models: ['glm-5.3', 'glm-5.3-flash', 'glm-5.2'],
     docs: 'https://docs.z.ai/devpack/tool/others', keyUrl: 'https://z.ai/manage-apikey/apikey-list',
@@ -65,7 +66,7 @@ const PRESETS = [
     note: 'Key 以 sk-sp- 开头，和按量 Key / 地址不能混用。条款限编程工具使用，禁止脚本、自建后端和批量调用。',
   },
   {
-    id: 'qwencloud-coding', name: 'QwenCloud Coding（国际）', category: 'coding', prefix: 'qwencloud', keywords: 'aliyun qwen international',
+    id: 'qwencloud-coding', currency: 'USD', name: 'QwenCloud Coding（国际）', category: 'coding', prefix: 'qwencloud', keywords: 'aliyun qwen international',
     openai: 'https://coding-intl.dashscope.aliyuncs.com/v1', anthropic: 'https://coding-intl.dashscope.aliyuncs.com/apps/anthropic',
     models: ['qwen3.7-plus', 'qwen3.6-plus', 'qwen3-coder-plus'],
     docs: 'https://www.qwencloud.com', keyUrl: 'https://home.qwencloud.com/api-keys',
@@ -93,7 +94,7 @@ const PRESETS = [
     note: '和 Coding Plan 是不同订阅，地址和 Key 不能互换。',
   },
   {
-    id: 'byteplus-coding', name: 'BytePlus ModelArk Coding Plan', category: 'coding', prefix: 'byteplus', keywords: 'volcengine ark international',
+    id: 'byteplus-coding', currency: 'USD', name: 'BytePlus ModelArk Coding Plan', category: 'coding', prefix: 'byteplus', keywords: 'volcengine ark international',
     openai: 'https://ark.ap-southeast.bytepluses.com/api/coding/v3', anthropic: 'https://ark.ap-southeast.bytepluses.com/api/coding',
     models: ['ark-code-latest'],
     docs: 'https://www.byteplus.com/en/product/modelark', keyUrl: 'https://www.byteplus.com/en/product/modelark',
@@ -107,14 +108,14 @@ const PRESETS = [
     note: '订阅 Key（sk-cp-）和按量 Key 不通用；旧域名 api.minimaxi.com。',
   },
   {
-    id: 'minimax-tokenplan-intl', name: 'MiniMax Token Plan（国际）', category: 'coding', prefix: 'minimax-intl', keywords: 'minimax international',
+    id: 'minimax-tokenplan-intl', currency: 'USD', name: 'MiniMax Token Plan（国际）', category: 'coding', prefix: 'minimax-intl', keywords: 'minimax international',
     openai: 'https://api.minimax.io/v1', anthropic: 'https://api.minimax.io/anthropic',
     models: ['MiniMax-M3'],
     docs: 'https://platform.minimax.io/docs/token-plan/quickstart', keyUrl: 'https://platform.minimax.io/subscribe/coding-plan',
     note: '订阅 Key 和按量 Key 不通用。',
   },
   {
-    id: 'opencode-go', name: 'OpenCode Go', category: 'coding', prefix: 'opencode', keywords: 'opencode zen go',
+    id: 'opencode-go', currency: 'USD', name: 'OpenCode Go', category: 'coding', prefix: 'opencode', keywords: 'opencode zen go',
     openai: 'https://opencode.ai/zen/go/v1', anthropic: 'https://opencode.ai/zen/go',
     models: ['glm-5.3', 'kimi-k3', 'deepseek-v4-pro', 'deepseek-v4-flash', 'minimax-m3', 'qwen3.8-max'],
     protocols: {
@@ -163,7 +164,7 @@ const PRESETS = [
     note: '按量计费。Key 和站点绑定，.cn 与 .ai 不通用。若你买的是 Kimi 会员编码套餐，请选“Kimi Code”。',
   },
   {
-    id: 'moonshot-global', name: 'Kimi Platform（海外）', category: 'official', prefix: 'moonshot-intl', keywords: 'kimi moonshot global',
+    id: 'moonshot-global', currency: 'USD', name: 'Kimi Platform（海外）', category: 'official', prefix: 'moonshot-intl', keywords: 'kimi moonshot global',
     openai: 'https://api.moonshot.ai/v1', anthropic: 'https://api.moonshot.ai/anthropic',
     models: ['kimi-k3', 'kimi-k2.7-code', 'kimi-k2.7-code-highspeed', 'kimi-k2.6'],
     docs: 'https://platform.kimi.ai/docs/api/overview', keyUrl: 'https://platform.kimi.ai/console/api-keys',
@@ -177,7 +178,7 @@ const PRESETS = [
     note: '按量计费。若你买的是 GLM Coding Plan，请选“智谱 GLM Coding Plan”。',
   },
   {
-    id: 'zai', name: 'Z.ai（按量）', category: 'official', prefix: 'zai-api', keywords: 'glm zhipu international',
+    id: 'zai', currency: 'USD', name: 'Z.ai（按量）', category: 'official', prefix: 'zai-api', keywords: 'glm zhipu international',
     openai: 'https://api.z.ai/api/paas/v4', anthropic: 'https://api.z.ai/api/anthropic',
     models: ['glm-5.3', 'glm-5.2'],
     docs: 'https://docs.z.ai', keyUrl: 'https://z.ai/manage-apikey/apikey-list',
@@ -239,28 +240,28 @@ const PRESETS = [
     docs: 'https://longcat.chat/platform', keyUrl: 'https://longcat.chat/platform/api_keys',
   },
   {
-    id: 'openai', name: 'OpenAI', category: 'official', prefix: 'openai', keywords: 'gpt',
+    id: 'openai', currency: 'USD', name: 'OpenAI', category: 'official', prefix: 'openai', keywords: 'gpt',
     openai: 'https://api.openai.com/v1', anthropic: '',
     models: ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-5.6-sol'],
     docs: 'https://developers.openai.com/api/docs/models', keyUrl: 'https://platform.openai.com/api-keys',
     note: '按量计费，走 Chat Completions 接口。',
   },
   {
-    id: 'anthropic', name: 'Anthropic', category: 'official', prefix: 'anthropic', keywords: 'claude',
+    id: 'anthropic', currency: 'USD', name: 'Anthropic', category: 'official', prefix: 'anthropic', keywords: 'claude',
     openai: '', anthropic: 'https://api.anthropic.com',
     models: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-fable-5-1', 'claude-haiku-4-5'],
     docs: 'https://platform.claude.com/docs/en/about-claude/models/overview', keyUrl: 'https://platform.claude.com/settings/keys',
     note: '按量计费。官方的 OpenAI 兼容层仅供测试、不支持提示词缓存，所以只配置 Anthropic 端点（OpenAI 请求由网关转换）。',
   },
   {
-    id: 'gemini', name: 'Google Gemini', category: 'official', prefix: 'gemini', keywords: 'google',
+    id: 'gemini', currency: 'USD', name: 'Google Gemini', category: 'official', prefix: 'gemini', keywords: 'google',
     openai: 'https://generativelanguage.googleapis.com/v1beta/openai', anthropic: '',
     models: ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.1-pro-preview'],
     docs: 'https://ai.google.dev/gemini-api/docs/openai', keyUrl: 'https://aistudio.google.com/app/apikey',
     note: '使用 Gemini 的 OpenAI 兼容接口。',
   },
   {
-    id: 'xai', name: 'xAI Grok', category: 'official', prefix: 'xai', keywords: 'grok',
+    id: 'xai', currency: 'USD', name: 'xAI Grok', category: 'official', prefix: 'xai', keywords: 'grok',
     openai: 'https://api.x.ai/v1', anthropic: '',
     models: ['grok-4.7', 'grok-4.6', 'grok-4.5'],
     docs: 'https://docs.x.ai/developers/models', keyUrl: 'https://console.x.ai',
@@ -268,7 +269,7 @@ const PRESETS = [
   },
   // ============================================================ aggregators / relays
   {
-    id: 'opencode-zen', name: 'OpenCode Zen', category: 'aggregator', prefix: 'zen', keywords: 'opencode',
+    id: 'opencode-zen', currency: 'USD', name: 'OpenCode Zen', category: 'aggregator', prefix: 'zen', keywords: 'opencode',
     openai: 'https://opencode.ai/zen/v1', anthropic: 'https://opencode.ai/zen',
     models: ['claude-opus-5-5', 'claude-sonnet-5', 'glm-5.3', 'kimi-k3'],
     protocols: { 'claude-*': 'anthropic', 'qwen*': 'anthropic' },
@@ -276,7 +277,7 @@ const PRESETS = [
     note: '按量计费。Claude / Qwen 走 /messages，其余走 chat；GPT / Grok（只有 Responses 接口）和 Gemini 暂不支持经网关调用。',
   },
   {
-    id: 'openrouter', name: 'OpenRouter', category: 'aggregator', prefix: 'openrouter',
+    id: 'openrouter', currency: 'USD', name: 'OpenRouter', category: 'aggregator', prefix: 'openrouter',
     openai: 'https://openrouter.ai/api/v1', anthropic: 'https://openrouter.ai/api',
     models: ['anthropic/claude-opus-5.5', 'anthropic/claude-sonnet-5', 'openai/gpt-5.6-sol', 'moonshotai/kimi-k3'],
     docs: 'https://openrouter.ai/docs', keyUrl: 'https://openrouter.ai/keys',
@@ -297,7 +298,7 @@ const PRESETS = [
     note: 'Key 为 SDK Token（ms- 开头），每日有免费调用额度。',
   },
   {
-    id: 'novita', name: 'Novita AI', category: 'aggregator', prefix: 'novita',
+    id: 'novita', currency: 'USD', name: 'Novita AI', category: 'aggregator', prefix: 'novita',
     openai: 'https://api.novita.ai/openai/v1', anthropic: 'https://api.novita.ai/anthropic',
     models: ['zai-org/glm-5.3', 'moonshotai/kimi-k3'],
     docs: 'https://novita.ai/docs', keyUrl: 'https://novita.ai/settings/key-management',

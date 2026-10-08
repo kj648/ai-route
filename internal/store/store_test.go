@@ -1,6 +1,7 @@
 package store
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -211,5 +212,140 @@ func TestModelTagsPersistAndExport(t *testing.T) {
 	ms, _ = st.ListModels()
 	if got := strings.Join(ms[0].Tags, ","); got != "chat,vision,ctx-1m" {
 		t.Fatalf("tags after import %q", got)
+	}
+}
+
+func TestPriceForAndCost(t *testing.T) {
+	cache := 0.1
+	p := &Provider{Prices: map[string]Price{
+		"glm-5":   {Input: 4, Cache: &cache, Output: 16},
+		"glm-*":   {Input: 2, Output: 8},
+		"glm-5-*": {Input: 3, Output: 12},
+		"*":       {Input: 1, Output: 1},
+	}}
+	for model, want := range map[string]float64{"glm-5": 4, "glm-5-air": 3, "glm-4": 2, "kimi": 1} {
+		if got, ok := p.PriceFor(model); !ok || got.Input != want {
+			t.Errorf("PriceFor(%q) = %+v, %v; want input %v", model, got, ok, want)
+		}
+	}
+	if _, ok := (&Provider{}).PriceFor("x"); ok {
+		t.Error("no prices should mean no price")
+	}
+	// 1M input of which 400k cached, 100k output
+	if got := p.Prices["glm-5"].Cost(1_000_000, 400_000, 100_000); math.Abs(got-(0.6*4+0.4*0.1+0.1*16)) > 1e-9 {
+		t.Errorf("cost with cache price: %v", got)
+	}
+	if got := p.Prices["glm-*"].Cost(1_000_000, 400_000, 0); math.Abs(got-2) > 1e-9 {
+		t.Errorf("cached tokens without cache price bill as input: %v", got)
+	}
+}
+
+func TestProviderPricesPersist(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	bad := []*Provider{
+		{Prefix: "a", OpenAIBaseURL: "http://a/v1", Currency: "EUR"},
+		{Prefix: "b", OpenAIBaseURL: "http://a/v1", Prices: map[string]Price{"m": {Input: -1}}},
+	}
+	for _, p := range bad {
+		if err := st.CreateProvider(p); err == nil {
+			t.Errorf("accepted invalid provider %+v", p)
+		}
+	}
+	cache := 0.2
+	p := &Provider{Prefix: "ds", OpenAIBaseURL: "http://a/v1", Currency: "usd", Enabled: true,
+		Prices: map[string]Price{" deepseek-* ": {Input: 2, Cache: &cache, Output: 8}}}
+	mustNil(t, st.CreateProvider(p))
+	got := st.Snapshot().Providers["ds"]
+	if got.Currency != CurrencyUSD || got.Prices["deepseek-*"].Cache == nil || *got.Prices["deepseek-*"].Cache != 0.2 {
+		t.Fatalf("after create: %+v", got)
+	}
+	plain := &Provider{Prefix: "plan", OpenAIBaseURL: "http://b/v1", Enabled: true}
+	mustNil(t, st.CreateProvider(plain))
+	if g := st.Snapshot().Providers["plan"]; g.Currency != CurrencyCNY || g.Prices == nil || len(g.Prices) != 0 {
+		t.Fatalf("defaults: %+v", g)
+	}
+	e, _ := st.Export()
+	mustNil(t, st.Import(e))
+	if g := st.Snapshot().Providers["ds"]; g.Currency != CurrencyUSD || g.Prices["deepseek-*"].Output != 8 {
+		t.Fatalf("after import: %+v", g)
+	}
+}
+
+func TestStatsCostInDisplayCurrency(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UnixMilli()
+	st.insertLogs([]*RequestLog{
+		{CreatedAt: now, KeyName: "a", Success: true, InputTokens: 10, Cost: 1, Currency: "USD", CostSource: "upstream"},
+		{CreatedAt: now, KeyName: "a", Success: true, InputTokens: 10, Cost: 7, Currency: "CNY", CostSource: "price"},
+		{CreatedAt: now, KeyName: "b", Success: true, InputTokens: 10},  // no price configured
+		{CreatedAt: now, KeyName: "b", Success: false, HTTPStatus: 502}, // no tokens: not "unpriced"
+	})
+	settings := DefaultSettings()
+	settings.USDToCNY = 7
+	for _, c := range []struct {
+		currency string
+		want     float64
+	}{{"CNY", 14}, {"USD", 2}} {
+		settings.Currency = c.currency
+		mustNil(t, st.UpdateSettings(settings))
+		s, err := st.GetStats(now-3600*1000, 3600*1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Currency != c.currency || math.Abs(s.Total.Cost-c.want) > 1e-9 || s.Total.Unpriced != 1 {
+			t.Fatalf("%s: currency=%s total=%+v", c.currency, s.Currency, s.Total)
+		}
+		byKey := map[string]StatRow{}
+		for _, r := range s.ByKey {
+			byKey[r.Key] = r
+		}
+		if math.Abs(byKey["a"].Cost-c.want) > 1e-9 || byKey["a"].Unpriced != 0 || byKey["b"].Cost != 0 || byKey["b"].Unpriced != 1 {
+			t.Fatalf("by key: %+v", s.ByKey)
+		}
+	}
+}
+
+func TestCostColumnsAddedToOldDatabase(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// simulate a database created before cost accounting existed
+	for _, q := range []string{
+		`ALTER TABLE request_logs DROP COLUMN cost`, `ALTER TABLE request_logs DROP COLUMN currency`, `ALTER TABLE request_logs DROP COLUMN cost_source`,
+		`ALTER TABLE providers DROP COLUMN prices`, `ALTER TABLE providers DROP COLUMN currency`,
+	} {
+		if _, err := st.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+	st, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mustNil(t, st.CreateProvider(&Provider{Prefix: "x", OpenAIBaseURL: "http://a/v1", Prices: map[string]Price{"m": {Input: 1, Output: 1}}}))
+	st.AddLog(&RequestLog{CreatedAt: time.Now().UnixMilli(), Cost: 0.5, Currency: "CNY", CostSource: "price"})
+	st.FlushLogs()
+	logs, _, err := st.QueryLogs(LogQuery{})
+	if err != nil || len(logs) != 1 || logs[0].Cost != 0.5 {
+		t.Fatalf("logs after migration: %v %+v", err, logs)
+	}
+}
+
+func mustNil(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }

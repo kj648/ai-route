@@ -19,6 +19,9 @@ type Usage struct {
 	Input  int64 `json:"input"`
 	Output int64 `json:"output"`
 	Cached int64 `json:"cached"`
+	// Cost is the charge reported by the upstream itself (OpenRouter's
+	// usage.cost, in USD credits); nil when the upstream does not report it.
+	Cost *float64 `json:"cost,omitempty"`
 }
 
 // ---------- OpenAI request ----------
@@ -125,13 +128,15 @@ type OAUsage struct {
 	} `json:"prompt_tokens_details,omitempty"`
 	// some providers (e.g. kimi/deepseek style) report cache hits here
 	PromptCacheHitTokens int64 `json:"prompt_cache_hit_tokens,omitempty"`
+	// Cost is reported by OpenRouter on every response.
+	Cost *float64 `json:"cost,omitempty"`
 }
 
 func (u *OAUsage) toUsage() Usage {
 	if u == nil {
 		return Usage{}
 	}
-	out := Usage{Input: u.PromptTokens, Output: u.CompletionTokens}
+	out := Usage{Input: u.PromptTokens, Output: u.CompletionTokens, Cost: u.Cost}
 	if u.PromptTokensDetails != nil {
 		out.Cached = u.PromptTokensDetails.CachedTokens
 	}
@@ -223,6 +228,8 @@ type ANUsage struct {
 	OutputTokens             int64 `json:"output_tokens"`
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadInputTokens     int64 `json:"cache_read_input_tokens,omitempty"`
+	// Cost is reported by OpenRouter's Anthropic-compatible endpoint.
+	Cost *float64 `json:"cost,omitempty"`
 }
 
 func (u ANUsage) toUsage() Usage {
@@ -230,6 +237,7 @@ func (u ANUsage) toUsage() Usage {
 		Input:  u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens,
 		Output: u.OutputTokens,
 		Cached: u.CacheReadInputTokens,
+		Cost:   u.Cost,
 	}
 }
 

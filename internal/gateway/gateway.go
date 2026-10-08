@@ -319,6 +319,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 			}
 			entry.TTFBMs = res.ttfb
 			entry.InputTokens, entry.OutputTokens, entry.CachedTokens = res.usage.Input, res.usage.Output, res.usage.Cached
+			entry.Cost, entry.Currency, entry.CostSource = costOf(c.provider, c.model, res.usage)
 			entry.Fallback = i > 0
 			if res.streamErr == "" {
 				g.Breaker.Success(c.prefix, c.target)
@@ -414,6 +415,33 @@ func anthropicURL(base string) string {
 	default:
 		return base + "/v1/messages"
 	}
+}
+
+// costOf prices a completed request. OpenRouter reports the actual charge
+// (USD credits), which wins over configured unit prices.
+func costOf(p *store.Provider, model string, u convert.Usage) (float64, string, string) {
+	if u.Cost != nil && isOpenRouter(p) {
+		return *u.Cost, store.CurrencyUSD, "upstream"
+	}
+	if u.Input == 0 && u.Output == 0 {
+		return 0, "", ""
+	}
+	if price, ok := p.PriceFor(model); ok {
+		return price.Cost(u.Input, u.Cached, u.Output), p.Currency, "price"
+	}
+	return 0, "", ""
+}
+
+func isOpenRouter(p *store.Provider) bool {
+	if p.Vendor == "openrouter" {
+		return true
+	}
+	for _, base := range []string{p.OpenAIBaseURL, p.AnthropicBaseURL} {
+		if u, err := url.Parse(base); err == nil && strings.EqualFold(u.Hostname(), "openrouter.ai") {
+			return true
+		}
+	}
+	return false
 }
 
 // isOfficialAnthropic reports whether base points at the Anthropic API itself.

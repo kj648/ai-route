@@ -211,6 +211,9 @@ func mergeANUsage(dst *ANUsage, src ANUsage) {
 	if src.CacheCreationInputTokens > 0 {
 		dst.CacheCreationInputTokens = src.CacheCreationInputTokens
 	}
+	if src.Cost != nil {
+		dst.Cost = src.Cost
+	}
 }
 
 func (p *anPass) Process(ev SSEEvent) []SSEEvent {

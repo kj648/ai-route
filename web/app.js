@@ -71,6 +71,13 @@ function fmtSecs(s) {
   if (s >= 60) return Math.ceil(s / 60) + 'm';
   return s + 's';
 }
+const CURRENCY_SIGN = { CNY: '¥', USD: '$' };
+function fmtMoney(v, cur) {
+  if (!cur) return '-';
+  const sign = CURRENCY_SIGN[cur] || '';
+  if (!v) return sign + '0';
+  return sign + (v < 0.01 ? v.toFixed(5) : v < 1 ? v.toFixed(4) : v.toFixed(2));
+}
 function pct(a, b) { return b ? ((a / b) * 100).toFixed(1) + '%' : '-'; }
 
 async function copyText(text) {
@@ -248,19 +255,20 @@ async function pageDashboard() {
   }).join('');
   const rowTable = (rows, label) => rows.length ? `
     <div class="table-wrap"><table>
-      <tr><th>${label}</th><th class="num">请求</th><th class="num">成功率</th><th class="num">切换</th><th class="num">输入</th><th class="num">输出</th><th class="num">平均耗时</th><th class="num">首字</th></tr>
-      ${rows.map((r) => `<tr><td>${esc(r.key || '-')}</td><td class="num">${fmtNum(r.requests)}</td><td class="num">${pct(r.success, r.requests)}</td><td class="num">${fmtNum(r.fallback)}</td><td class="num">${fmtNum(r.input_tokens)}</td><td class="num">${fmtNum(r.output_tokens)}</td><td class="num">${fmtMs(r.avg_latency_ms)}</td><td class="num">${r.avg_ttfb_ms ? fmtMs(r.avg_ttfb_ms) : '-'}</td></tr>`).join('')}
+      <tr><th>${label}</th><th class="num">请求</th><th class="num">成功率</th><th class="num">切换</th><th class="num">输入</th><th class="num">输出</th><th class="num">费用</th><th class="num">平均耗时</th><th class="num">首字</th></tr>
+      ${rows.map((r) => `<tr><td>${esc(r.key || '-')}</td><td class="num">${fmtNum(r.requests)}</td><td class="num">${pct(r.success, r.requests)}</td><td class="num">${fmtNum(r.fallback)}</td><td class="num">${fmtNum(r.input_tokens)}</td><td class="num">${fmtNum(r.output_tokens)}</td><td class="num" ${r.unpriced ? `title="${r.unpriced} 次请求没有配置单价，未计入"` : ''}>${r.unpriced && !r.cost ? '-' : fmtMoney(r.cost, stats.currency)}${r.unpriced && r.cost ? '*' : ''}</td><td class="num">${fmtMs(r.avg_latency_ms)}</td><td class="num">${r.avg_ttfb_ms ? fmtMs(r.avg_ttfb_ms) : '-'}</td></tr>`).join('')}
     </table></div>` : '<div class="empty">暂无数据</div>';
 
   $('#page').innerHTML = `
     ${head('概览', '请求量、成功率、候补切换与上游健康状态', `
       <select id="dash-range">${ranges.map(([v, l]) => `<option value="${v}" ${v === dashRange ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <button class="btn" id="dash-refresh">刷新</button>`)}
-    <div class="grid cols-4">
+    <div class="grid cols-5">
       <div class="card stat"><div class="label">请求数</div><div class="value">${fmtNum(t.requests)}</div><div class="hint">失败 ${fmtNum(t.failed)}</div></div>
       <div class="card stat"><div class="label">成功率</div><div class="value">${pct(t.success, t.requests)}</div><div class="hint">平均耗时 ${fmtMs(t.avg_latency_ms)}</div></div>
       <div class="card stat"><div class="label">发生候补切换</div><div class="value">${fmtNum(t.fallback)}</div><div class="hint">由非首选上游完成的请求</div></div>
       <div class="card stat"><div class="label">Tokens（输入 / 输出）</div><div class="value">${fmtNum(t.input_tokens)} / ${fmtNum(t.output_tokens)}</div><div class="hint">缓存命中 ${fmtNum(t.cached_tokens)}</div></div>
+      <div class="card stat"><div class="label">费用</div><div class="value">${t.cost ? fmtMoney(t.cost, stats.currency) : '-'}</div><div class="hint">${t.unpriced ? `${fmtNum(t.unpriced)} 次未配单价，未计入` : '按上游实际费用或配置的单价'}</div></div>
     </div>
     <div class="card">
       <div class="card-head">请求趋势 <span class="muted small">蓝色：成功 · 红色：失败</span></div>
@@ -307,6 +315,26 @@ function parseLines(text, sep) {
   return out;
 }
 const toLines = (obj, sep) => Object.entries(obj || {}).map(([k, v]) => `${k}${sep} ${v}`).join('\n');
+// unit prices: one line per model, "model(*) = input / cache / output" or
+// "model = input / output" (cache billed at the input price), per 1M tokens
+function parsePrices(text) {
+  const prices = {};
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const i = line.indexOf('=');
+    const k = i > 0 ? line.slice(0, i).trim() : '';
+    const nums = i > 0 ? line.slice(i + 1).split('/').map((x) => x.trim()) : [];
+    if (!k || (nums.length !== 2 && nums.length !== 3) || nums.some((x) => x === '' || !(Number(x) >= 0))) {
+      throw new Error('单价格式不对：' + line);
+    }
+    const [input, output] = [Number(nums[0]), Number(nums[nums.length - 1])];
+    prices[k] = nums.length === 3 ? { input, cache: Number(nums[1]), output } : { input, output };
+  }
+  return prices;
+}
+const toPriceLines = (prices) => Object.entries(prices || {})
+  .map(([k, v]) => `${k} = ${v.input} / ${v.cache != null ? v.cache + ' / ' : ''}${v.output}`).join('\n');
 const usesProvider = (m, prefix) => m.targets.some((t) => t.startsWith(prefix + '/'));
 
 function compatOf(p) {
@@ -469,7 +497,7 @@ function presetInfoHTML(ps) {
 
 function providerForm(p, models, providers) {
   const isNew = !p;
-  p = p || { prefix: '', name: '', vendor: '', openai_base_url: '', anthropic_base_url: '', api_key: '', headers: {}, model_protocols: {}, models: [], ua_mode: 'passthrough', user_agent: '', timeout_seconds: 300, enabled: true, remark: '' };
+  p = p || { prefix: '', name: '', vendor: '', openai_base_url: '', anthropic_base_url: '', api_key: '', headers: {}, model_protocols: {}, models: [], ua_mode: 'passthrough', user_agent: '', timeout_seconds: 300, prices: {}, currency: 'CNY', enabled: true, remark: '' };
   const state = {
     vendor: guessVendor(p),
     models: [...(p.models || [])],
@@ -528,6 +556,10 @@ function providerForm(p, models, providers) {
             <div class="field"><label>模型协议规则</label><textarea id="pf-protos" placeholder="minimax-* = anthropic&#10;glm-* = openai">${esc(toLines(p.model_protocols, ' ='))}</textarea><div class="help">每行 <code>模型(可用*) = openai|anthropic</code>，某些模型只在一种端点提供时使用</div></div>
             <div class="field"><label>自定义请求头</label><textarea id="pf-headers" placeholder="X-Custom: value">${esc(toLines(p.headers, ':'))}</textarea><div class="help">每行 <code>Header: 值</code>，值留空表示删除该头</div></div>
           </div>
+          <div class="field"><label>单价（每百万 tokens，用于成本核算）
+              <select id="pf-currency" style="margin-left:8px">${['CNY', 'USD'].map((c) => `<option value="${c}" ${(p.currency || 'CNY') === c ? 'selected' : ''}>${c === 'CNY' ? '人民币 ¥' : '美元 $'}</option>`).join('')}</select></label>
+            <textarea id="pf-prices" placeholder="glm-5.3 = 4 / 0.8 / 16&#10;deepseek-* = 2 / 8">${esc(toPriceLines(p.prices))}</textarea>
+            <div class="help">每行 <code>模型(可用*) = 输入 / 缓存命中 / 输出</code>，缓存价可省略（按输入价计）。没配单价的模型不计费用；包月套餐可以写 <code>* = 0 / 0</code>，表示不另外收费，概览里就不会算作“未配单价”。OpenRouter 会直接使用上游返回的实际费用，不需要配置。</div></div>
         </div>
       </details>
       <label class="check"><input type="checkbox" id="pf-enabled" ${p.enabled ? 'checked' : ''}> 启用</label>
@@ -584,6 +616,7 @@ function providerForm(p, models, providers) {
         $('#pf-anthropic', m).value = ps.anthropic || '';
         $('#pf-protos', m).value = toLines(ps.protocols || {}, ' =');
         $('#pf-headers', m).value = toLines(ps.headers || {}, ':');
+        if (isNew) $('#pf-currency', m).value = ps.currency || 'CNY';
         setCompat(ps.openai && ps.anthropic ? 'both' : ps.anthropic ? 'anthropic' : 'openai');
         if (ps.ua && ps.ua.mode) {
           $('#pf-ua-value', m).value = ps.ua.value || '';
@@ -667,6 +700,8 @@ function providerForm(p, models, providers) {
 
       $('#pf-save', m).onclick = async () => {
         addFromInput();
+        let prices;
+        try { prices = parsePrices($('#pf-prices', m).value); } catch (e) { return toast(e.message, 'err'); }
         const body = {
           ...formBody(),
           vendor: state.vendor,
@@ -676,6 +711,8 @@ function providerForm(p, models, providers) {
           remark: $('#pf-remark', m).value.trim(),
           model_protocols: parseLines($('#pf-protos', m).value, '='),
           models: state.models,
+          prices,
+          currency: $('#pf-currency', m).value,
           enabled: $('#pf-enabled', m).checked,
         };
         // drop protocol rules pointing at an endpoint that is no longer configured
@@ -1135,7 +1172,7 @@ async function pageLogs() {
         </div>
       </div>
       ${items.length ? `<div class="table-wrap"><table>
-        <tr><th>时间</th><th>Key</th><th>模型</th><th>实际上游</th><th>协议</th><th>状态</th><th class="num">耗时</th><th class="num">首字</th><th class="num">输入/输出</th></tr>
+        <tr><th>时间</th><th>Key</th><th>模型</th><th>实际上游</th><th>协议</th><th>状态</th><th class="num">耗时</th><th class="num">首字</th><th class="num">输入/输出</th><th class="num">费用</th></tr>
         ${items.map((l, i) => `<tr class="clickable" data-i="${i}">
           <td class="small">${fmtTime(l.created_at)}</td>
           <td class="small">${esc(l.key_name || '-')}</td>
@@ -1146,6 +1183,7 @@ async function pageLogs() {
           <td class="num small">${fmtMs(l.latency_ms)}</td>
           <td class="num small">${l.ttfb_ms ? fmtMs(l.ttfb_ms) : '-'}</td>
           <td class="num small">${fmtNum(l.input_tokens)} / ${fmtNum(l.output_tokens)}</td>
+          <td class="num small">${fmtMoney(l.cost, l.currency)}</td>
         </tr>`).join('')}
       </table></div>
       <div class="pager"><span class="muted small">${logFilter.offset + 1} - ${logFilter.offset + items.length} / ${data.total}</span>
@@ -1180,6 +1218,7 @@ function logDetail(l) {
         <div class="k">结果</div><div>${l.success ? '<span class="badge ok">成功</span>' : '<span class="badge err">失败</span>'} HTTP ${l.http_status}</div>
         <div class="k">耗时 / 首字</div><div>${fmtMs(l.latency_ms)} / ${l.ttfb_ms ? fmtMs(l.ttfb_ms) : '-'}</div>
         <div class="k">Tokens</div><div>输入 ${l.input_tokens}（缓存 ${l.cached_tokens}） · 输出 ${l.output_tokens}</div>
+        <div class="k">费用</div><div>${l.cost_source ? `${fmtMoney(l.cost, l.currency)} <span class="muted small">（${l.cost_source === 'upstream' ? '上游返回的实际费用' : '按配置的单价估算'}）</span>` : '<span class="muted">未计费（没有配置该模型的单价）</span>'}</div>
         ${l.error ? `<div class="k">错误</div><div class="err-text small">${esc(l.error)}</div>` : ''}
       </div>
       ${atts ? `<div class="table-wrap"><table><tr><th>#</th><th>上游</th><th>协议</th><th>状态</th><th>耗时</th><th>结果</th></tr>${atts}</table></div>` : ''}
@@ -1238,6 +1277,10 @@ claude</pre>
         <div class="row2">
           <div class="field"><label>默认 max_tokens</label><input type="number" id="st-mt" min="1" value="${st.default_max_tokens}"><div class="help">OpenAI 请求转 Anthropic 上游且没带 max_tokens 时使用</div></div>
         </div>
+        <div class="row2">
+          <div class="field"><label>统计货币</label><select id="st-cur">${['CNY', 'USD'].map((c) => `<option value="${c}" ${st.currency === c ? 'selected' : ''}>${c === 'CNY' ? '人民币 ¥' : '美元 $'}</option>`).join('')}</select><div class="help">概览里的费用统一换算成这种货币；日志里显示原始货币</div></div>
+          <div class="field"><label>美元兑人民币汇率</label><input type="number" id="st-rate" min="0" step="0.01" value="${st.usd_to_cny}"><div class="help">换算时使用，修改后历史数据也按新汇率显示</div></div>
+        </div>
         <div><button class="btn primary" id="st-save">保存设置</button></div>
       </div>
     </div>
@@ -1256,6 +1299,7 @@ claude</pre>
         failure_threshold: Number($('#st-th').value), cooldown_seconds: Number($('#st-cd').value),
         max_cooldown_seconds: Number($('#st-max').value), log_retention_days: Number($('#st-ret').value),
         default_max_tokens: Number($('#st-mt').value),
+        currency: $('#st-cur').value, usd_to_cny: Number($('#st-rate').value),
       });
       toast('已保存', 'ok');
       route();

@@ -43,6 +43,12 @@ type RequestLog struct {
 	Attempts         []Attempt `json:"attempts"`
 	Error            string    `json:"error"`
 	ClientIP         string    `json:"client_ip"`
+	// Cost is in Currency; CostSource is "upstream" (reported by the
+	// upstream, e.g. OpenRouter), "price" (from the provider's unit prices)
+	// or "" (not costed).
+	Cost       float64 `json:"cost"`
+	Currency   string  `json:"currency"`
+	CostSource string  `json:"cost_source"`
 
 	flushed chan struct{} // FlushLogs marker, not a real entry
 }
@@ -121,7 +127,7 @@ func (s *Store) insertLogs(batch []*RequestLog) error {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.Prepare(`INSERT INTO request_logs (created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	stmt, err := tx.Prepare(`INSERT INTO request_logs (created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -131,7 +137,7 @@ func (s *Store) insertLogs(batch []*RequestLog) error {
 		if attempts == nil {
 			attempts = []Attempt{}
 		}
-		if _, err := stmt.Exec(l.CreatedAt, l.KeyID, l.KeyName, l.RequestedModel, l.PublicModel, l.Inbound, b2i(l.Stream), l.Provider, l.UpstreamModel, l.UpstreamProtocol, b2i(l.Success), l.HTTPStatus, l.LatencyMs, l.TTFBMs, l.InputTokens, l.OutputTokens, l.CachedTokens, b2i(l.Fallback), mustJSON(attempts), l.Error, l.ClientIP); err != nil {
+		if _, err := stmt.Exec(l.CreatedAt, l.KeyID, l.KeyName, l.RequestedModel, l.PublicModel, l.Inbound, b2i(l.Stream), l.Provider, l.UpstreamModel, l.UpstreamProtocol, b2i(l.Success), l.HTTPStatus, l.LatencyMs, l.TTFBMs, l.InputTokens, l.OutputTokens, l.CachedTokens, b2i(l.Fallback), mustJSON(attempts), l.Error, l.ClientIP, l.Cost, l.Currency, l.CostSource); err != nil {
 			return err
 		}
 	}
@@ -198,7 +204,7 @@ func (s *Store) QueryLogs(q LogQuery) ([]*RequestLog, int64, error) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM request_logs`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.Query(`SELECT id, created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip FROM request_logs`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`,
+	rows, err := s.db.Query(`SELECT id, created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source FROM request_logs`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`,
 		append(args, q.Limit, q.Offset)...)
 	if err != nil {
 		return nil, 0, err
@@ -209,7 +215,7 @@ func (s *Store) QueryLogs(q LogQuery) ([]*RequestLog, int64, error) {
 		l := &RequestLog{}
 		var stream, success, fallback int
 		var attempts string
-		if err := rows.Scan(&l.ID, &l.CreatedAt, &l.KeyID, &l.KeyName, &l.RequestedModel, &l.PublicModel, &l.Inbound, &stream, &l.Provider, &l.UpstreamModel, &l.UpstreamProtocol, &success, &l.HTTPStatus, &l.LatencyMs, &l.TTFBMs, &l.InputTokens, &l.OutputTokens, &l.CachedTokens, &fallback, &attempts, &l.Error, &l.ClientIP); err != nil {
+		if err := rows.Scan(&l.ID, &l.CreatedAt, &l.KeyID, &l.KeyName, &l.RequestedModel, &l.PublicModel, &l.Inbound, &stream, &l.Provider, &l.UpstreamModel, &l.UpstreamProtocol, &success, &l.HTTPStatus, &l.LatencyMs, &l.TTFBMs, &l.InputTokens, &l.OutputTokens, &l.CachedTokens, &fallback, &attempts, &l.Error, &l.ClientIP, &l.Cost, &l.Currency, &l.CostSource); err != nil {
 			return nil, 0, err
 		}
 		l.Stream, l.Success, l.Fallback = stream == 1, success == 1, fallback == 1
@@ -230,11 +236,16 @@ type StatRow struct {
 	CachedTokens int64   `json:"cached_tokens"`
 	AvgLatencyMs float64 `json:"avg_latency_ms"`
 	AvgTTFBMs    float64 `json:"avg_ttfb_ms"`
+	// Cost is in Stats.Currency. Unpriced counts requests that used tokens
+	// but have no cost (no unit price configured for that upstream model).
+	Cost     float64 `json:"cost"`
+	Unpriced int64   `json:"unpriced"`
 }
 
 type Stats struct {
 	Since      int64     `json:"since"`
 	BucketMs   int64     `json:"bucket_ms"`
+	Currency   string    `json:"currency"`
 	Total      StatRow   `json:"total"`
 	ByModel    []StatRow `json:"by_model"`
 	ByProvider []StatRow `json:"by_provider"`
@@ -243,10 +254,18 @@ type Stats struct {
 	Timeline   []StatRow `json:"timeline"`
 }
 
-const statCols = `COUNT(*), SUM(success), SUM(1-success), SUM(fallback), SUM(input_tokens), SUM(output_tokens), SUM(cached_tokens), AVG(latency_ms), AVG(CASE WHEN ttfb_ms > 0 THEN ttfb_ms END)`
+const statCols = `COUNT(*), SUM(success), SUM(1-success), SUM(fallback), SUM(input_tokens), SUM(output_tokens), SUM(cached_tokens), AVG(latency_ms), AVG(CASE WHEN ttfb_ms > 0 THEN ttfb_ms END), ` +
+	`SUM(cost * CASE currency WHEN 'USD' THEN ? WHEN 'CNY' THEN ? ELSE 0 END), SUM(cost_source = '' AND input_tokens + output_tokens > 0)`
 
+// statGroup aggregates logs grouped by expr; costs are converted to the
+// settings' display currency.
 func (s *Store) statGroup(expr string, since int64, order string) ([]StatRow, error) {
-	rows, err := s.db.Query(`SELECT `+expr+` AS k, `+statCols+` FROM request_logs WHERE created_at >= ? GROUP BY k ORDER BY `+order, since)
+	st := s.GetSettings()
+	usd, cny := 1.0, 1/st.USDToCNY // to USD
+	if st.Currency == CurrencyCNY {
+		usd, cny = st.USDToCNY, 1
+	}
+	rows, err := s.db.Query(`SELECT `+expr+` AS k, `+statCols+` FROM request_logs WHERE created_at >= ? GROUP BY k ORDER BY `+order, usd, cny, since)
 	if err != nil {
 		return nil, err
 	}
@@ -256,9 +275,14 @@ func (s *Store) statGroup(expr string, since int64, order string) ([]StatRow, er
 		var r StatRow
 		var avgTTFB *float64
 		var avgLat *float64
-		var succ, fail, fb, in, outT, cached *int64
-		if err := rows.Scan(&r.Key, &r.Requests, &succ, &fail, &fb, &in, &outT, &cached, &avgLat, &avgTTFB); err != nil {
+		var succ, fail, fb, in, outT, cached, unpriced *int64
+		var cost *float64
+		if err := rows.Scan(&r.Key, &r.Requests, &succ, &fail, &fb, &in, &outT, &cached, &avgLat, &avgTTFB, &cost, &unpriced); err != nil {
 			return nil, err
+		}
+		r.Unpriced = deref(unpriced)
+		if cost != nil {
+			r.Cost = *cost
 		}
 		r.Success, r.Failed, r.Fallback = deref(succ), deref(fail), deref(fb)
 		r.InputTokens, r.OutputTokens, r.CachedTokens = deref(in), deref(outT), deref(cached)
@@ -283,7 +307,7 @@ func deref(p *int64) int64 {
 // GetStats aggregates logs since the given unix ms; the timeline uses
 // fixed buckets of bucketMs (gaps filled with zero rows, keys in local time).
 func (s *Store) GetStats(since int64, bucketMs int64) (*Stats, error) {
-	st := &Stats{Since: since, BucketMs: bucketMs}
+	st := &Stats{Since: since, BucketMs: bucketMs, Currency: s.GetSettings().Currency}
 	tot, err := s.statGroup(`'total'`, since, "k")
 	if err != nil {
 		return nil, err

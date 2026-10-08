@@ -125,7 +125,7 @@ func (m *mockUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": "chatcmpl-1", "object": "chat.completion", "model": req.Model,
 			"choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finish}},
-			"usage":   map[string]any{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+			"usage":   oaMockUsage(req.Model),
 		})
 		return
 	}
@@ -197,8 +197,19 @@ func (m *mockUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		finish = "tool_calls"
 	}
 	send("", `{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"`+finish+`"}]}`)
-	send("", `{"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	usage, _ := json.Marshal(oaMockUsage(req.Model))
+	send("", `{"id":"c1","object":"chat.completion.chunk","choices":[],"usage":`+string(usage)+`}`)
 	send("", `[DONE]`)
+}
+
+// oaMockUsage is the OpenAI usage the mock reports; model "costly" also
+// reports the charge the way OpenRouter does.
+func oaMockUsage(model string) map[string]any {
+	u := map[string]any{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+	if model == "costly" {
+		u["cost"] = 0.0123
+	}
+	return u
 }
 
 // ---------- harness ----------

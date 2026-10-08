@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -205,5 +207,50 @@ func TestRequestLogAdminTest(t *testing.T) {
 	h.gw.TestTarget(context.Background(), p[0], "ok", "", false)
 	if n := len(h.logs()); n != 1 {
 		t.Fatalf("provider test was logged (%d logs)", n)
+	}
+}
+
+func TestRequestLogCost(t *testing.T) {
+	h := newHarness(t)
+	cache := 0.5
+	setPrices := func(prefix, currency string, prices map[string]store.Price) {
+		p := h.st.Snapshot().Providers[prefix]
+		cp := *p
+		cp.Prices, cp.Currency = prices, currency
+		mustNil(t, h.st.UpdateProvider(&cp))
+	}
+	setPrices("an", "CNY", map[string]store.Price{"ok": {Input: 2, Cache: &cache, Output: 8}, "*": {Input: 100, Output: 100}})
+	setPrices("oa", "USD", map[string]store.Price{"o*": {Input: 1, Output: 2}})
+	mustNil(t, h.st.CreateProvider(&store.Provider{Prefix: "or", Vendor: "openrouter", OpenAIBaseURL: h.mock.srv.URL + "/v1", APIKey: "k", Enabled: true,
+		Prices: map[string]store.Price{"costly": {Input: 1000, Output: 1000}}})) // the upstream's own figure wins
+	mustNil(t, h.st.CreateProvider(&store.Provider{Prefix: "plan", OpenAIBaseURL: h.mock.srv.URL + "/v1", APIKey: "k", Enabled: true,
+		Prices: map[string]store.Price{"*": {}}})) // subscription plan marked free
+
+	cases := []struct {
+		name, target, path string
+		body               map[string]any
+		cost               float64
+		currency, source   string
+	}{
+		// 7 uncached input * 2 + 3 cached * 0.5 + 5 output * 8, exact entry beats the "*" glob
+		{"unit price with cache", "an/ok", "/v1/messages", anReq("m", false), 55.5e-6, "CNY", "price"},
+		// cache price not set: cached tokens billed as input
+		{"glob price, stream", "oa/ok", "/v1/chat/completions", oaReq("m", true), 20e-6, "USD", "price"},
+		{"no price", "both/ok", "/v1/chat/completions", oaReq("m", false), 0, "", ""},
+		{"free plan", "plan/ok", "/v1/chat/completions", oaReq("m", false), 0, "CNY", "price"},
+		{"openrouter", "or/costly", "/v1/chat/completions", oaReq("m", false), 0.0123, "USD", "upstream"},
+		{"openrouter stream, converted", "or/costly", "/v1/messages", anReq("m", true), 0.0123, "USD", "upstream"},
+	}
+	for i, c := range cases {
+		model := fmt.Sprintf("m%d", i)
+		h.model(model, c.target)
+		c.body["model"] = model
+		if resp, body := h.post(c.path, c.body); resp.StatusCode != 200 {
+			t.Fatalf("%s: %s", c.name, body)
+		}
+		l := h.logs()[0]
+		if math.Abs(l.Cost-c.cost) > 1e-12 || l.Currency != c.currency || l.CostSource != c.source {
+			t.Errorf("%s: cost=%v currency=%q source=%q", c.name, l.Cost, l.Currency, l.CostSource)
+		}
 	}
 }

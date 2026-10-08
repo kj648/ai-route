@@ -48,11 +48,41 @@ type Provider struct {
 	UAMode         string `json:"ua_mode"`
 	UserAgent      string `json:"user_agent"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
-	Enabled        bool   `json:"enabled"`
-	Remark         string `json:"remark"`
-	CreatedAt      int64  `json:"created_at"`
-	UpdatedAt      int64  `json:"updated_at"`
+	// Prices are per-million-token unit prices by upstream model (exact
+	// name or '*' glob), in Currency. Models without a price are not costed.
+	Prices    map[string]Price `json:"prices"`
+	Currency  string           `json:"currency"` // CNY | USD
+	Enabled   bool             `json:"enabled"`
+	Remark    string           `json:"remark"`
+	CreatedAt int64            `json:"created_at"`
+	UpdatedAt int64            `json:"updated_at"`
 }
+
+// Price is a unit price per million tokens.
+type Price struct {
+	Input float64 `json:"input"`
+	// Cache is the price of cached (cache-read) input tokens; nil means
+	// they are billed at the input price.
+	Cache  *float64 `json:"cache,omitempty"`
+	Output float64  `json:"output"`
+}
+
+// Cost prices a request. input includes cached tokens.
+func (p Price) Cost(input, cached, output int64) float64 {
+	cache := p.Input
+	if p.Cache != nil {
+		cache = *p.Cache
+	}
+	if cached > input {
+		cached = input
+	}
+	return (float64(input-cached)*p.Input + float64(cached)*cache + float64(output)*p.Output) / 1e6
+}
+
+const (
+	CurrencyCNY = "CNY"
+	CurrencyUSD = "USD"
+)
 
 // Model is a public model exposed to clients. Targets are tried in order
 // ("<prefix>/<model>"), later entries are fallbacks.
@@ -91,6 +121,10 @@ type Settings struct {
 	MaxCooldownSeconds int `json:"max_cooldown_seconds"` // cap for exponential backoff
 	LogRetentionDays   int `json:"log_retention_days"`
 	DefaultMaxTokens   int `json:"default_max_tokens"` // used when converting OpenAI -> Anthropic without max_tokens
+	// Currency is the currency stats are shown in; costs recorded in the
+	// other currency are converted with USDToCNY.
+	Currency string  `json:"currency"`
+	USDToCNY float64 `json:"usd_to_cny"`
 }
 
 func DefaultSettings() Settings {
@@ -102,6 +136,8 @@ func DefaultSettings() Settings {
 		MaxCooldownSeconds: 1800,
 		LogRetentionDays:   30,
 		DefaultMaxTokens:   8192,
+		Currency:           CurrencyCNY,
+		USDToCNY:           7.2,
 	}
 }
 
@@ -214,6 +250,8 @@ CREATE TABLE IF NOT EXISTS providers (
 	ua_mode TEXT NOT NULL DEFAULT 'passthrough',
 	user_agent TEXT NOT NULL DEFAULT '',
 	timeout_seconds INTEGER NOT NULL DEFAULT 300,
+	prices TEXT NOT NULL DEFAULT '{}',
+	currency TEXT NOT NULL DEFAULT 'CNY',
 	enabled INTEGER NOT NULL DEFAULT 1,
 	remark TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL,
@@ -266,7 +304,10 @@ CREATE TABLE IF NOT EXISTS request_logs (
 	fallback INTEGER NOT NULL DEFAULT 0,
 	attempts TEXT NOT NULL DEFAULT '[]',
 	error TEXT NOT NULL DEFAULT '',
-	client_ip TEXT NOT NULL DEFAULT ''
+	client_ip TEXT NOT NULL DEFAULT '',
+	cost REAL NOT NULL DEFAULT 0,
+	currency TEXT NOT NULL DEFAULT '',
+	cost_source TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_logs_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_model ON request_logs(public_model, created_at);
@@ -281,8 +322,19 @@ CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_a
 		{"vendor", `TEXT NOT NULL DEFAULT ''`},
 		{"ua_mode", `TEXT NOT NULL DEFAULT 'passthrough'`},
 		{"user_agent", `TEXT NOT NULL DEFAULT ''`},
+		{"prices", `TEXT NOT NULL DEFAULT '{}'`},
+		{"currency", `TEXT NOT NULL DEFAULT 'CNY'`},
 	} {
 		if err := s.ensureColumn("providers", c[0], c[1]); err != nil {
+			return err
+		}
+	}
+	for _, c := range [][2]string{
+		{"cost", `REAL NOT NULL DEFAULT 0`},
+		{"currency", `TEXT NOT NULL DEFAULT ''`},
+		{"cost_source", `TEXT NOT NULL DEFAULT ''`},
+	} {
+		if err := s.ensureColumn("request_logs", c[0], c[1]); err != nil {
 			return err
 		}
 	}
@@ -385,19 +437,23 @@ func (s *Store) reloadLocked() error {
 
 // ---------- providers ----------
 
-const providerCols = `id, prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, enabled, remark, created_at, updated_at`
+const providerCols = `id, prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, enabled, remark, created_at, updated_at`
 
 func scanProvider(sc interface{ Scan(...any) error }) (*Provider, error) {
 	p := &Provider{}
-	var headers, protos, models string
+	var headers, protos, models, prices string
 	var enabled int
-	if err := sc.Scan(&p.ID, &p.Prefix, &p.Name, &p.OpenAIBaseURL, &p.AnthropicBaseURL, &p.APIKey, &headers, &protos, &models, &p.Vendor, &p.UAMode, &p.UserAgent, &p.TimeoutSeconds, &enabled, &p.Remark, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.Prefix, &p.Name, &p.OpenAIBaseURL, &p.AnthropicBaseURL, &p.APIKey, &headers, &protos, &models, &p.Vendor, &p.UAMode, &p.UserAgent, &p.TimeoutSeconds, &prices, &p.Currency, &enabled, &p.Remark, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	p.Enabled = enabled == 1
 	_ = json.Unmarshal([]byte(headers), &p.Headers)
 	_ = json.Unmarshal([]byte(protos), &p.ModelProtocols)
 	_ = json.Unmarshal([]byte(models), &p.Models)
+	_ = json.Unmarshal([]byte(prices), &p.Prices)
+	if p.Prices == nil {
+		p.Prices = map[string]Price{}
+	}
 	if p.Models == nil {
 		p.Models = []string{}
 	}
@@ -461,6 +517,26 @@ func normalizeProvider(p *Provider) error {
 	}
 	p.Models = cleanList(p.Models)
 	p.Vendor = strings.TrimSpace(p.Vendor)
+	p.Currency = strings.ToUpper(strings.TrimSpace(p.Currency))
+	switch p.Currency {
+	case "":
+		p.Currency = CurrencyCNY
+	case CurrencyCNY, CurrencyUSD:
+	default:
+		return fmt.Errorf("currency must be CNY or USD, got %q", p.Currency)
+	}
+	prices := make(map[string]Price, len(p.Prices))
+	for k, v := range p.Prices {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if v.Input < 0 || v.Output < 0 || v.Cache != nil && *v.Cache < 0 {
+			return fmt.Errorf("prices[%s] must not be negative", k)
+		}
+		prices[k] = v
+	}
+	p.Prices = prices
 	p.UserAgent = strings.TrimSpace(p.UserAgent)
 	switch p.UAMode {
 	case "", "passthrough":
@@ -556,6 +632,21 @@ func (p *Provider) ForcedProtocol(model string) string {
 	return ""
 }
 
+// PriceFor returns the unit price of an upstream model: an exact entry
+// first, then the longest matching glob.
+func (p *Provider) PriceFor(model string) (Price, bool) {
+	if v, ok := p.Prices[model]; ok {
+		return v, true
+	}
+	best, found := "", false
+	for pat := range p.Prices {
+		if strings.Contains(pat, "*") && globMatch(pat, model) && (!found || len(pat) > len(best) || len(pat) == len(best) && pat < best) {
+			best, found = pat, true
+		}
+	}
+	return p.Prices[best], found
+}
+
 // CreateProvider stores a new provider. The prefix is generated when empty
 // (see DerivePrefix) and made unique with a numeric suffix (kimi, kimi-2 ...).
 func (s *Store) CreateProvider(p *Provider) error {
@@ -575,8 +666,8 @@ func (s *Store) CreateProvider(p *Provider) error {
 	}
 	p.Prefix = uniquePrefix(p.Prefix, taken)
 	t := now()
-	res, err := s.db.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, b2i(p.Enabled), p.Remark, t, t)
+	res, err := s.db.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, b2i(p.Enabled), p.Remark, t, t)
 	if err != nil {
 		return friendlyErr(err)
 	}
@@ -611,8 +702,8 @@ func (s *Store) UpdateProvider(p *Provider) error {
 	}
 	defer tx.Rollback()
 	t := now()
-	if _, err := tx.Exec(`UPDATE providers SET prefix=?, name=?, openai_base_url=?, anthropic_base_url=?, api_key=?, headers=?, model_protocols=?, models=?, vendor=?, ua_mode=?, user_agent=?, timeout_seconds=?, enabled=?, remark=?, updated_at=? WHERE id=?`,
-		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, b2i(p.Enabled), p.Remark, t, p.ID); err != nil {
+	if _, err := tx.Exec(`UPDATE providers SET prefix=?, name=?, openai_base_url=?, anthropic_base_url=?, api_key=?, headers=?, model_protocols=?, models=?, vendor=?, ua_mode=?, user_agent=?, timeout_seconds=?, prices=?, currency=?, enabled=?, remark=?, updated_at=? WHERE id=?`,
+		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, b2i(p.Enabled), p.Remark, t, p.ID); err != nil {
 		return friendlyErr(err)
 	}
 	if old.Prefix != p.Prefix {
@@ -970,6 +1061,12 @@ func normalizeSettings(st Settings) Settings {
 	if st.DefaultMaxTokens <= 0 {
 		st.DefaultMaxTokens = d.DefaultMaxTokens
 	}
+	if st.Currency = strings.ToUpper(strings.TrimSpace(st.Currency)); st.Currency != CurrencyUSD {
+		st.Currency = CurrencyCNY
+	}
+	if st.USDToCNY <= 0 {
+		st.USDToCNY = d.USDToCNY
+	}
 	return st
 }
 
@@ -1039,8 +1136,8 @@ func (s *Store) Import(e *Export) error {
 	}
 	t := now()
 	for _, p := range e.Providers {
-		if _, err := tx.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, b2i(p.Enabled), p.Remark, t, t); err != nil {
+		if _, err := tx.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, b2i(p.Enabled), p.Remark, t, t); err != nil {
 			return friendlyErr(err)
 		}
 	}
