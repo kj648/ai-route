@@ -86,7 +86,14 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 
   内置变量：`$conversation`（`ses_` 开头，同一会话内不变：按“API Key + 第一条用户消息”计算）、`$uuid`（每个请求一个新的）、`$requestId`（网关的请求 ID，也在响应头 `X-Route-Request-Id` 和日志里）、`$timestamp`、`$keyName`、`$keyId`、`$model`（上游模型名）。变量名写错，或者引用 `header.Authorization` 这类凭证，保存时会报错。日志详情里能看到每次尝试实际发出的动态请求头。
 
-  OpenCode Go 预设已经写好 `x-opencode-session: {{header.x-opencode-session ?? $conversation}}`：自研 Agent 传了自己的会话 ID 就原样透传，Claude Code 等不认识这个头的客户端由网关按会话生成。旧版本建的 OpenCode Go 供应商里，写死的 `ai-route` 会在启动时自动改成这个写法。
+  OpenCode Go 预设已经写好 `x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? $conversation}}`：
+  - 自研 Agent 传了自己的会话 ID，就原样透传；
+  - Claude Code 会自带 `x-claude-code-session-id`（[官方文档](https://code.claude.com/docs/en/llm-gateway-protocol)），就用它；
+  - 其他客户端由网关按会话生成。
+
+  旧版本建的 OpenCode Go 供应商里，写死的 `ai-route` 会在启动时自动改成这个写法。OpenCode Go 官方[只要求](https://opencode.ai/docs/go/)每个会话带一个稳定的 ID，没有规定格式。走 `/v1/responses` 的模型（Grok、GPT Luna 等）网关暂不支持。
+
+  “设置与接入 → 请求头说明”里整理了每段请求头的规则，以及已核实的厂商要求和出处。
 - 网关会透传 Anthropic 的 `anthropic-version` 和 `anthropic-beta`。
 - **请求参数规则**：某些模型要求额外参数时使用，每行写 `模型(可用*) [条件] = JSON`。JSON 会深度合并进发给上游的请求体（在协议转换之后），值写 `null` 表示删除该字段。条件可选：`stream` / `nonstream` 限定流式或非流式，`openai` / `anthropic` / `embeddings` 限定上游协议，多个条件用逗号分隔。例如百炼的 Qwen3 开源模型默认开启思考，非流式调用必须关掉：
 

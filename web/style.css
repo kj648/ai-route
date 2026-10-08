@@ -230,3 +230,6 @@ pre.box { background: var(--code); border-radius: 8px; padding: 10px 12px; overf
 .chain-row.tied { margin-left: 18px; }
 .snippet { margin-top: 10px; }
 .snippet pre { margin-top: 4px; }
+.hdoc details { border-top: 1px solid var(--border); padding-top: 8px; }
+.hdoc details:first-of-type { border-top: none; padding-top: 0; }
+.hdoc td { vertical-align: top; }

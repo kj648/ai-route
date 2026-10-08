@@ -1379,7 +1379,8 @@ function logDetail(l) {
 
 // ---------------------------------------------------------------- settings
 async function pageSettings() {
-  const [st, models, alerts, keys] = await Promise.all([api('GET', '/settings'), api('GET', '/models'), api('GET', '/alerts'), api('GET', '/keys')]);
+  const [st, models, alerts, keys, ping] = await Promise.all([api('GET', '/settings'), api('GET', '/models'), api('GET', '/alerts'), api('GET', '/keys'), api('GET', '/ping')]);
+  if (ping.user_agent) PLATFORM_UA = ping.user_agent;
   const origin = location.origin;
   $('#page').innerHTML = `
     ${head('设置与接入', '')}
@@ -1393,6 +1394,10 @@ async function pageSettings() {
         </div>
         <div class="wizard" id="wz"></div>
       </div>
+    </div>
+    <div class="card">
+      <div class="card-head">请求头说明</div>
+      <div class="card-body form hdoc">${headerDocsHTML()}</div>
     </div>
     <div class="card">
       <div class="card-head">重试、熔断与日志</div>
@@ -1485,6 +1490,95 @@ async function pageSettings() {
     } catch (err) { toast('导入失败：' + err.message, 'err'); }
     e.target.value = '';
   };
+}
+
+// ---------------------------------------------------------------- header docs
+// What each header does on the way client -> gateway -> upstream and back.
+// Vendor requirements link to the source they were checked against.
+const HDR_DROPPED = [
+  ['Authorization、x-api-key', '调用方发给网关的 sk-route-…。转给上游会泄露平台 Key，网关会换成供应商自己的 Key'],
+  ['Cookie、Proxy-Authorization', '凭证类，不能带给第三方'],
+  ['Host、Content-Length、Content-Type', '网关重新组装请求体后自己设置'],
+  ['Accept-Encoding', '网关要解析上游返回的 JSON 和 SSE。网关自己声明 gzip 时，Go 会自动解压；如果转发调用方的值（浏览器还会带 br、zstd），收到的是压缩内容，解析会失败'],
+  ['User-Agent', '由供应商的 User-Agent 策略决定（见下文）'],
+  ['Connection 以及它列出的头、Keep-Alive、TE、Trailer、Transfer-Encoding、Upgrade、HTTP2-Settings、Proxy-*、Expect', '逐跳头，只对当前这一段连接有效。HTTP 规范（RFC 9110 §7.6.1）要求代理去掉，和 Go 标准库反向代理的处理一致'],
+  ['X-Forwarded-*、Forwarded、X-Real-IP、True-Client-IP、Via、CF-*', '反向代理和 CDN（如 Cloudflare）记录的用户真实 IP 和经过的代理，转出去会泄露用户信息'],
+  ['Origin、Referer、Sec-*', '浏览器自动加的头，表示请求来自网页。Anthropic 会拒绝带 Origin 的跨域请求，除非额外声明 anthropic-dangerous-direct-browser-access；网关是服务端调用，不需要它们'],
+  ['anthropic-*（上游不是 Anthropic 协议时）、openai-*（上游是 Anthropic 协议时）', '对面协议专属，协议转换后没有意义'],
+];
+const HDR_SYNTAX = [
+  ['abc', '固定值', '平台写死，覆盖调用方的同名头'],
+  ['（留空）', '删除', '不发这个头，即使调用方带了'],
+  ['{{header.X-Foo}}', '调用方提供，必传', '首选上游缺了直接返回 400；候补上缺了就不发'],
+  ['{{header.X-Foo?}}', '调用方提供，可选', '没带就不发'],
+  ['{{header.X-Foo ?? $conversation}}', '调用方优先，平台兜底', '带了用调用方的，没带用平台生成的；也可以写 ?? "默认值"'],
+  ['{{$变量}}', '平台生成', '可以和文字拼接，如 ai-route-{{$requestId}}'],
+];
+const HDR_VARS = [
+  ['$conversation', 'ses_ 开头，同一会话内不变', '按“API Key + 会话第一条用户消息”计算，适合给不带会话 ID 的客户端兜底；调用方自己有会话头（如 Claude Code 的 x-claude-code-session-id）时优先用 header.… 取它。没有用户消息的请求（向量、重排序）取不到值，这个头就不发'],
+  ['$uuid', '每个请求一个新的 UUID', '请求 ID、幂等键。不要用作会话 ID'],
+  ['$requestId', '网关的请求 ID（req_…）', '同时出现在响应头 X-Route-Request-Id 和请求日志里，方便和上游对账'],
+  ['$timestamp', '当前 Unix 秒', ''],
+  ['$keyName / $keyId', '调用方使用的 API Key 名称 / 编号', '名称里的中文等字符会做 URL 编码'],
+  ['$model', '实际请求的上游模型名', ''],
+];
+const HDR_RESPONSE = [
+  ['X-Route-Target', '这次实际走的上游，前缀/模型名'],
+  ['X-Route-Request-Id', '网关的请求 ID，在“请求日志”里可以搜到'],
+  ['Retry-After', '被 RPM / TPM 限流或上游都满载时返回 429，告诉客户端多少秒后重试'],
+];
+// [vendor, requirement, how this gateway handles it, source]
+const HDR_VENDORS = [
+  ['OpenCode Go', '每个会话带一个稳定的 x-opencode-session（官方说明用于路由和提示词缓存，没有规定格式）；客户端用自己的 User-Agent，不要用 SDK 或 HTTP 库的默认值。对 Claude Code 等客户端也能识别它们自带的会话头', '预设：x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? $conversation}}，UA 透传客户端。走 /v1/responses 的模型（Grok、GPT Luna 等）暂不支持', 'https://opencode.ai/docs/go/'],
+  ['Kimi Code', '会员条款：篡改客户端标识（User-Agent）视为违规，可能暂停会员权益。接口只接受 Kimi CLI、Claude Code、Roo Code、Kilo Code 等编码工具，其他客户端会收到 403', '预设 UA 透传客户端，不要改成固定 UA 或平台标识', 'https://www.kimi.com/help/kimi-code/membership-guide'],
+  ['Claude Code（作为调用方）', '发给网关的请求带 x-claude-code-session-id（当前会话的唯一 ID，v2.1.86 起），以及 anthropic-version、anthropic-beta', '默认透传；OpenCode Go 预设用它作为会话 ID，比按消息计算的 $conversation 更准（压缩上下文后也不变）', 'https://code.claude.com/docs/en/llm-gateway-protocol'],
+  ['Anthropic 及兼容端点', 'anthropic-version 必填（目前是 2023-06-01）；beta 功能用 anthropic-beta，多个用逗号分隔', '调用方带了就透传，没带补 2023-06-01；鉴权同时发 x-api-key 和 Authorization: Bearer', 'https://platform.claude.com/docs/en/api/versioning'],
+  ['OpenRouter', '可选的应用标识：HTTP-Referer（应用网址，没有它不会生成应用页）、X-OpenRouter-Title（应用名，旧名 X-Title 仍兼容），用于在 OpenRouter 的排行和统计里显示你的应用', '需要的话在自定义请求头里写固定值；费用直接取响应里的 usage.cost', 'https://openrouter.ai/docs/app-attribution'],
+];
+
+function headerDocsHTML() {
+  const table = (head, rows) => `<div class="table-wrap"><table><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr>${rows.map((r) => `<tr>${r.map((c, i) => `<td class="${i === 0 ? 'mono small' : 'small'}">${c}</td>`).join('')}</tr>`).join('')}</table></div>`;
+  const e = (rows) => rows.map((r) => r.map(esc));
+  return `
+    <div class="muted small">请求头分三段经过网关：调用方 → 网关、网关 → 上游、网关 → 调用方。下面按这个顺序说明每段的规则。</div>
+    <details open>
+      <summary><b>1. 调用方发给网关</b></summary>
+      <div class="kv" style="margin-top:8px">
+        <div class="k">鉴权</div><div><code>Authorization: Bearer sk-route-…</code> 或 <code>x-api-key: sk-route-…</code>，两种都行。只用于网关鉴权，不会转给上游</div>
+        <div class="k">Anthropic 协议</div><div><code>anthropic-version</code>、<code>anthropic-beta</code> 照常带，上游也是 Anthropic 协议时透传</div>
+        <div class="k">其他头</div><div>默认原样转给上游（见第 2 段）。供应商要求的头（比如 OpenCode Go 的会话 ID）由调用方自己带，或者由平台按下面的规则生成</div>
+      </div>
+    </details>
+    <details>
+      <summary><b>2. 网关转给上游：透传规则</b></summary>
+      <div class="small" style="margin:8px 0">调用方的请求头默认透传，下面这些除外。个别上游对多余请求头敏感时，可以在供应商的“高级设置”里关掉“透传调用方的请求头”。供应商配置的同名头总是覆盖调用方的值。</div>
+      ${table(['不透传的头', '原因'], e(HDR_DROPPED))}
+    </details>
+    <details>
+      <summary><b>3. 供应商自定义请求头：写法</b></summary>
+      <div class="small" style="margin:8px 0">在供应商的“高级设置 → 自定义请求头”里每行写 <code>Header: 值</code>。值可以是下面几种之一；变量名写错，或者引用 <code>header.Authorization</code> 这类凭证，保存时会直接报错。</div>
+      ${table(['值', '来源', '说明'], e(HDR_SYNTAX))}
+      <div class="small" style="margin:8px 0"><b>必传的判断按配置顺序</b>：模型调度顺序第一级上启用的供应商（并列组的每个成员都算）要求的头，调用方没带就直接返回 400，即使首选当前在冷却也一样，保证同一个客户端每次结果一致。只出现在候补位置的供应商，必传头缺了不报错，只是不发这个头。模型映射页会在每个上游旁边标出它的必传头。</div>
+      ${table(['内置变量', '值', '说明'], e(HDR_VARS))}
+      <div class="small" style="margin-top:8px">每次尝试实际发出的动态请求头可以在“请求日志 → 详情”里看到。</div>
+    </details>
+    <details>
+      <summary><b>4. User-Agent</b></summary>
+      <div class="kv" style="margin-top:8px">
+        <div class="k">透传客户端（默认）</div><div>转发调用方的 UA（如 <code>claude-cli/…</code>）；调用方没带时用供应商里填的值，再没有就用平台标识。限制客户端类型的套餐（如 Kimi Code）必须用这个</div>
+        <div class="k">平台标识</div><div>总是发本网关的标识 <code>${esc(PLATFORM_UA)}</code>，适合自建模型、中转平台这类需要识别来源的上游</div>
+        <div class="k">固定 UA</div><div>总是发供应商里填的值，只在厂商明确要求某个固定 UA 时用</div>
+      </div>
+    </details>
+    <details>
+      <summary><b>5. 网关返回给调用方</b></summary>
+      ${table(['响应头', '含义'], e(HDR_RESPONSE))}
+    </details>
+    <details>
+      <summary><b>6. 已知厂商要求</b></summary>
+      <div class="small" style="margin:8px 0">下面是已经对照官方文档核实过的要求；厂商可能调整，请以链接里的最新文档为准。</div>
+      ${table(['厂商', '要求', '本网关的处理', '来源'], HDR_VENDORS.map(([v, req, how, src]) => [esc(v), esc(req), esc(how), `<a href="${esc(src)}" target="_blank" rel="noopener">文档</a>`]))}
+    </details>`;
 }
 
 // ---------------------------------------------------------------- client setup wizard

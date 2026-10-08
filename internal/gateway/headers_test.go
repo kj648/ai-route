@@ -19,6 +19,7 @@ func TestClientHeadersForwarded(t *testing.T) {
 		"X-Custom": "1", "X-Stainless-Lang": "python", "X-Override": "caller",
 		"Cookie": "sid=secret", "X-Forwarded-For": "10.0.0.1", "Origin": "https://evil.example", "Sec-Fetch-Mode": "cors",
 		"anthropic-beta": "tools-2024", // meaningless for an OpenAI upstream
+		"Connection":     "X-Hop", "X-Hop": "1", "Http2-Settings": "AAMAAABkAAQAoAAAAAIAAAAA",
 	})
 	if resp.StatusCode != 200 {
 		t.Fatal(body)
@@ -27,6 +28,7 @@ func TestClientHeadersForwarded(t *testing.T) {
 	for k, want := range map[string]string{
 		"X-Custom": "1", "X-Stainless-Lang": "python", "X-Override": "platform", "Authorization": "Bearer k-oa",
 		"Cookie": "", "X-Forwarded-For": "", "Origin": "", "Sec-Fetch-Mode": "", "Anthropic-Beta": "",
+		"X-Hop": "", "Http2-Settings": "",
 	} {
 		if got := hdr.Get(k); got != want {
 			t.Errorf("%s = %q, want %q", k, got, want)
@@ -118,8 +120,13 @@ func TestGeneratedSessionHeader(t *testing.T) {
 	if l.Attempts[0].Headers["x-opencode-session"] != s3 || !strings.HasPrefix(l.RequestID, "req_") {
 		t.Fatalf("log: %+v", l)
 	}
-	// the caller's own session id wins
-	resp, _ := h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"x-opencode-session": "conv_X"})
+	// Claude Code's own session id beats the generated one
+	h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"X-Claude-Code-Session-Id": "cc-123"})
+	if got := h.mock.lastHdr["ok"].Get("x-opencode-session"); got != "cc-123" {
+		t.Fatalf("Claude Code session: %q", got)
+	}
+	// and the caller's explicit x-opencode-session beats both
+	resp, _ := h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"x-opencode-session": "conv_X", "X-Claude-Code-Session-Id": "cc-123"})
 	if resp.StatusCode != 200 || h.mock.lastHdr["ok"].Get("x-opencode-session") != "conv_X" {
 		t.Fatal("caller session not forwarded")
 	}

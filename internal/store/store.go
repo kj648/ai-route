@@ -428,11 +428,19 @@ CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_a
 }
 
 // OpenCodeSessionHeader is the OpenCode Go preset's session header value:
-// the caller's own session id, else one generated per conversation.
-const OpenCodeSessionHeader = "{{header.x-opencode-session ?? $conversation}}"
+// the caller's own session id, else Claude Code's session id (documented
+// x-claude-code-session-id), else one generated per conversation.
+const OpenCodeSessionHeader = "{{header.x-opencode-session ?? header.x-claude-code-session-id ?? $conversation}}"
 
-// migrateOpenCodeSession replaces the fixed session id older OpenCode Go
-// presets used (one id for all traffic) with the per-conversation template.
+// earlier values of the preset's session header, replaced on startup
+var oldOpenCodeSessionHeaders = map[string]bool{
+	"ai-route": true, // one fixed id for all traffic
+	"{{header.x-opencode-session ?? $conversation}}": true,
+}
+
+// migrateOpenCodeSession replaces earlier OpenCode Go session header values
+// (a fixed id for all traffic, then a template without Claude Code's id)
+// with the current template; values the user wrote are left alone.
 func (s *Store) migrateOpenCodeSession() error {
 	rows, err := s.db.Query(`SELECT id, headers FROM providers WHERE vendor = 'opencode-go'`)
 	if err != nil {
@@ -453,7 +461,7 @@ func (s *Store) migrateOpenCodeSession() error {
 		var h map[string]string
 		_ = json.Unmarshal([]byte(raw), &h)
 		for k, v := range h {
-			if strings.EqualFold(k, "x-opencode-session") && v == "ai-route" {
+			if strings.EqualFold(k, "x-opencode-session") && oldOpenCodeSessionHeaders[v] {
 				h[k] = OpenCodeSessionHeader
 				updates = append(updates, upd{id, mustJSON(h)})
 			}

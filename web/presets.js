@@ -123,10 +123,10 @@ const PRESETS = [
       'glm-*': 'openai', 'kimi-*': 'openai', 'deepseek-*': 'openai', 'mimo-*': 'openai', 'longcat-*': 'openai', 'hy3': 'openai',
       'minimax-*': 'anthropic', 'qwen*': 'anthropic',
     },
-    // the caller's own session id, else a stable id per conversation
-    headers: { 'x-opencode-session': '{{header.x-opencode-session ?? $conversation}}' },
+    // the caller's own session id, else Claude Code's, else a stable id per conversation
+    headers: { 'x-opencode-session': '{{header.x-opencode-session ?? header.x-claude-code-session-id ?? $conversation}}' },
     docs: 'https://opencode.ai/docs/go/', keyUrl: 'https://opencode.ai/go',
-    note: '月订阅。MiniMax / Qwen 只走 /messages，GLM / Kimi / DeepSeek / MiMo 走 chat，已预填“模型协议规则”；官方要求每个会话带稳定的 x-opencode-session 头：已预填为调用方传了就透传，没传由网关按会话生成。',
+    note: '月订阅。MiniMax / Qwen 只走 /messages，GLM / Kimi / DeepSeek / MiMo 走 chat，已预填“模型协议规则”；官方要求每个会话带稳定的 x-opencode-session 头：已预填为调用方传了就透传，否则用 Claude Code 的会话 ID（x-claude-code-session-id），再没有由网关按会话生成。走 /v1/responses 的模型（Grok、GPT Luna 等）网关暂不支持。',
     ua: { mode: 'passthrough', note: '官方要求客户端用自己的 UA（如 my-agent/1.0），不要用 SDK / HTTP 库的默认 UA。透传客户端即可；客户端没带 UA 时使用平台标识 ai-route/版本号。' },
   },
   {

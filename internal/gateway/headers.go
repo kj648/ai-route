@@ -59,8 +59,9 @@ var dropHeaders = map[string]bool{
 	"Host": true, "Content-Length": true, "Content-Type": true, "User-Agent": true,
 	// the transport only decompresses responses when it asked for gzip itself
 	"Accept-Encoding": true,
-	"Connection":      true, "Keep-Alive": true, "Proxy-Connection": true, "Te": true,
-	"Trailer": true, "Transfer-Encoding": true, "Upgrade": true, "Expect": true,
+	// hop-by-hop, as in net/http/httputil.ReverseProxy (RFC 9110 7.6.1)
+	"Connection": true, "Keep-Alive": true, "Proxy-Connection": true, "Te": true,
+	"Trailer": true, "Transfer-Encoding": true, "Upgrade": true, "Http2-Settings": true, "Expect": true,
 	"Forwarded": true, "X-Real-Ip": true, "True-Client-Ip": true, "Via": true,
 	"Origin": true, "Referer": true,
 }
@@ -70,8 +71,17 @@ var dropPrefixes = []string{"X-Forwarded-", "Cf-", "Sec-", "Proxy-"}
 // copyClientHeaders forwards the caller's headers that make sense for the
 // upstream protocol.
 func copyClientHeaders(dst, src http.Header, upstream string) {
+	// fields named in Connection are hop-by-hop too (RFC 9110 7.6.1)
+	named := map[string]bool{}
+	for _, v := range src.Values("Connection") {
+		for _, f := range strings.Split(v, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				named[http.CanonicalHeaderKey(f)] = true
+			}
+		}
+	}
 	for k, vs := range src {
-		if dropHeaders[k] {
+		if dropHeaders[k] || named[k] {
 			continue
 		}
 		skip := false
