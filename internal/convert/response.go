@@ -249,6 +249,8 @@ func anErrorType(status int) string {
 		return "invalid_request_error"
 	case status == 401:
 		return "authentication_error"
+	case status == 402:
+		return "billing_error"
 	case status == 403:
 		return "permission_error"
 	case status == 404:
@@ -268,6 +270,8 @@ func oaErrorType(status int) string {
 	switch {
 	case status == 401:
 		return "authentication_error"
+	case status == 402:
+		return "insufficient_quota"
 	case status == 403:
 		return "permission_error"
 	case status == 404:

@@ -257,14 +257,31 @@ type Stats struct {
 const statCols = `COUNT(*), SUM(success), SUM(1-success), SUM(fallback), SUM(input_tokens), SUM(output_tokens), SUM(cached_tokens), AVG(latency_ms), AVG(CASE WHEN ttfb_ms > 0 THEN ttfb_ms END), ` +
 	`SUM(cost * CASE currency WHEN 'USD' THEN ? WHEN 'CNY' THEN ? ELSE 0 END), SUM(cost_source = '' AND input_tokens + output_tokens > 0)`
 
+// CurrencyFactors returns what one USD and one CNY are worth in the
+// display currency.
+func (st Settings) CurrencyFactors() (usd, cny float64) {
+	if st.Currency == CurrencyCNY {
+		return st.USDToCNY, 1
+	}
+	return 1, 1 / st.USDToCNY
+}
+
+// ToDisplayCurrency converts an amount recorded in currency.
+func (st Settings) ToDisplayCurrency(amount float64, currency string) float64 {
+	usd, cny := st.CurrencyFactors()
+	switch currency {
+	case CurrencyUSD:
+		return amount * usd
+	case CurrencyCNY:
+		return amount * cny
+	}
+	return 0
+}
+
 // statGroup aggregates logs grouped by expr; costs are converted to the
 // settings' display currency.
 func (s *Store) statGroup(expr string, since int64, order string) ([]StatRow, error) {
-	st := s.GetSettings()
-	usd, cny := 1.0, 1/st.USDToCNY // to USD
-	if st.Currency == CurrencyCNY {
-		usd, cny = st.USDToCNY, 1
-	}
+	usd, cny := s.GetSettings().CurrencyFactors()
 	rows, err := s.db.Query(`SELECT `+expr+` AS k, `+statCols+` FROM request_logs WHERE created_at >= ? GROUP BY k ORDER BY `+order, usd, cny, since)
 	if err != nil {
 		return nil, err
@@ -355,4 +372,31 @@ func (s *Store) GetStats(since int64, bucketMs int64) (*Stats, error) {
 func tzOffsetMs() int64 {
 	_, off := time.Now().Zone()
 	return int64(off) * 1000
+}
+
+// KeySpend returns each key's cost since the given unix ms, in the display
+// currency.
+func (s *Store) KeySpend(since int64) (map[int64]float64, error) {
+	usd, cny := s.GetSettings().CurrencyFactors()
+	rows, err := s.db.Query(`SELECT key_id, SUM(cost * CASE currency WHEN 'USD' THEN ? WHEN 'CNY' THEN ? ELSE 0 END) FROM request_logs WHERE created_at >= ? AND cost > 0 GROUP BY key_id`, usd, cny, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]float64{}
+	for rows.Next() {
+		var id int64
+		var v float64
+		if err := rows.Scan(&id, &v); err != nil {
+			return nil, err
+		}
+		out[id] = v
+	}
+	return out, rows.Err()
+}
+
+// MonthStart is local midnight on the first day of t's month, in unix ms.
+func MonthStart(t time.Time) int64 {
+	y, m, _ := t.Date()
+	return time.Date(y, m, 1, 0, 0, 0, 0, t.Location()).UnixMilli()
 }

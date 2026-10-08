@@ -348,10 +348,20 @@ func (a *Admin) listKeys(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err)
 		return
 	}
-	if ks == nil {
-		ks = []*store.APIKey{}
+	spend, err := a.store.KeySpend(store.MonthStart(time.Now()))
+	if err != nil {
+		writeErr(w, 500, err)
+		return
 	}
-	writeJSON(w, ks)
+	type keyView struct {
+		*store.APIKey
+		MonthCost float64 `json:"month_cost"` // month-to-date, display currency
+	}
+	out := make([]keyView, 0, len(ks))
+	for _, k := range ks {
+		out = append(out, keyView{k, spend[k.ID]})
+	}
+	writeJSON(w, out)
 }
 
 func (a *Admin) createKey(w http.ResponseWriter, r *http.Request) {
@@ -464,6 +474,7 @@ func (a *Admin) updateSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	a.gw.Limiter.Forget() // budgets are in the display currency
 	writeJSON(w, a.store.GetSettings())
 }
 
@@ -491,5 +502,6 @@ func (a *Admin) importConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.gw.Breaker.Reset("")
+	a.gw.Limiter.Forget()
 	writeJSON(w, map[string]any{"ok": true})
 }

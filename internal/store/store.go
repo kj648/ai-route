@@ -108,8 +108,13 @@ type APIKey struct {
 	Enabled       bool     `json:"enabled"`
 	AllowedModels []string `json:"allowed_models"` // empty = all
 	ExpiresAt     int64    `json:"expires_at"`     // unix ms, 0 = never
-	CreatedAt     int64    `json:"created_at"`
-	LastUsedAt    int64    `json:"last_used_at"`
+	// MonthlyBudget caps the calendar month's cost in Settings.Currency;
+	// RPM / TPM cap requests and tokens per rolling minute. 0 = unlimited.
+	MonthlyBudget float64 `json:"monthly_budget"`
+	RPM           int     `json:"rpm"`
+	TPM           int     `json:"tpm"`
+	CreatedAt     int64   `json:"created_at"`
+	LastUsedAt    int64   `json:"last_used_at"`
 }
 
 // Settings are global tunables.
@@ -275,6 +280,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
 	enabled INTEGER NOT NULL DEFAULT 1,
 	allowed_models TEXT NOT NULL DEFAULT '[]',
 	expires_at INTEGER NOT NULL DEFAULT 0,
+	monthly_budget REAL NOT NULL DEFAULT 0,
+	rpm INTEGER NOT NULL DEFAULT 0,
+	tpm INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL,
 	last_used_at INTEGER NOT NULL DEFAULT 0
 );
@@ -335,6 +343,15 @@ CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_a
 		{"cost_source", `TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := s.ensureColumn("request_logs", c[0], c[1]); err != nil {
+			return err
+		}
+	}
+	for _, c := range [][2]string{
+		{"monthly_budget", `REAL NOT NULL DEFAULT 0`},
+		{"rpm", `INTEGER NOT NULL DEFAULT 0`},
+		{"tpm", `INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if err := s.ensureColumn("api_keys", c[0], c[1]); err != nil {
 			return err
 		}
 	}
@@ -895,13 +912,13 @@ func (s *Store) DeleteModel(id int64) error {
 
 // ---------- api keys ----------
 
-const keyCols = `id, name, key, enabled, allowed_models, expires_at, created_at, last_used_at`
+const keyCols = `id, name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, created_at, last_used_at`
 
 func scanKey(sc interface{ Scan(...any) error }) (*APIKey, error) {
 	k := &APIKey{}
 	var allowed string
 	var enabled int
-	if err := sc.Scan(&k.ID, &k.Name, &k.Key, &enabled, &allowed, &k.ExpiresAt, &k.CreatedAt, &k.LastUsedAt); err != nil {
+	if err := sc.Scan(&k.ID, &k.Name, &k.Key, &enabled, &allowed, &k.ExpiresAt, &k.MonthlyBudget, &k.RPM, &k.TPM, &k.CreatedAt, &k.LastUsedAt); err != nil {
 		return nil, err
 	}
 	k.Enabled = enabled == 1
@@ -941,14 +958,25 @@ func RandomToken(prefix string, nbytes int) string {
 // the platform; custom values are not accepted.
 func NewAPIKeyValue() string { return RandomToken("sk-route-", 24) }
 
+func normalizeKey(k *APIKey) error {
+	k.Name = strings.TrimSpace(k.Name)
+	k.AllowedModels = cleanList(k.AllowedModels)
+	if k.MonthlyBudget < 0 || k.RPM < 0 || k.TPM < 0 {
+		return errors.New("monthly_budget, rpm and tpm must not be negative")
+	}
+	return nil
+}
+
 func (s *Store) CreateKey(k *APIKey) error {
 	k.Key = NewAPIKeyValue()
-	k.AllowedModels = cleanList(k.AllowedModels)
+	if err := normalizeKey(k); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := now()
-	res, err := s.db.Exec(`INSERT INTO api_keys (name, key, enabled, allowed_models, expires_at, created_at) VALUES (?,?,?,?,?,?)`,
-		k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, t)
+	res, err := s.db.Exec(`INSERT INTO api_keys (name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, t)
 	if err != nil {
 		return friendlyErr(err)
 	}
@@ -957,14 +985,16 @@ func (s *Store) CreateKey(k *APIKey) error {
 	return s.reloadLocked()
 }
 
-// UpdateKey updates name/enabled/allowed models/expiry. The key value itself
-// never changes here; use RotateKey.
+// UpdateKey updates name/enabled/allowed models/expiry/limits. The key value
+// itself never changes here; use RotateKey.
 func (s *Store) UpdateKey(k *APIKey) error {
-	k.AllowedModels = cleanList(k.AllowedModels)
+	if err := normalizeKey(k); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`UPDATE api_keys SET name=?, enabled=?, allowed_models=?, expires_at=? WHERE id=?`,
-		k.Name, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.ID)
+	res, err := s.db.Exec(`UPDATE api_keys SET name=?, enabled=?, allowed_models=?, expires_at=?, monthly_budget=?, rpm=?, tpm=? WHERE id=?`,
+		k.Name, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.ID)
 	if err != nil {
 		return friendlyErr(err)
 	}
@@ -1151,8 +1181,11 @@ func (s *Store) Import(e *Export) error {
 		if k.Key == "" {
 			continue
 		}
-		if _, err := tx.Exec(`INSERT INTO api_keys (name, key, enabled, allowed_models, expires_at, created_at) VALUES (?,?,?,?,?,?)`,
-			k.Name, k.Key, b2i(k.Enabled), mustJSON(cleanList(k.AllowedModels)), k.ExpiresAt, t); err != nil {
+		if err := normalizeKey(k); err != nil {
+			return fmt.Errorf("api key %q: %w", k.Name, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO api_keys (name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+			k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, t); err != nil {
 			return friendlyErr(err)
 		}
 	}

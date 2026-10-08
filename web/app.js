@@ -1053,18 +1053,32 @@ function modelTest(m) {
 function maskApiKey(k) { return k.length > 14 ? k.slice(0, 10) + '••••••' + k.slice(-4) : k; }
 
 async function pageKeys() {
-  const [keys, models] = await Promise.all([api('GET', '/keys'), api('GET', '/models')]);
+  const [keys, models, st] = await Promise.all([api('GET', '/keys'), api('GET', '/models'), api('GET', '/settings')]);
+  const limitsHTML = (k) => {
+    const parts = [];
+    if (k.rpm) parts.push(`${fmtNum(k.rpm)} 次/分`);
+    if (k.tpm) parts.push(`${fmtNum(k.tpm)} tokens/分`);
+    return parts.length ? parts.join('<br>') : '<span class="muted">不限</span>';
+  };
+  const spendHTML = (k) => {
+    const spent = fmtMoney(k.month_cost, st.currency);
+    if (!k.monthly_budget) return `${spent} <span class="muted">/ 不限</span>`;
+    const over = k.month_cost >= k.monthly_budget;
+    return `<span class="${over ? 'err-text' : ''}">${spent} / ${fmtMoney(k.monthly_budget, st.currency)}</span>${over ? ' <span class="badge err">已超预算</span>' : ''}`;
+  };
   $('#page').innerHTML = `
-    ${head('API Keys', '发给使用方的 Key；可单独停用、设置到期时间、限制可用模型', '<button class="btn primary" id="add-key">+ 创建 Key</button>')}
+    ${head('API Keys', '发给使用方的 Key；可单独停用、设置到期时间、限制可用模型、预算和请求频率', '<button class="btn primary" id="add-key">+ 创建 Key</button>')}
     <div class="card">
       ${keys.length ? `<div class="table-wrap"><table>
-        <tr><th>名称</th><th>Key</th><th>可用模型</th><th>到期</th><th>最近使用</th><th>状态</th><th></th></tr>
+        <tr><th>名称</th><th>Key</th><th>可用模型</th><th>本月费用 / 预算</th><th>限流</th><th>到期</th><th>最近使用</th><th>状态</th><th></th></tr>
         ${keys.map((k) => {
           const expired = k.expires_at && k.expires_at < Date.now();
           return `<tr>
             <td>${esc(k.name || '-')}</td>
             <td class="mono small"><span class="copy" data-copy="${esc(k.key)}" title="点击复制完整 Key">${esc(maskApiKey(k.key))}</span></td>
             <td class="small">${k.allowed_models.length ? k.allowed_models.map((x) => `<span class="badge">${esc(x)}</span>`).join(' ') : '<span class="muted">全部</span>'}</td>
+            <td class="small">${spendHTML(k)}</td>
+            <td class="small">${limitsHTML(k)}</td>
             <td class="small">${k.expires_at ? `<span class="${expired ? 'err-text' : ''}">${fmtTime(k.expires_at)}</span>` : '<span class="muted">永不</span>'}</td>
             <td class="small">${fmtAgo(k.last_used_at)}</td>
             <td>${!k.enabled ? '<span class="badge">停用</span>' : expired ? '<span class="badge err">已过期</span>' : '<span class="badge ok">启用</span>'}</td>
@@ -1076,9 +1090,9 @@ async function pageKeys() {
         }).join('')}
       </table></div>` : '<div class="empty">还没有 API Key</div>'}
     </div>`;
-  $('#add-key').onclick = () => keyForm(null, models);
+  $('#add-key').onclick = () => keyForm(null, models, st);
   $$('[data-copy]').forEach((el) => el.onclick = () => copyText(el.dataset.copy));
-  $$('[data-edit]').forEach((b) => b.onclick = () => keyForm(keys.find((k) => k.id == b.dataset.edit), models));
+  $$('[data-edit]').forEach((b) => b.onclick = () => keyForm(keys.find((k) => k.id == b.dataset.edit), models, st));
   $$('[data-del]').forEach((b) => b.onclick = async () => {
     const k = keys.find((x) => x.id == b.dataset.del);
     if (!(await confirmBox(`删除 Key ${k.name || maskApiKey(k.key)}？使用它的客户端会立即无法访问。`))) return;
@@ -1103,9 +1117,10 @@ function showNewKey(title, key) {
   });
 }
 
-function keyForm(k, models) {
+function keyForm(k, models, st) {
   const isNew = !k;
-  k = k || { name: '', key: '', enabled: true, allowed_models: [], expires_at: 0 };
+  k = k || { name: '', key: '', enabled: true, allowed_models: [], expires_at: 0, monthly_budget: 0, rpm: 0, tpm: 0 };
+  const sign = CURRENCY_SIGN[st.currency] || '';
   openModal({
     title: isNew ? '创建 API Key' : '编辑 API Key',
     body: `<div class="form">
@@ -1114,6 +1129,11 @@ function keyForm(k, models) {
         ? '<div class="help">保存后由平台自动生成（sk-route-…），不支持自定义</div>'
         : `<div class="toolbar"><code class="mono">${esc(maskApiKey(k.key))}</code><button type="button" class="btn sm danger" id="kf-rotate">重新生成</button></div><div class="help">重新生成后旧 Key 立即失效</div>`}</div>
       <div class="field"><label>到期时间（可选）</label><input type="datetime-local" id="kf-exp" value="${toLocalInput(k.expires_at)}"></div>
+      <div class="row3">
+        <div class="field"><label>月预算（${sign}，可选）</label><input type="number" id="kf-budget" min="0" step="any" value="${k.monthly_budget || ''}" placeholder="不限"><div class="help">本月费用达到后拒绝请求（402），每月 1 日恢复；按“设置与接入”里的统计货币计</div></div>
+        <div class="field"><label>每分钟请求数 RPM</label><input type="number" id="kf-rpm" min="0" value="${k.rpm || ''}" placeholder="不限"><div class="help">超过时返回 429，并带上 Retry-After</div></div>
+        <div class="field"><label>每分钟 tokens TPM</label><input type="number" id="kf-tpm" min="0" value="${k.tpm || ''}" placeholder="不限"><div class="help">按最近一分钟已完成请求的输入 + 输出计</div></div>
+      </div>
       <div class="field"><label>可用模型（都不勾选 = 全部可用）</label>
         <div class="btns">${models.map((m) => `<label class="check badge"><input type="checkbox" value="${esc(m.name)}" ${k.allowed_models.includes(m.name) ? 'checked' : ''}> ${esc(m.name)}</label>`).join('') || '<span class="muted small">暂无模型</span>'}</div>
       </div>
@@ -1136,7 +1156,11 @@ function keyForm(k, models) {
           enabled: $('#kf-enabled', root).checked,
           expires_at: exp ? new Date(exp).getTime() : 0,
           allowed_models: $$('.btns input[type=checkbox]:checked', root).map((c) => c.value),
+          monthly_budget: Number($('#kf-budget', root).value) || 0,
+          rpm: Math.floor(Number($('#kf-rpm', root).value) || 0),
+          tpm: Math.floor(Number($('#kf-tpm', root).value) || 0),
         };
+        if (body.monthly_budget < 0 || body.rpm < 0 || body.tpm < 0) return toast('预算和限流不能为负数', 'err');
         try {
           if (isNew) {
             const created = await api('POST', '/keys', body);

@@ -349,3 +349,56 @@ func mustNil(t *testing.T, err error) {
 		t.Fatal(err)
 	}
 }
+
+func TestKeyLimitsPersist(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.CreateKey(&APIKey{Name: "x", RPM: -1}); err == nil {
+		t.Fatal("negative rpm accepted")
+	}
+	k := &APIKey{Name: "x", Enabled: true, MonthlyBudget: 12.5, RPM: 30, TPM: 100000}
+	mustNil(t, st.CreateKey(k))
+	got := st.Snapshot().Keys[k.Key]
+	if got.MonthlyBudget != 12.5 || got.RPM != 30 || got.TPM != 100000 {
+		t.Fatalf("after create: %+v", got)
+	}
+	k.RPM, k.MonthlyBudget = 0, 0
+	mustNil(t, st.UpdateKey(k))
+	if got := st.Snapshot().Keys[k.Key]; got.RPM != 0 || got.TPM != 100000 || got.MonthlyBudget != 0 {
+		t.Fatalf("after update: %+v", got)
+	}
+	e, _ := st.Export()
+	mustNil(t, st.Import(e))
+	if got := st.Snapshot().Keys[k.Key]; got == nil || got.TPM != 100000 {
+		t.Fatalf("after import: %+v", got)
+	}
+}
+
+func TestKeySpend(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now()
+	month := MonthStart(now)
+	if d := time.UnixMilli(month); d.Day() != 1 || d.Hour() != 0 || d.After(now) {
+		t.Fatalf("MonthStart: %v", d)
+	}
+	st.insertLogs([]*RequestLog{
+		{CreatedAt: now.UnixMilli(), KeyID: 1, Cost: 1, Currency: "USD"},
+		{CreatedAt: now.UnixMilli(), KeyID: 1, Cost: 2, Currency: "CNY"},
+		{CreatedAt: month - 1, KeyID: 1, Cost: 100, Currency: "CNY"}, // last month
+		{CreatedAt: now.UnixMilli(), KeyID: 2, Cost: 3, Currency: "CNY"},
+	})
+	got, err := st.KeySpend(month)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(got[1]-9.2) > 1e-9 || got[2] != 3 { // 1 USD * 7.2 + 2
+		t.Fatalf("spend: %v", got)
+	}
+}

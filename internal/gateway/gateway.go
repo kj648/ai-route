@@ -28,6 +28,7 @@ const maxBodyBytes = 64 << 20
 type Gateway struct {
 	store   *store.Store
 	Breaker *Breaker
+	Limiter *Limiter
 	client  *http.Client
 
 	touchMu sync.Mutex
@@ -48,6 +49,7 @@ func New(s *store.Store) *Gateway {
 	return &Gateway{
 		store:   s,
 		Breaker: NewBreaker(s.GetSettings),
+		Limiter: NewLimiter(s),
 		client:  &http.Client{Transport: transport},
 		touched: map[int64]time.Time{},
 	}
@@ -227,7 +229,25 @@ func (g *Gateway) handle(w http.ResponseWriter, r *http.Request, inbound string)
 		writeError(w, inbound, http.StatusRequestEntityTooLarge, "request body too large")
 		return
 	}
-	g.route(w, r, inbound, body, key)
+	if rej := g.Limiter.Admit(key); rej != nil {
+		g.reject(w, r, inbound, body, key, rej)
+		return
+	}
+	g.Limiter.Record(key, g.route(w, r, inbound, body, key))
+}
+
+// reject answers a request refused by the key's limits and logs it.
+func (g *Gateway) reject(w http.ResponseWriter, r *http.Request, inbound string, body []byte, key *store.APIKey, rej *rejection) {
+	info, _ := convert.ParseRequestInfo(body)
+	g.store.AddLog(&store.RequestLog{
+		CreatedAt: time.Now().UnixMilli(), KeyID: key.ID, KeyName: key.Name,
+		RequestedModel: info.Model, Inbound: inbound, Stream: info.Stream,
+		HTTPStatus: rej.status, Error: rej.msg, ClientIP: clientIP(r),
+	})
+	if rej.retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(rej.retryAfter.Seconds())+1))
+	}
+	writeError(w, inbound, rej.status, rej.msg)
 }
 
 // route resolves the public model and tries its targets in order.
