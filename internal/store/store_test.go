@@ -459,6 +459,7 @@ func TestBodyRules(t *testing.T) {
 	p := &Provider{Prefix: "bl", OpenAIBaseURL: "http://a/v1", AnthropicBaseURL: "http://a", Enabled: true, BodyRules: []BodyRule{
 		{Model: "qwen3-*", When: "nonstream", Protocol: "openai", Set: json.RawMessage(`{"enable_thinking":false}`)},
 		{Model: "qwen3-32b", Set: json.RawMessage(`{"top_k":20}`)},
+		{Model: "gpt-*", Protocol: "responses", Set: json.RawMessage(`{"store":false}`)},
 	}}
 	mustNil(t, st.CreateProvider(p))
 	got := st.Snapshot().Providers["bl"]
@@ -476,6 +477,9 @@ func TestBodyRules(t *testing.T) {
 	}
 	if r := got.RulesFor("qwen3-8b", "anthropic", false); len(r) != 0 {
 		t.Fatalf("anthropic: %v", names(r))
+	}
+	if r := got.RulesFor("gpt-x", "responses", true); len(r) != 1 {
+		t.Fatalf("responses rule: %v", names(r))
 	}
 	if r := got.RulesFor("qwen-plus", "openai", false); len(r) != 0 {
 		t.Fatalf("no match: %v", names(r))

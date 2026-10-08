@@ -371,7 +371,7 @@ function parsePrices(text) {
 const toPriceLines = (prices) => Object.entries(prices || {})
   .map(([k, v]) => `${k} = ${v.input} / ${v.cache != null ? v.cache + ' / ' : ''}${v.output}`).join('\n');
 // request body rules: "model(*) [stream|nonstream, openai|anthropic|embeddings] = {json}"
-const RULE_TAGS = { stream: 'when', nonstream: 'when', openai: 'protocol', anthropic: 'protocol', embeddings: 'protocol', rerank: 'protocol' };
+const RULE_TAGS = { stream: 'when', nonstream: 'when', openai: 'protocol', anthropic: 'protocol', responses: 'protocol', embeddings: 'protocol', rerank: 'protocol' };
 function parseRules(text) {
   const rules = [];
   for (const raw of text.split('\n')) {
@@ -381,7 +381,7 @@ function parseRules(text) {
     if (!m) throw new Error('参数规则格式不对：' + line);
     const rule = { model: m[1] };
     for (const tag of (m[2] || '').split(/[,\s]+/).filter(Boolean)) {
-      if (!RULE_TAGS[tag]) throw new Error(`参数规则的条件只能是 stream、nonstream、openai、anthropic、embeddings、rerank：${line}`);
+      if (!RULE_TAGS[tag]) throw new Error(`参数规则的条件只能是 stream、nonstream、openai、anthropic、responses、embeddings、rerank：${line}`);
       rule[RULE_TAGS[tag]] = tag;
     }
     try { rule.set = JSON.parse(m[3]); } catch (e) { throw new Error('参数规则的 JSON 不对：' + line); }
@@ -637,7 +637,7 @@ function providerForm(p, models, providers) {
           </div>
           <div class="field"><label>请求参数规则</label>
             <textarea id="pf-rules" placeholder='qwen3-* [nonstream] = {"enable_thinking": false}'>${esc(toRuleLines(p.body_rules))}</textarea>
-            <div class="help">每行 <code>模型(可用*) [条件] = JSON</code>，把 JSON 合并进发给上游的请求体（协议转换之后），值为 <code>null</code> 表示删除该字段。条件可选：<code>stream</code> / <code>nonstream</code>，<code>openai</code> / <code>anthropic</code> / <code>embeddings</code> / <code>rerank</code>，多个用逗号分隔</div></div>
+            <div class="help">每行 <code>模型(可用*) [条件] = JSON</code>，把 JSON 合并进发给上游的请求体（协议转换之后），值为 <code>null</code> 表示删除该字段。条件可选：<code>stream</code> / <code>nonstream</code>，<code>openai</code> / <code>anthropic</code> / <code>responses</code> / <code>embeddings</code> / <code>rerank</code>，多个用逗号分隔</div></div>
           <div class="field"><label>单价（每百万 tokens，用于成本核算）
               <select id="pf-currency" style="margin-left:8px">${['CNY', 'USD'].map((c) => `<option value="${c}" ${(p.currency || 'CNY') === c ? 'selected' : ''}>${c === 'CNY' ? '人民币 ¥' : '美元 $'}</option>`).join('')}</select></label>
             <textarea id="pf-prices" placeholder="glm-5.3 = 4 / 0.8 / 16&#10;deepseek-* = 2 / 8">${esc(toPriceLines(p.prices))}</textarea>
@@ -1332,7 +1332,7 @@ async function pageLogs() {
           <td class="small">${esc(l.public_model || l.requested_model)}${l.public_model && l.requested_model !== l.public_model ? `<div class="muted">${esc(l.requested_model)}</div>` : ''}</td>
           <td class="small mono">${l.provider ? esc(l.provider + '/' + l.upstream_model) : '-'}${l.fallback ? ' <span class="badge warn">切换</span>' : ''}</td>
           <td class="small">${esc(l.inbound)}${l.upstream_protocol && l.upstream_protocol !== l.inbound ? ' → ' + esc(l.upstream_protocol) : ''}${l.stream ? ' <span class="badge">流</span>' : ''}</td>
-          <td>${l.success ? '<span class="badge ok">成功</span>' : `<span class="badge err" title="${esc(l.error)}">${l.http_status || '失败'}</span>`}</td>
+          <td>${l.success ? '<span class="badge ok">成功</span>' : `<span class="badge err" title="${esc(l.error)}">${l.http_status && l.http_status !== 200 ? l.http_status : '失败'}</span>`}</td>
           <td class="num small">${fmtMs(l.latency_ms)}</td>
           <td class="num small">${l.ttfb_ms ? fmtMs(l.ttfb_ms) : '-'}</td>
           <td class="num small">${fmtNum(l.input_tokens)} / ${fmtNum(l.output_tokens)}</td>

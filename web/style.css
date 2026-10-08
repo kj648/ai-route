@@ -126,6 +126,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--p
 .check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
 .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .toolbar select, .toolbar input { width: auto; min-width: 140px; }
+.toolbar input[type=checkbox], .toolbar input[type=radio] { min-width: 0; }
 
 .tag { display: inline-flex; align-items: center; border: 1px solid transparent; border-radius: 999px; padding: 1px 9px; font-size: 12px; line-height: 1.6; background: var(--code); color: var(--muted); font-family: inherit; white-space: nowrap; }
 button.tag { cursor: pointer; border-color: var(--border); background: var(--panel); }

@@ -84,7 +84,7 @@ type BodyRule struct {
 	Model string `json:"model"` // exact name or '*' glob
 	// When: "" (always) | "stream" | "nonstream"
 	When string `json:"when,omitempty"`
-	// Protocol: "" (any) | "openai" | "anthropic" | "embeddings" | "rerank"
+	// Protocol: "" (any) | "openai" | "anthropic" | "responses" | "embeddings" | "rerank"
 	Protocol string `json:"protocol,omitempty"`
 	// Set is a JSON object deep-merged into the body; a null value deletes
 	// the field.
@@ -708,7 +708,7 @@ func normalizeProvider(p *Provider) error {
 			return fmt.Errorf("body_rules[%d]: when must be stream or nonstream, got %q", i, r.When)
 		}
 		switch r.Protocol {
-		case "", "openai", "anthropic", "embeddings", "rerank":
+		case "", "openai", "anthropic", "responses", "embeddings", "rerank":
 		default:
 			return fmt.Errorf("body_rules[%d]: unknown protocol %q", i, r.Protocol)
 		}

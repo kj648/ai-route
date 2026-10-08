@@ -1,193 +1,150 @@
+<div align="center">
+
 # AI Route
 
-把多个大模型套餐（Kimi Code、GLM Coding Plan、OpenCode Go、百炼 Coding Plan、火山方舟 Coding Plan 等）聚合成**一个**对外入口。客户端只需要知道平台地址、平台发的 Key 和平台定义的模型名。上游套餐的地址、Key、模型映射和候补顺序都在 Web 后台里配置，改完立即生效。
+**把手上的多个大模型套餐，变成一个稳定、好管理的 API 入口**
 
-- **三种协议都支持**：对外同时提供 OpenAI 的 `/v1/chat/completions` 和 `/v1/responses`（Codex CLI 可以直接用），以及 Anthropic 兼容的 `/v1/messages`（Claude Code 可以直接用）。上游有同协议端点就直通，没有就自动转换协议，流式和非流式都支持，包括工具调用和思考内容。
-- **供应商**：内置 40 个预设，覆盖编码套餐、各家官方按量 API、聚合平台，选中后自动填好地址、协议、常用模型和需要的请求头，也支持自定义；每个供应商可以单独设置 User-Agent 策略。填写 Key 后模型列表会自动从上游拉取，也可以手动增删。每个套餐有一个前缀，它的模型统一显示为 `前缀/模型名`，用来区分不同套餐。
-- **模型映射 + 调度顺序**：给模型起一个对外名字（如 `dess`），从全部 `前缀/模型名` 里点选要映射的模型并排好顺序，例如 `kimi/k3 → bailian/kimi-k3 → opencode/deepseek`。前一个不可用时自动切到下一个。同一优先级可以放多个上游（比如同一家的多个 Key），按权重分流。
-- **先重试再切换**：遇到短暂错误（断连、5xx、上游过载、短时限流），先在同一个模型上按退避间隔重试，仍然失败才切换。这样网络抖动不会把会话切到别的套餐，避免提示词缓存失效和效果变差。
-- **熔断冷却**：套餐额度用尽或 Key 失效时，整个套餐冷却；模型在重试后仍连续失败时，这个模型冷却。冷却期间排到调度顺序最后兜底，冷却时长按指数退避。
-- **多个对外 Key**：可以给不同人、不同工具单独发 Key，单独停用，设置到期时间，限制可用模型，设置月预算和每分钟请求数 / tokens 上限。
-- **请求日志与统计**：记录每次请求实际走了哪个上游、发生了几次切换、耗时、首字时间、token 用量和费用。概览页按模型、上游、套餐、Key 分别统计。
-- **成本核算**：按量计费的供应商可以给每个模型配置输入、缓存命中、输出单价；OpenRouter 直接使用上游返回的实际费用。
-- **自建模型**：vLLM、SGLang、Ollama 等自己部署的模型可以设置并发上限（满了溢出到下一个候补）、主动健康检查和单独的首包超时。
-- **失效告警**：上游 Key 失效或欠费、整条调度链全部失败、长时间冷却时，推送到飞书、钉钉、企业微信群机器人或任意 Webhook。
-- **单个二进制**：Go 编写，内置 SQLite 和 Web 控制台，没有外部依赖。
+Kimi Code · GLM Coding Plan · 百炼 · 火山方舟 · OpenCode Go · OpenRouter · 自建 vLLM……一次接入，自动切换
 
----
+[![CI](https://github.com/OWNER/ai-route/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/ai-route/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/tag/OWNER/ai-route?label=release)](https://github.com/OWNER/ai-route/tags)
+[![Go](https://img.shields.io/github/go-mod/go-version/OWNER/ai-route)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+</div>
+
+![控制台概览](docs/images/dashboard.png)
+
+AI Route 是一个自托管的大模型 API 网关。你把各家套餐的地址和 Key 配进去，给模型起一个对外的名字，排好"先用谁、不行再用谁"的顺序，然后给自己和团队发网关的 Key。Claude Code、Codex、Cursor 系插件、Cherry Studio 等客户端只需要连这一个地址，剩下的事情由网关处理：选上游、转换协议、出错重试和切换、限流记账、出问题告警。
+
+单个 Go 二进制，内置 SQLite 和 Web 控制台，没有外部依赖，`docker compose up -d` 即可运行。
+
+## 为什么需要它
+
+如果你同时用着几个编码套餐或按量 API，大概率遇到过这些问题：
+
+- **每个客户端都要配一遍**：Claude Code 配一套，Codex 配一套，Cherry Studio 再配一套；换个套餐要改一圈。
+- **额度用完、Key 失效要手动换**：写到一半被 429 打断，只能停下来改配置。
+- **协议对不上**：Claude Code 只说 Anthropic 协议，Codex 只说 OpenAI Responses 协议，而你手上的套餐有的只给 OpenAI 接口，有的只给 Anthropic 接口。
+- **团队共用时管不住**：谁用了多少、花了多少钱、能用哪些模型，都不清楚。
+
+AI Route 就是为解决这些问题写的。
+
+## 功能特性
+
+**统一接入**
+- 三种协议都提供：OpenAI 的 `/v1/chat/completions`、`/v1/responses`，Anthropic 的 `/v1/messages`，另有 `/v1/embeddings`、`/v1/rerank`、`/v1/models`。
+- 上游有同协议端点就直通，没有就自动转换，流式和非流式都支持，包括工具调用、思考内容、图片和提示词缓存标记。
+- 内置 40 个供应商预设（编码套餐、各家官方 API、聚合平台），选中后自动填好地址、协议规则和必要的请求头。
+
+**智能调度**
+- 给模型起对外名字（如 `coder`），按顺序映射到多个上游，前一个不可用就自动切下一个。
+- 先重试再切换：网络抖动、5xx、短时限流先在同一个上游重试，避免会话被切走、提示词缓存失效。
+- 熔断冷却：额度用尽、Key 失效时整个套餐冷却，冷却期间排到最后兜底，时长指数退避。
+- 同级分流：同一优先级放多个上游（比如同一家的两个 Key），按权重分流，同一会话固定走同一个。
+
+**管理与成本**
+- 多个对外 Key：可以限制可用模型、设到期时间、月预算、每分钟请求数和 tokens。
+- 请求日志记录实际走了哪个上游、切换了几次、耗时、首字时间、用量和费用。
+- 成本核算：给按量模型配单价，OpenRouter 直接用实际扣费；概览按模型、上游、套餐、Key 汇总。
+- 失效告警：推送到飞书、钉钉、企业微信群机器人或任意 Webhook。
+
+**自建与扩展**
+- 自建模型（vLLM、SGLang、Ollama 等）：并发上限与溢出、主动健康检查、单独的首包超时。
+- 请求头模板：透传调用方的头，或按规则生成会话 ID 等动态值。
+- 请求参数规则：按模型给请求体注入或删除参数，比如百炼 Qwen3 非流式时关闭思考。
+
+## 工作原理
+
+```mermaid
+flowchart LR
+    subgraph C[客户端]
+        CC[Claude Code<br/>Anthropic 协议]
+        CX[Codex CLI<br/>Responses 协议]
+        OT[Cherry Studio / SDK / 插件<br/>OpenAI 协议]
+    end
+    subgraph G[AI Route]
+        AUTH[鉴权 · 限流 · 预算]
+        MAP[模型映射<br/>coder → 调度顺序]
+        CONV[协议转换]
+        RETRY[重试 · 切换 · 熔断]
+    end
+    subgraph U[上游]
+        K[Kimi Code]
+        G[GLM Coding Plan]
+        O[OpenCode Go]
+        V[自建 vLLM]
+    end
+    CC & CX & OT --> AUTH --> MAP --> CONV --> RETRY
+    RETRY -->|首选| K
+    RETRY -.->|失败时| G
+    RETRY -.-> O
+    RETRY -.-> V
+```
+
+一个请求进来后：校验网关 Key 和限额 → 按请求里的 `model` 找到映射 → 按调度顺序挑上游（冷却中的排到最后）→ 转换成上游的协议 → 发出请求，遇到短暂错误先重试，仍失败再切下一个 → 把响应转回客户端的协议 → 记日志和费用。
 
 ## 快速开始
 
-### Docker Compose（推荐）
+### 方式一：Docker Compose（推荐）
 
 ```bash
-cp .env.example .env        # 修改 ADMIN_TOKEN
+git clone https://github.com/OWNER/ai-route.git
+cd ai-route
+cp .env.example .env        # 把 ADMIN_TOKEN 改成一串足够长的随机字符串
 docker compose up -d --build
 ```
 
-在国内构建时，如果 Docker Hub、`proxy.golang.org` 或 Alpine 官方源访问不畅，可以把 `.env.example` 末尾那几行国内配置复制到 `.env` 里，取消注释：Go 模块走 `goproxy.cn`，基础镜像走 DaoCloud 镜像站（`m.daocloud.io/docker.io/library/…`），Alpine 软件源走阿里云。也可以先手动拉好基础镜像（`docker pull golang:1.27-alpine`、`docker pull alpine:3.22`），再构建。
+打开 `http://服务器:8080/admin/`，用 `ADMIN_TOKEN` 登录。数据保存在 Docker 卷 `ai-route-data` 里，重建容器不会丢。
 
-打开 `http://服务器:8080/admin/`，用 `ADMIN_TOKEN` 登录。数据保存在 `ai-route-data` 卷里。
+> 国内构建时，如果 Docker Hub、`proxy.golang.org` 或 Alpine 官方源访问不畅，把 `.env.example` 末尾的国内配置复制到 `.env` 并取消注释即可：Go 模块走 `goproxy.cn`，基础镜像走 DaoCloud 镜像站，Alpine 软件源走阿里云。也可以先手动 `docker pull golang:1.27-alpine` 和 `docker pull alpine:3.22` 再构建。
 
-### 直接运行
+### 方式二：直接运行
+
+需要 Go 1.27 或更高版本：
 
 ```bash
 go build -o bin/ai-route .
-ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080，数据在 ./data
-./bin/ai-route -listen :9000 -data /var/lib/ai-route  # 也可以用参数
+ADMIN_TOKEN=换成你的令牌 ./bin/ai-route                # 默认监听 :8080，数据在 ./data
+./bin/ai-route -listen :9000 -data /var/lib/ai-route    # 也可以用参数
 ```
 
-不设置 `ADMIN_TOKEN` 时，首次启动会生成一个 `admin-xxxx` 令牌并打印到日志里（同时保存在数据库）。
+不设置 `ADMIN_TOKEN` 时，首次启动会生成一个 `admin-xxxx` 令牌，打印在日志里并保存到数据库。
 
-| 环境变量 | 默认 | 说明 |
+| 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `LISTEN` | `:8080` | 监听地址 |
 | `DATA_DIR` | `./data` | SQLite 数据目录 |
 | `ADMIN_TOKEN` | 自动生成 | 管理后台令牌 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | 访问上游时使用的代理 |
 
----
+### 五分钟上手
 
-## 配置三步走
+1. **添加供应商**：在“供应商”页面点“添加供应商”，选一个预设（比如 Kimi Code），填上 Key。模型列表会自动从上游拉取，拉不到就手动输入。
+2. **建模型映射**：在“模型映射”页面添加一个对外模型，比如 `coder`，从下面点选要用的上游模型，点选的先后就是调度顺序。
+3. **发 API Key**：在“API Keys”页面创建一个 Key，复制保存。
+4. **接入客户端**：在“设置与接入”的接入向导里，选好客户端、Key 和模型，复制生成的配置。
 
-### 1. 添加供应商
+用 curl 验证一下：
 
-在“供应商”页面点“添加供应商”，从预设里选一个（可以按分类筛选，也可以搜索），地址、兼容方案、常用模型、协议规则、需要的请求头都会自动填好。然后填 Key：填完会自动尝试从上游拉取模型列表；拉不到的话（很多 coding plan 不开放 `/models`），手动输入、回车添加即可。保存后也可以点“同步模型”增量拉取。选“自定义”就全部手动填写。
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-route-你的Key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"coder","messages":[{"role":"user","content":"你好"}]}'
+```
 
-内置 40 个预设，定义在 [web/presets.js](web/presets.js)。同一家厂商的**编码套餐**和**按量 API** 是分开的两个预设，因为它们的地址和 Key 都不通用，比如 Kimi Code 和 Kimi 开放平台：
+响应头 `X-Route-Target` 会告诉你这次实际走的是哪个上游。
 
-| 分类 | 预设 |
+## 截图
+
+| 供应商 | 模型映射：调度顺序与同级分流 |
 |---|---|
-| 编码套餐 | Kimi Code（国内 / 海外）、智谱 GLM Coding Plan、Z.ai Coding Plan、阿里云百炼 Coding Plan、QwenCloud Coding、千问 Token Plan、火山方舟 Coding Plan / Agent Plan、BytePlus Coding Plan、MiniMax Token Plan（国内 / 国际）、OpenCode Go、阶跃 Step Plan、腾讯云 Token Plan、百度千帆 Token Plan、KAT-Coder |
-| 官方 API（按量） | Kimi 开放平台（国内 / 海外）、智谱开放平台、Z.ai、阿里云百炼、火山方舟、DeepSeek、MiniMax、阶跃星辰、腾讯混元、小米 MiMo、美团 LongCat、OpenAI、Anthropic、Google Gemini、xAI |
-| 聚合平台 | OpenCode Zen、OpenRouter、硅基流动、魔搭 ModelScope、Novita、AiHubMix、PackyCode |
-
-> 预设整理自各家官方文档和 cc-switch 的预设（2026-10）。套餐经常调整，**请以厂商控制台为准**，添加后点“测试”验证。未能完全确认的预设会在表单里标出。
-
-- **前缀**是供应商的唯一标识，模型映射里用 `前缀/模型名` 来引用。前缀**自动生成，不需要手填**：
-  1. 选了预设就用预设的前缀，比如 Kimi Code 是 `kimi`、Kimi 开放平台是 `moonshot`；
-  2. 自定义供应商从地址的域名提取，会跳过 `api`、`open`、`coding` 这类通用词，比如 `api.deepseek.com` 得到 `deepseek`，`coding.dashscope.aliyuncs.com` 得到 `dashscope`；
-  3. 域名取不到时（比如 IP 地址），用名称里的字母和数字，再不行就用 `provider`；
-  4. 重名时加数字后缀：`kimi`、`kimi-2`、`kimi-3`。
-
-  前缀创建后固定不变。
-- 两个地址**至少填一个**。客户端用哪种协议请求，就优先走同协议地址，没有就自动转换。
-- **模型协议规则**：有些供应商的不同模型只在一种端点上提供（比如 OpenCode Go 的 MiniMax / Qwen 只走 `/messages`，GPT Luna / Grok 只走 `/responses`），可以按 `模型(支持 *) = openai|anthropic|responses` 强制指定，`responses` 指 OpenAI 地址下的 `/responses`。相关预设已经预填好。
-- **Responses API**：勾选“OpenAI 地址也支持 Responses API”后，Codex 等 Responses 客户端的请求会原样转发给这个供应商；不勾选就转换成 Chat Completions 发送。OpenAI 官方预设已经勾选。多数 OpenAI 兼容厂商（Kimi、GLM、DeepSeek 等）没有 `/responses`，不要勾。
-- **请求头透传**：调用方的请求头默认原样转发给上游，但不会转发：网关自己的凭证（`Authorization`、`x-api-key`）、`Cookie`、`Accept-Encoding`、逐跳头（`Connection` 等）、暴露用户身份的头（`X-Forwarded-*`、`X-Real-IP`、`Origin`、`Referer`、`Sec-*`、`CF-*`），以及跨协议时对面协议专属的头（`anthropic-*` / `openai-*`）。个别上游对多余请求头敏感时，可以在“高级设置”里关掉“透传调用方的请求头”。
-- **自定义请求头**：每行写 `Header: 值`，会覆盖调用方的同名头，值留空表示删除该头。值可以是固定文本，也可以引用调用方的头或内置变量：
-
-  | 写法 | 含义 |
-  |---|---|
-  | `X-Foo: abc` | 固定值 |
-  | `X-Foo: {{header.X-Bar}}` | 取调用方的 `X-Bar`，**必传**：首选上游（调度顺序第一级里启用的供应商，含并列组）要求而调用方没带时，直接返回 400；作为候补时缺了就不发 |
-  | `X-Foo: {{header.X-Bar?}}` | 取调用方的值，可选，没带就不发 |
-  | `X-Foo: {{header.X-Bar ?? $conversation}}` | 调用方带了就用它的，没带由平台生成；也可以写 `?? "默认值"` |
-  | `X-Foo: ai-route-{{$requestId}}` | 内置变量，可以和文字拼接 |
-
-  内置变量：`$conversation`（`ses_` 开头，同一会话内不变：按“API Key + 第一条用户消息”计算）、`$uuid`（每个请求一个新的）、`$requestId`（网关的请求 ID，也在响应头 `X-Route-Request-Id` 和日志里）、`$timestamp`、`$keyName`、`$keyId`、`$model`（上游模型名）。变量名写错，或者引用 `header.Authorization` 这类凭证，保存时会报错。日志详情里能看到每次尝试实际发出的动态请求头。
-
-  OpenCode Go 预设已经写好 `x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}`：
-  - 自研 Agent 传了自己的会话 ID，就原样透传；
-  - Claude Code 会自带 `x-claude-code-session-id`（[官方文档](https://code.claude.com/docs/en/llm-gateway-protocol)），Codex 会自带 `session-id`，就用它们；
-  - 其他客户端由网关按会话生成。
-
-  旧版本建的 OpenCode Go 供应商里，写死的 `ai-route` 会在启动时自动改成这个写法。OpenCode Go 官方[只要求](https://opencode.ai/docs/go/)每个会话带一个稳定的 ID，没有规定格式。
-
-  “设置与接入 → 请求头说明”里整理了每段请求头的规则，以及已核实的厂商要求和出处。
-- 网关会透传 Anthropic 的 `anthropic-version` 和 `anthropic-beta`。
-- **请求参数规则**：某些模型要求额外参数时使用，每行写 `模型(可用*) [条件] = JSON`。JSON 会深度合并进发给上游的请求体（在协议转换之后），值写 `null` 表示删除该字段。条件可选：`stream` / `nonstream` 限定流式或非流式，`openai` / `anthropic` / `embeddings` 限定上游协议，多个条件用逗号分隔。例如百炼的 Qwen3 开源模型默认开启思考，非流式调用必须关掉：
-
-  ```
-  qwen3-* [nonstream, openai] = {"enable_thinking": false}
-  ```
-
-  “阿里云百炼（按量）”预设已经预填了这一条。
-
-#### User-Agent 策略
-
-部分编码套餐会按 User-Agent 识别客户端，所以每个供应商可以单独设置：
-
-| 策略 | 行为 | 适用 |
-|---|---|---|
-| 透传客户端（默认） | 原样转发调用方的 UA（如 Claude Code 的 `claude-cli/…`）；调用方没带 UA 时，用这里填写的值，没填则用平台标识 `ai-route/<版本号>` | 绝大多数情况，**Kimi Code 必须用这个** |
-| 平台标识 | 所有请求都使用 `ai-route/<版本号>` | 自建模型、中转平台等需要识别来源的上游；限制客户端类型的套餐不能用 |
-| 固定 UA | 所有请求都使用填写的 UA | 只在供应商明确要求某个固定 UA 时使用 |
-
-已知要求：
-
-- **Kimi Code**：只放行编码工具（实测 `claude-cli`、`claude-code`、`Kilo-Code` 可以），官方**禁止篡改 User-Agent**，违者可能暂停会员权益。
-- **OpenCode Go**：要求客户端用自己的 UA（不要用 SDK 默认 UA），并带上稳定的 `x-opencode-session` 头。预设已经填好。
-- 智谱、百炼、火山方舟的 Coding Plan 没有写明 UA 规则，但条款限定只能在编码工具里使用。
-
-后台“测试”按钮发出的 UA 是 `ai-route-admin-test`，限制客户端的套餐可能返回 403。这时请用实际客户端经网关调用一次来确认。
-
-#### 自建模型
-
-自己部署的模型（vLLM、SGLang、Ollama、LM Studio 等）按“自定义”添加，地址填 `http://服务器:端口/v1`。在“高级设置 → 自建模型”里可以设置：
-
-| 设置 | 作用 |
-|---|---|
-| 最大并发 | 同时在途的请求数上限。满了的请求直接溢出到调度顺序里的下一个候补，不算失败、不触发冷却。所有候补都失败、只剩满载的自建模型时，请求排队等空位，最多等“设置与接入”里的“排队等待”秒数（默认 30 秒），等不到返回 429 |
-| 首包超时 | 流式请求等第一个事件的最长时间，超过就切到下一个候补。适合 GPU 排队时快速转走；收到首包之后仍按普通超时计 |
-| 健康检查间隔 | 每隔这么多秒（最少 5 秒）`GET` 一次模型列表接口（`/v1/models`，也可以自定义地址），带上 Key 和自定义请求头，2xx 视为正常。连续 2 次失败就把整个供应商移出调度，只在其他候补都不可用时兜底；检查通过后自动恢复。移出和恢复都会触发告警 |
-
-供应商列表会显示当前在途请求数和健康检查结果。
-
-### 2. 建模型映射
-
-在“模型映射”页面点“添加模型”：
-
-- **对外模型名**：客户端请求时 `model` 字段填的值，如 `dess`、`coder`。
-- **调度顺序**：在下方按套餐分组的模型里依次点选，点的先后就是调度顺序，之后可以用 ↑↓ 调整；再点一次就移除。不在列表里的模型，可以手动输入 `前缀/模型名`。
-- **别名**（可选）：支持 `*` 通配符。例如给 `fast` 加别名 `claude-*haiku*`，Claude Code 的后台小模型请求就会落到 `fast` 上。精确名称的优先级高于通配别名。
-
-#### 同级分流
-
-在调度顺序里勾选“与上一项并列”，可以把多个上游放在同一优先级，比如同一个套餐的两个 Key（各建一个供应商）。每个上游可以设置权重，存储为 `kimi/k3*3 | kimi-2/k3`。
-
-- **会话粘性**：按“API Key + 会话的第一条用户消息”做加权一致性哈希。同一个会话一直走同一个上游，保住提示词缓存；不同会话按权重分散到各个上游。没有用户消息的请求（向量、重排序）随机按权重分。
-- **同级兜底**：同级里的某个上游失败时，先切到同级的其他上游，再往下一个优先级走。
-
-示例：
-
-| 对外模型 | 调度顺序 |
-|---|---|
-| `dess` | `kimi/k3` → `bailian/kimi-k3` → `opencode/deepseek` |
-| `coder` | `kimi/kimi-for-coding` → `glm/glm-5.3` → `bailian/qwen3.7-plus` → `volc/ark-code-latest` |
-| `fast` | `glm/glm-5.3-flash` → `volc/ark-code-latest` |
-| `kimi` | `kimi/k3*2 \| kimi-2/k3`（并列，2:1 分流）→ `bailian/kimi-k3` |
-
-#### 能力标签
-
-每个对外模型可以打上能力标签，让使用方一眼看出它能做什么。标签显示在模型映射列表里（可以按标签筛选），也会作为扩展字段 `tags`、`description` 出现在 `/v1/models` 的返回里。
-
-| 分组 | 标签 |
-|---|---|
-| 类型 | 文本对话 `chat`、向量 `embedding`、重排序 `rerank`、图像生成 `image`、语音 `audio` |
-| 能力 | 多模态 `vision`、深度思考 `reasoning`、工具调用 `tools`、编程 `code`、结构化输出 `json`、联网搜索 `search` |
-| 上下文（单选） | `ctx-32k`、`ctx-128k`、`ctx-200k`、`ctx-256k`、`ctx-1m` |
-| 特点 | 高速 `fast`、经济 `cheap`、免费 `free` |
-
-也可以输入自定义标签。点“根据映射的模型推荐”会按上游模型名推断标签，例如 `k3` 推出 1M 上下文，`*-flash` / `*highspeed` 推出高速，`*embedding*` / `bge-*` 推出向量，Claude / Gemini / GPT-5 推出多模态。推荐只保留**所有候补都具备**的能力，上下文取最小值；只有部分候补具备的能力会单独提示，因为切换到其他候补时这些能力可能缺失。推荐结果需要确认后才会保存。
-
-标签只用于展示和筛选，不影响路由。
-
-### 3. 发 API Key
-
-在“API Keys”页面创建 Key，可以限制可用模型、设置到期时间。Key 由平台**自动生成**（`sk-route-` 加 48 位随机十六进制），不支持自定义。Key 泄露时，在编辑里点“重新生成”，旧 Key 立即失效。
-
-每个 Key 还可以设置预算和限流（留空表示不限）：
-
-| 限制 | 超出时 | 说明 |
-|---|---|---|
-| 月预算 | 返回 402（OpenAI 格式为 `insufficient_quota`，Anthropic 格式为 `billing_error`），每月 1 日恢复 | 按[成本核算](#成本核算)算出的费用累计，单位是统计货币；没配单价的请求不计入 |
-| RPM（每分钟请求数） | 返回 429，带 `Retry-After` | 最近 60 秒滑动窗口 |
-| TPM（每分钟 tokens） | 返回 429，带 `Retry-After` | 最近 60 秒内已完成请求的输入 + 输出 tokens；请求结束才知道用量，所以是用超之后拦截下一个请求 |
-
-被拒绝的请求也会记进日志，不会发给上游。列表页显示每个 Key 本月已花的费用。限流计数保存在内存里，重启后清零；本月费用从日志重新统计。
-
----
+| ![供应商](docs/images/providers.png) | ![模型映射](docs/images/model-editor.png) |
+| **请求日志** | **请求详情：每次尝试与切换** |
+| ![请求日志](docs/images/logs.png) | ![请求详情](docs/images/log-detail.png) |
+| **API Keys：预算与限流** | **接入向导** |
+| ![API Keys](docs/images/keys.png) | ![接入向导](docs/images/setup-wizard.png) |
 
 ## 客户端接入
 
@@ -196,13 +153,10 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 | OpenAI 兼容 | `http://服务器:8080/v1` | `POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/embeddings`、`POST /v1/rerank`、`GET /v1/models` |
 | Anthropic 兼容 | `http://服务器:8080` | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
 
-鉴权方式：`Authorization: Bearer sk-route-…` 或 `x-api-key: sk-route-…` 都可以。
+鉴权用 `Authorization: Bearer sk-route-…` 或 `x-api-key: sk-route-…` 都可以。控制台“设置与接入”里的**接入向导**能直接生成下面这些配置。
 
-“设置与接入”页面有**接入向导**：选好客户端（Claude Code、OpenCode、Cline / Roo Code / Kilo Code、Cherry Studio、OpenAI / Anthropic Python SDK、curl）、Key 和模型，就能生成可以直接复制的配置。
-
-`/v1/rerank` 和 `/v1/embeddings` 一样原样转发（只改写 `model`），发往上游的 `OpenAI 兼容地址 + /rerank`，兼容 Jina、Cohere、硅基流动、vLLM 的请求格式。用量按响应里的 `usage.total_tokens`、`meta.tokens.input_tokens` 或 `meta.billed_units.input_tokens` 记为输入 tokens。
-
-**Claude Code**
+<details open>
+<summary><b>Claude Code</b></summary>
 
 ```bash
 export ANTHROPIC_BASE_URL=http://服务器:8080
@@ -212,7 +166,13 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL=fast
 claude
 ```
 
-**Codex CLI**（只支持 Responses API，网关会按上游自动转换）：在 `~/.codex/config.toml` 里写
+长期使用可以写进 `~/.claude/settings.json` 的 `env` 字段。给 `fast` 加别名 `claude-*haiku*`，Claude Code 的后台小模型请求就会自动落到它上面。
+</details>
+
+<details>
+<summary><b>Codex CLI</b></summary>
+
+Codex 只支持 Responses API，网关会按上游自动转换。在 `~/.codex/config.toml` 里写：
 
 ```toml
 model = "coder"
@@ -225,139 +185,301 @@ env_key = "AI_ROUTE_API_KEY"
 wire_api = "responses"
 ```
 
-然后 `export AI_ROUTE_API_KEY=sk-route-xxxx` 再运行 `codex`。
+然后 `export AI_ROUTE_API_KEY=sk-route-xxxx`，再运行 `codex`。
+</details>
 
-**OpenAI SDK、opencode、Cline、Cherry Studio 等**：Base URL 填 `http://服务器:8080/v1`，API Key 填 `sk-route-…`，模型填对外模型名。
+<details>
+<summary><b>OpenCode</b></summary>
 
-```bash
-curl http://服务器:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-route-xxxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"coder","stream":true,"messages":[{"role":"user","content":"你好"}]}'
+在项目根目录的 `opencode.json`（或 `~/.config/opencode/opencode.json`）里加一个 provider：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ai-route": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "AI Route",
+      "options": { "baseURL": "http://服务器:8080/v1", "apiKey": "sk-route-xxxx" },
+      "models": { "coder": { "name": "coder" } }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Cline / Roo Code / Kilo Code、Cherry Studio、各种 SDK</b></summary>
+
+- **Cline / Roo Code / Kilo Code**：API Provider 选 OpenAI Compatible，Base URL 填 `http://服务器:8080/v1`，Model ID 填对外模型名。
+- **Cherry Studio**：设置 → 模型服务 → 添加，类型选 OpenAI，API 地址填 `http://服务器:8080`。
+- **OpenAI SDK**：`OpenAI(base_url="http://服务器:8080/v1", api_key="sk-route-xxxx")`
+- **Anthropic SDK**：`Anthropic(base_url="http://服务器:8080", api_key="sk-route-xxxx")`
+</details>
+
+## 配置详解
+
+### 供应商
+
+在“供应商”页面添加。同一家厂商的**编码套餐**和**按量 API** 是两个预设，因为地址和 Key 不通用，比如 Kimi Code 和 Kimi 开放平台。
+
+| 分类 | 预设 |
+|---|---|
+| 编码套餐 | Kimi Code（国内 / 海外）、智谱 GLM Coding Plan、Z.ai Coding Plan、阿里云百炼 Coding Plan、QwenCloud Coding、千问 Token Plan、火山方舟 Coding Plan / Agent Plan、BytePlus Coding Plan、MiniMax Token Plan（国内 / 国际）、OpenCode Go、阶跃 Step Plan、腾讯云 Token Plan、百度千帆 Token Plan、KAT-Coder |
+| 官方 API（按量） | Kimi 开放平台（国内 / 海外）、智谱开放平台、Z.ai、阿里云百炼、火山方舟、DeepSeek、MiniMax、阶跃星辰、腾讯混元、小米 MiMo、美团 LongCat、OpenAI、Anthropic、Google Gemini、xAI |
+| 聚合平台 | OpenCode Zen、OpenRouter、硅基流动、魔搭 ModelScope、Novita、AiHubMix、PackyCode |
+
+> 预设定义在 [web/presets.js](web/presets.js)，整理自各家官方文档（2026-10）。套餐经常调整，**请以厂商控制台为准**，添加后点“测试”验证。
+
+- **前缀**：每个供应商有一个前缀，它的模型在映射里写作 `前缀/模型名`。前缀自动生成：预设用预设的前缀；自定义的从域名提取（`api.deepseek.com` → `deepseek`）；重名时加数字后缀（`kimi`、`kimi-2`）。创建后固定不变。
+- **地址**：OpenAI 兼容地址和 Anthropic 兼容地址至少填一个。客户端用哪种协议，就优先走同协议的地址，没有就自动转换。
+- **模型协议规则**：某些模型只在一种端点上提供时使用，每行 `模型(可用*) = openai|anthropic|responses`。比如 OpenCode Go 的 MiniMax 只走 `/messages`，GPT Luna 只走 `/responses`，预设已填好。
+- **Responses API 开关**：勾选“OpenAI 地址也支持 Responses API”后，Codex 等客户端的请求原样转发；不勾选就转成 Chat Completions。OpenAI 官方预设已勾选；Kimi、GLM、DeepSeek 等多数兼容厂商没有 `/responses`，不要勾。
+- **单价**：见[成本核算](#成本核算)。
+
+#### User-Agent 策略
+
+部分编码套餐按 User-Agent 识别客户端，每个供应商可以单独设置：
+
+| 策略 | 行为 | 适用 |
+|---|---|---|
+| 透传客户端（默认） | 转发调用方的 UA（如 Claude Code 的 `claude-cli/…`）；调用方没带时用供应商里填的值，再没有就用 `ai-route/<版本号>` | 绝大多数情况，**Kimi Code 必须用这个** |
+| 平台标识 | 总是发 `ai-route/<版本号>` | 自建模型、中转平台等需要识别来源的上游 |
+| 固定 UA | 总是发填写的值 | 只在厂商明确要求某个固定 UA 时使用 |
+
+Kimi Code 的会员条款规定篡改客户端标识（User-Agent）视为违规；OpenCode Go 要求客户端用自己的 UA。后台“测试”按钮发出的 UA 是 `ai-route-admin-test`，限制客户端的套餐可能返回 403，这时请用实际客户端经网关测一次。
+
+#### 请求头
+
+调用方的请求头**默认透传**给上游，但凭证（`Authorization`、`x-api-key`、`Cookie`）、`Accept-Encoding`、逐跳头、暴露用户身份的头（`X-Forwarded-*`、`Origin`、`Referer`、`Sec-*`、`CF-*`）以及对面协议专属的头不会转发。个别上游对多余请求头敏感时，可以在“高级设置”里关掉透传。
+
+“自定义请求头”每行写 `Header: 值`，会覆盖调用方的同名头，值留空表示删除。值支持模板：
+
+| 写法 | 含义 |
+|---|---|
+| `X-Foo: abc` | 固定值 |
+| `X-Foo: {{header.X-Bar}}` | 取调用方的 `X-Bar`，**必传**：首选上游要求而调用方没带时直接返回 400；候补上游缺了就不发 |
+| `X-Foo: {{header.X-Bar?}}` | 取调用方的值，可选 |
+| `X-Foo: {{header.X-Bar ?? $conversation}}` | 调用方带了用它的，没带由平台生成；也可以写 `?? "默认值"` |
+| `X-Trace: ai-route-{{$requestId}}` | 内置变量，可以和文字拼接 |
+
+内置变量：`$conversation`（`ses_` 开头，同一会话内不变）、`$uuid`（每个请求一个新的）、`$requestId`（网关请求 ID，也在响应头 `X-Route-Request-Id` 里）、`$timestamp`、`$keyName`、`$keyId`、`$model`。变量写错或者引用凭证类的头，保存时会报错。
+
+例如 OpenCode Go 预设写的是：
+
+```
+x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}
 ```
 
-响应头 `X-Route-Target` 会标明这次实际走的是哪个上游。
+依次取：调用方自己的会话 ID → Claude Code 自带的 `x-claude-code-session-id` → Codex 自带的 `session-id` → 网关按会话生成。控制台“设置与接入 → 请求头说明”整理了完整规则和各厂商要求的出处。
 
----
+#### 请求参数规则
 
-## 成本核算
+某些模型要求额外参数时使用，每行写 `模型(可用*) [条件] = JSON`，JSON 会深度合并进发给上游的请求体（协议转换之后），值写 `null` 表示删除该字段。条件可选：`stream` / `nonstream`，`openai` / `anthropic` / `responses` / `embeddings` / `rerank`。例如百炼的 Qwen3 开源模型默认开启思考，非流式调用必须关掉（“阿里云百炼（按量）”预设已内置）：
 
-每次请求的费用记在日志里，概览页按模型、上游、套餐、Key 汇总。
+```
+qwen3-* [nonstream, openai] = {"enable_thinking": false}
+```
 
-- **单价**：在供应商的“高级设置”里填写，每行 `模型(可用*) = 输入 / 缓存命中 / 输出`，单位是**每百万 tokens**，货币选人民币或美元（海外预设默认美元）。缓存价可以省略，写成 `模型 = 输入 / 输出`，这时缓存命中的 token 按输入价计。精确模型名优先，其次是最长的通配规则。
-- **OpenRouter**：每次响应都带实际扣费（`usage.cost`，美元），优先使用它，不需要配置单价。
-- **未配单价**的模型不计费用，概览会提示有多少次请求“未配单价，未计入”，以免漏配。**包月套餐**（各家 Coding Plan）可以写一行 `* = 0 / 0`，表示不另外收费，这样就不会算作“未配单价”。
-- **货币换算**：日志保留原始货币；概览统一换算成“设置与接入”里选的统计货币，汇率也在那里改。改汇率后，历史数据也按新汇率显示。
-- **估算口径**：费用 = (输入 − 缓存命中) × 输入价 + 缓存命中 × 缓存价 + 输出 × 输出价。Anthropic 的缓存写入按输入价计（官方实际是输入价的 1.25 倍）；思考 token 包含在输出里。
+#### 自建模型
 
----
+自己部署的模型（vLLM、SGLang、Ollama、LM Studio 等）按“自定义”添加，地址填 `http://服务器:端口/v1`，在“高级设置 → 自建模型”里可以设置：
 
-## 重试、切换与熔断
+| 设置 | 作用 |
+|---|---|
+| 最大并发 | 同时在途的请求上限。满了直接溢出到下一个候补，不算失败；所有候补都失败、只剩满载的自建模型时，排队等空位（默认最多 30 秒），等不到返回 429 |
+| 首包超时 | 流式请求等第一个事件的最长时间，超过就切换，适合 GPU 排队时快速转走 |
+| 健康检查 | 定期 `GET` 模型列表接口（也可以自定义地址），连续 2 次失败就移出调度，恢复后自动加回，移出和恢复都会告警 |
 
-一次请求按调度顺序处理每个模型。**同一个模型上先判断要不要重试，再决定是否切换**：
+### 模型映射
 
-| 错误 | 处理 | 理由 |
+- **对外模型名**：客户端请求里 `model` 填的值，如 `coder`、`fast`。
+- **调度顺序**：从下面按套餐分组的模型里依次点选，之后可以用 ↑↓ 调整。
+- **同级分流**：勾选“与上一项并列”把多个上游放在同一优先级并设置权重（存储为 `kimi/k3*2 | kimi-2/k3`）。按“API Key + 会话第一条用户消息”做加权一致性哈希：同一会话固定走同一个上游以保住提示词缓存，不同会话按权重分散；其中一个失败时先切到同级的其他上游。
+- **别名**：支持 `*` 通配，比如给 `fast` 加别名 `claude-*haiku*`。精确名称优先于通配别名。
+- **能力标签**：类型、能力、上下文长度、高速 / 经济等，显示在列表里，也会出现在 `/v1/models` 的扩展字段里。可以根据映射的模型一键推荐，只推荐所有候补都具备的能力。
+
+| 对外模型 | 调度顺序示例 |
+|---|---|
+| `coder` | `kimi/kimi-for-coding*2 \| kimi-2/kimi-for-coding` → `glm/glm-5.3` → `bailian/qwen3.7-plus` |
+| `fast` | `glm/glm-5.3-flash` → `deepseek/deepseek-chat` |
+| `gpt` | `opencode/gpt-5.6-luna` → `openrouter/openai/gpt-5.6-sol` |
+
+### API Key
+
+Key 由平台自动生成（`sk-route-` 加 48 位十六进制），泄露时点“重新生成”，旧 Key 立即失效。每个 Key 可以限制可用模型、设置到期时间，以及：
+
+| 限制 | 超出时 | 说明 |
 |---|---|---|
-| 连接断开、重置，5xx / 408 / 529，上游返回 200 但内容是错误，流式首包报错 | 在同一模型上**重试**，默认 2 次，间隔 1s、2s 翻倍；仍失败则切换 | 典型的短暂抖动，重试成本低，也能保住提示词缓存 |
-| 429，且 `Retry-After` 不超过 10 秒（或没给） | 等待后重试 | 通常只是短时限流 |
-| 429 要等很久、401、402 | 不重试，直接切换，并冷却**整个套餐** | 额度用尽、Key 失效、欠费，重试没有意义 |
-| 404 | 直接切换，并冷却**该模型** | 模型不存在 |
-| 超时 | 直接切换 | 已经等满了超时时间，再等一遍代价太大 |
-| 400 / 403 / 413 等 | 直接切换，不冷却 | 一般是请求本身的问题；403 常见于 Kimi Code 的客户端白名单校验 |
+| 月预算 | 返回 402（OpenAI 格式为 `insufficient_quota`，Anthropic 格式为 `billing_error`），每月 1 日恢复 | 按成本核算的费用累计，单位是统计货币 |
+| RPM | 返回 429，带 `Retry-After` | 最近 60 秒滑动窗口 |
+| TPM | 返回 429，带 `Retry-After` | 最近 60 秒内已完成请求的输入 + 输出 tokens |
 
-**流式响应一旦开始向客户端输出，就既不能重试也不能切换**。如果中途断开，网关会给客户端发一个错误事件。
+被拒绝的请求也会记日志，不会发给上游。
 
-熔断按**请求**计数：某个模型在一次请求里重试完仍然失败，记为失败 1 次；**连续** 2 次（可调）后冷却该模型。冷却时长从 60 秒开始，每次连续冷却翻倍，最长 30 分钟。冷却中的模型会**排到调度顺序最后**兜底，而且不再重试，只试一次。成功一次即清零。熔断状态保存在内存里，重启后清空。
+### 成本核算
 
-重试次数、重试间隔、冷却阈值和冷却时长都可以在“设置与接入”页面调整。重试次数设为 0 时，遇错立即切换。
+- **单价**：在供应商的“高级设置”里，每行 `模型(可用*) = 输入 / 缓存命中 / 输出`，单位是每百万 tokens，货币可选人民币或美元。缓存价可以省略，省略时按输入价计。
+- **OpenRouter**：直接使用响应里的实际扣费（`usage.cost`）。
+- **包月套餐**：写一行 `* = 0 / 0` 表示不另外收费；没配单价的请求会在概览里提示“未计入”，以免漏配。
+- **货币换算**：日志保留原始货币，概览统一换算成设置里的统计货币。
+- **口径**：费用 = (输入 − 缓存命中) × 输入价 + 缓存命中 × 缓存价 + 输出 × 输出价。Anthropic 的缓存写入按输入价计（官方实际是 1.25 倍），思考 tokens 包含在输出里。
 
 ### 告警通知
 
-在“设置与接入”页面的“告警通知”里添加 Webhook，可以添加多个，每个都能单独“发送测试”：
+在“设置与接入 → 告警通知”里添加 Webhook，每个都可以单独发送测试：
 
-| 类型 | 地址 | 密钥 |
-|---|---|---|
-| 飞书 / Lark | 群设置 → 群机器人 → 自定义机器人 | 开启“签名校验”时填 |
-| 钉钉 | 群设置 → 机器人 → 自定义 | 安全设置选“加签”时填（`SEC` 开头） |
-| 企业微信 | 群聊 → 添加群机器人 | 不需要 |
-| 通用 JSON | 任意地址，收到 `POST {event, subject, title, text, time}` | 不需要 |
-
-消息都以 `[AI Route]` 开头。如果机器人的安全设置用“自定义关键词”，关键词填 `AI Route` 即可。
-
-| 事件 | 触发条件 |
+| 类型 | 说明 |
 |---|---|
-| 鉴权失败 / 欠费 | 上游返回 401 或 402，整个套餐被冷却 |
-| 调度链全部失败 | 某个对外模型的所有候补都失败，客户端收到了错误；或者它没有任何可用上游 |
-| 长时间冷却 | 套餐或模型一次冷却的时长达到阈值（默认 10 分钟），比如连续多次冷却后翻倍，或者额度用尽时上游给出很长的 `Retry-After` |
+| 飞书 / Lark | 支持签名校验 |
+| 钉钉 | 支持“加签”（`SEC` 开头的密钥） |
+| 企业微信 | 群机器人地址即可 |
+| 通用 JSON | 收到 `POST {event, subject, title, text, time}` |
 
-同一事件、同一对象在静默时间（默认 30 分钟）内只推送一次。告警配置会随“导出配置”一起导出。
+触发条件：上游返回 401 / 402（Key 失效、欠费）、某个模型的整条调度链全部失败、套餐或模型一次冷却超过阈值（默认 10 分钟）、自建模型健康检查失败或恢复。同一件事在静默时间（默认 30 分钟）内只推送一次。消息都以 `[AI Route]` 开头，机器人用“自定义关键词”时填 `AI Route` 即可。
 
-## 协议转换说明
+## 路由、重试与熔断
+
+同一个上游上**先判断要不要重试，再决定是否切换**：
+
+| 错误 | 处理 | 理由 |
+|---|---|---|
+| 断连、5xx / 408 / 529、200 但内容是错误、流式首包报错 | 同一上游重试（默认 2 次，间隔 1s、2s），仍失败再切换 | 典型的短暂抖动，重试能保住提示词缓存 |
+| 429 且 `Retry-After` ≤ 10 秒 | 等待后重试 | 短时限流 |
+| 429 要等很久、401、402 | 直接切换，并冷却**整个套餐** | 额度用尽、Key 失效、欠费 |
+| 404 | 直接切换，并冷却**该模型** | 模型不存在 |
+| 超时 | 直接切换 | 已经等满了超时时间 |
+| 400 / 403 / 413 等 | 直接切换，不冷却 | 一般是请求本身的问题 |
+
+- 流式响应一旦开始向客户端输出，就不能再重试或切换；中途断开时，网关会给客户端发一个错误事件。
+- 一个上游连续 2 次请求失败（重试后仍失败）就冷却，时长从 60 秒起每次翻倍，最长 30 分钟。冷却中的上游排到最后兜底，只试一次；成功一次即清零。
+- 以上参数都可以在“设置与接入”里调整。
+
+## 协议转换
 
 | 客户端 → 上游 | 处理方式 |
 |---|---|
-| OpenAI → OpenAI、Anthropic → Anthropic | 直通，只改写 `model` 字段，其他字段原样转发 |
-| OpenAI → Anthropic | `system`/`developer` 消息 → `system`；`tool_calls`/`tool` 消息 → `tool_use`/`tool_result`；图片 → image block；`reasoning_effort` → `thinking`（见下文）；`cache_control` 原样保留（写在内容块、消息或工具上都行，写在消息上时加到该消息的最后一个块）；`response_format` 见下文；流式事件转换成 chunk，包括 `reasoning_content` |
-| Anthropic → OpenAI | `tool_use`/`tool_result` → `tool_calls`/`tool` 消息；`thinking` → `reasoning_content`；服务端工具（如 `web_search`）没有对应物，会被丢弃；流式 chunk 会还原成完整的 Anthropic 事件序列 |
-| Responses → Chat | `instructions` 和 `developer` 消息 → `system`；`function_call`/`function_call_output` → `tool_calls`/`tool` 消息；推理摘要 → 下一条助手消息的 `reasoning_content`；`max_output_tokens` → `max_tokens`；`text.format` → `response_format`。自定义（freeform）工具，比如 Codex 的 `apply_patch`，会变成只有一个字符串参数 `input` 的函数，调用结果再还原成 `custom_tool_call`。内置工具（`web_search` 等）和 `web_search_call` 这类服务端状态没有对应物，会被丢弃 |
-| Chat → Responses | 消息 → `input` 数组，`tool_calls`/`tool` → `function_call`/`function_call_output`；工具改成扁平格式，`strict: false` 保持 Chat 的语义；`store: false`，每次都带完整历史。流式 chunk 会转成完整的 Responses 事件序列（`response.created` … `response.completed`，带 `sequence_number`，没有 `[DONE]`） |
-| Responses ⇄ Anthropic | 经过 Chat 中转：Responses → Chat → Anthropic，反之亦然 |
+| 同协议 | 直通，只改写 `model` 字段 |
+| OpenAI ⇄ Anthropic | 系统消息、工具调用与结果、图片、思考内容、`cache_control` 互相转换；流式事件逐个转换 |
+| Responses ⇄ Chat | `instructions` / `developer` → `system`，`function_call` ⇄ `tool_calls`；Codex 的自定义工具（如 `apply_patch`）转成单个字符串参数的函数，结果再还原；内置工具（`web_search` 等）没有对应物会被丢弃 |
+| Responses ⇄ Anthropic | 以 Chat 为中转 |
 
-`response_format` 的处理：上游是 Anthropic 官方（`api.anthropic.com`）且为 `json_schema` + `strict: true` 时，转成原生结构化输出 `output_config.format`；其他情况（`json_object`、非 strict 的 schema、其他厂商的 Anthropic 兼容端点）在 `system` 末尾追加一段“只输出 JSON（并符合该 schema）”的要求。兼容端点不一定认识 `output_config`，贸然发送可能被 400 拒绝。
+- **`reasoning_effort`**：发给 Claude Opus / Sonnet 4.6 及以后、Fable 时转成 `thinking: {type: "adaptive"}` 加 `output_config.effort`，并去掉新模型不接受的参数；发给其他模型时转成 `budget_tokens`。
+- **`response_format`**：上游是 Anthropic 官方且为严格 JSON Schema 时，转成原生结构化输出；其他情况在系统提示词末尾要求“只输出 JSON”。
+- **Responses API 的限制**：网关不保存会话状态，所以转到非 Responses 上游时不支持 `previous_response_id` 和 `conversation`（返回 400，Codex 默认每次发完整历史，不受影响）。
 
-`reasoning_effort` 的处理按上游模型区分：
+## 部署与安全
 
-| 上游模型 | 转换结果 |
-|---|---|
-| Claude Opus / Sonnet 4.6 及以后、Fable、Mythos | `thinking: {type: "adaptive"}` + `output_config.effort`（`minimal` 记为 `low`）。Opus 4.7 及以后、Sonnet 5 及以后、Fable 不接受 `temperature` / `top_p`，会被去掉；Opus 5.5、Sonnet 5.5、Fable 5.1 不接受强制工具调用，`tool_choice` 的 `required` / 指定函数改为 `auto` |
-| 其他模型（更早的 Claude、各家兼容端点） | `thinking: {type: "enabled", budget_tokens}`，`low` 2048、`medium` 8192、`high` 16384 |
+- **HTTPS**：对公网开放时，建议在前面加一层反向代理。流式响应需要关闭缓冲（网关已返回 `X-Accel-Buffering: no`）：
 
-模型按名称识别，带厂商前缀的写法（如 `anthropic/claude-sonnet-5`）也能识别。
+  ```nginx
+  location / {
+      proxy_pass http://127.0.0.1:8080;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_buffering off;
+      proxy_read_timeout 600s;
+  }
+  ```
 
-Responses API 的限制：网关不保存会话状态，所以转换到非 Responses 上游时，不支持 `previous_response_id` 和 `conversation`（返回 400，请改用 `store: false` 加完整 `input`，Codex 默认就是这样）；`reasoning.encrypted_content` 只能在同一家 Responses 上游之间往返。
+  Caddy 只需要一行：`reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`。
+- **数据安全**：上游 Key 以明文存放在 SQLite 里，请控制好数据目录和管理令牌的访问权限。日志里的客户端 IP 取自 `X-Forwarded-For`，直接暴露在公网时这个头可以被伪造。
+- **备份与迁移**：“设置与接入”里可以导出 / 导入全部配置（JSON，包含上游 Key，请妥善保管）。
+- **单实例**：熔断、限流计数、并发槽保存在进程内存里，目前只支持单实例部署；重启后熔断状态清空，本月费用从日志重新统计。
 
-OpenAI 流式直通时，网关会自动向上游加上 `stream_options.include_usage` 来统计用量。如果客户端自己没有请求用量，这个仅含用量的 chunk 会被过滤掉，不会转发给客户端。
+## 常见问题
 
----
+<details>
+<summary><b>本机用 curl 调用没有任何输出</b></summary>
 
-## 其他
+多半是终端设置了 `http_proxy` 之类的代理环境变量，请求被发给了代理。加 `--noproxy '*'` 试一下；确认后，把 `127.0.0.1,localhost` 加进 `no_proxy`，或者在代理软件里让本机地址直连。
+</details>
 
-- **备份 / 迁移**：在“设置与接入”页面可以导出或导入全部配置（JSON，包含上游 Key，请妥善保管）。
-- **数据安全**：上游 Key 以明文存放在 SQLite 里，请控制好数据目录和管理令牌的访问权限。对公网开放时，建议在前面加一层 HTTPS 反向代理（Nginx/Caddy）。用 Nginx 时，流式请求需要关闭缓冲（网关已经返回了 `X-Accel-Buffering: no`）。
-- **服务条款**：部分 coding plan 限制只能在官方支持的编码工具里使用，或者禁止“自建后端 / 自动化调用”（例如百炼 Coding Plan、GLM Coding Plan、Kimi Code 都有类似条款）。通过网关转发是否合规，请自行确认各家条款。
-- **管理 API**：后台的所有操作都可以通过 `/admin/api/*` 完成（`Authorization: Bearer <ADMIN_TOKEN>`），例如 `GET /admin/api/providers`、`POST /admin/api/models`、`GET /admin/api/logs`、`GET /admin/api/stats?range=24h`。
+<details>
+<summary><b>docker compose 构建时卡在 Docker Hub 或超时</b></summary>
+
+国内网络访问 Docker Hub、`proxy.golang.org` 不稳定。把 `.env.example` 末尾的国内配置复制到 `.env`，或者先手动拉好基础镜像再构建。
+</details>
+
+<details>
+<summary><b>Kimi Code 返回 403</b></summary>
+
+Kimi Code 只接受编码工具的请求。供应商的 User-Agent 策略要保持“透传客户端”，并用 Claude Code 等实际客户端经网关调用；后台“测试”按钮的 UA 会被拒绝，属于正常现象。
+</details>
+
+<details>
+<summary><b>从上游拉取不到模型列表</b></summary>
+
+很多编码套餐不开放 `/models` 接口。在供应商表单里手动输入模型名，回车添加即可。
+</details>
+
+<details>
+<summary><b>忘记管理令牌</b></summary>
+
+设置 `ADMIN_TOKEN` 环境变量后重启，会以它为准。
+</details>
+
+<details>
+<summary><b>Codex 报 previous_response_id 不支持</b></summary>
+
+只在上游不是 Responses API 时出现。Codex 默认 `store: false` 并发送完整历史，不会触发；如果你的客户端依赖服务端会话，请把模型映射到支持 Responses API 的上游。
+</details>
+
+## 管理 API
+
+控制台的所有操作都可以通过 `/admin/api/*` 完成（`Authorization: Bearer <ADMIN_TOKEN>`），例如：
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:8080/admin/api/providers
+curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8080/admin/api/stats?range=24h"
+```
+
+常用端点：`providers`、`models`、`keys`、`logs`、`stats`、`status`、`settings`、`alerts`、`export`、`import`。
 
 ## 开发
 
-测试覆盖：
-
-| 文件 | 内容 |
-|---|---|
-| `internal/gateway/mapping_test.go` | 模型映射：精确名、别名、通配别名的优先级，停用的模型，按 Key 限制模型；调度顺序（跳过不存在或停用的前缀、重试后再切换、冷却的上游排到最后）；修改配置立即生效 |
-| `internal/alert`、`internal/gateway/alerts_test.go` | 告警：飞书、钉钉的签名，企业微信、通用 JSON 的格式，机器人返回 200 但带错误码，静默去重；401/402、全部失败、无可用上游、长时间冷却四种触发 |
-| `internal/convert`（规则与 Claude 新模型）、`TestBodyRulesAppliedUpstream` | 请求参数规则的合并、删除、条件匹配；新版 Claude 的 adaptive thinking、effort 档位、去掉采样参数、强制工具改 auto |
-| `internal/gateway/selfhost_test.go` | 自建模型：并发满时溢出到下一个候补且不计失败、排队等待空位、不排队时返回 429、首包超时只作用于流式、健康检查连续失败移出调度并告警、恢复后加回 |
-| `internal/gateway/item7_test.go` 等 | 重排序转发与用量；同级分流的权重分布、会话粘性、同级兜底；目标分组的解析、校验和前缀改名 |
-| `internal/hdrtpl`、`internal/gateway/headers_test.go` | 请求头模板的解析、校验和取值；透传与不透传清单；必传头只在首选上校验（冷却中也按配置顺序）、候补上缺了不发；会话 ID 在同一会话内稳定；平台标识 UA；旧 OpenCode Go 配置的自动迁移 |
-| `internal/convert/responses_test.go`、`internal/gateway/responses_test.go` | Responses API：Responses 客户端到 Chat / Anthropic / Responses 上游，Chat / Messages 客户端到 Responses 上游，流式事件顺序和 `sequence_number`，Codex 风格请求（自定义工具、推理回放、内置工具丢弃），`previous_response_id` 返回 400，直通时的用量与失败切换 |
-| `internal/gateway/limits_test.go` | Key 限额：RPM、TPM、月预算的拦截与错误格式，被拒请求记日志且不发上游，重启后从日志恢复本月费用，切换统计货币，滑动窗口到期恢复 |
-| `internal/gateway/logs_test.go` | 请求日志：成功请求每个字段的取值（Key、请求模型与对外模型、实际上游、协议、用量、客户端 IP、耗时）；费用（单价、通配单价、缓存价、未配单价、OpenRouter 实际费用）；四种协议组合下流式的用量；各种失败（模型不存在、模型不允许、全部上游失败、流中断）；按条件筛选、分页和统计 |
-| `internal/admin/e2e_test.go` | 端到端：通过管理 API 创建供应商（自动前缀、重名去重、自动拉取模型）、模型映射和 Key（拒绝自定义值、重新生成），调用对外 API，再通过管理 API 查日志和统计 |
-| `internal/gateway/gateway_test.go` | 协议互转、流式、重试与熔断、User-Agent 策略 |
-| `internal/convert`、`internal/store` | 请求和响应格式转换、SSE 解析；前缀生成规则、导入导出、统计分桶；单价匹配与计算、费用按统计货币换算、旧数据库自动加列 |
-
 ```bash
-go test -race ./...    # 用模拟上游跑全部测试（约 90 个），不需要真实 Key
+go test -race ./...      # 用模拟上游跑全部测试，不需要任何真实 Key
 go build -o bin/ai-route .
 ```
 
-目录结构：
+```
+main.go               入口：参数、内嵌静态资源、HTTP 服务
+internal/gateway      对外 API、路由与切换、熔断、限流、并发与健康检查、请求头处理
+internal/convert      OpenAI Chat / Responses / Anthropic 之间的请求、响应、流式转换
+internal/store        SQLite 存储、配置快照、请求日志与统计
+internal/admin        管理 API
+internal/alert        告警推送（飞书、钉钉、企业微信、Webhook）
+internal/hdrtpl       请求头模板
+web/                  控制台前端（原生 JS，无构建步骤）
+```
 
-```
-main.go                 入口：参数、内嵌静态资源、HTTP 服务
-internal/store          SQLite 存储、内存配置快照、请求日志与统计
-internal/gateway        对外 API、路由与候补切换、熔断器、后台测试
-internal/convert        OpenAI ⇄ Anthropic 请求/响应/SSE 转换
-internal/admin          管理 API
-web/                    控制台前端（原生 JS，无构建步骤）
-```
+测试覆盖协议互转（含流式事件顺序）、重试与熔断、模型映射与同级分流、限流与预算、费用计算、告警签名、请求头模板、自建模型的并发与健康检查等，全部使用模拟上游。
+
+## 路线图
+
+- [ ] 英文 README 与控制台中英文切换
+- [ ] 发布预编译二进制和 Docker 镜像
+- [ ] 多管理员账号与操作审计
+- [ ] 多实例部署（共享熔断与限流状态）
+
+欢迎在 Issues 里提需求。
+
+## 参与贡献
+
+欢迎提交 Issue 和 Pull Request。提交前请确保：
+
+- `gofmt -l .` 没有输出，`go vet ./...` 和 `go test -race ./...` 通过；
+- 新功能附带测试（参照 `internal/gateway/*_test.go` 里的模拟上游写法）；
+- 新增或修改供应商预设时，在 PR 里附上官方文档链接。
+
+## 免责声明
+
+- 部分编码套餐的条款限定只能在官方支持的编码工具中使用，或者禁止“自建后端 / 代理转发 / 自动化调用”（例如百炼 Coding Plan、GLM Coding Plan、Kimi Code 都有类似条款）。**通过本项目转发是否合规，请自行阅读并遵守各厂商的服务条款，由此产生的封号、扣费等后果由使用者自行承担。**
+- 本项目与文中提到的任何厂商均无关联，预设信息仅供参考，以各厂商官方说明为准。
+
+## 许可证
+
+[MIT](LICENSE)
