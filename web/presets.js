@@ -11,6 +11,7 @@
 //   anthropic  Anthropic-compatible base URL, i.e. ANTHROPIC_BASE_URL ('' = none)
 //   models     common model ids (pre-filled; the upstream list is fetched too)
 //   protocols  per-model protocol overrides (glob -> openai|anthropic)
+//   rules      request body rules ({model, when?, protocol?, set}) merged upstream
 //   headers    extra request headers the vendor asks for
 //   ua         { mode: 'passthrough'|'override', value, note }
 //   currency   currency the vendor bills in (default CNY), used for unit prices
@@ -188,6 +189,8 @@ const PRESETS = [
     id: 'dashscope', name: '阿里云百炼（按量）', category: 'official', prefix: 'dashscope', keywords: 'aliyun qwen bailian 通义 阿里',
     openai: 'https://dashscope.aliyuncs.com/compatible-mode/v1', anthropic: 'https://dashscope.aliyuncs.com/apps/anthropic',
     models: ['qwen3.8-max', 'qwen3.7-plus', 'qwen3.8-flash', 'qwen3.7-max'],
+    // Qwen3 open-weight models think by default and reject non-stream calls unless thinking is off
+    rules: [{ model: 'qwen3-*', when: 'nonstream', protocol: 'openai', set: { enable_thinking: false } }],
     docs: 'https://help.aliyun.com/zh/model-studio/', keyUrl: 'https://bailian.console.aliyun.com/?tab=model#/api-key',
     note: '按量计费。国际站把域名换成 dashscope-intl.aliyuncs.com。若你买的是 Coding Plan，请选“阿里云百炼 Coding Plan”。',
   },

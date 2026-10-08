@@ -73,6 +73,13 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 - 两个地址**至少填一个**。客户端用哪种协议请求，就优先走同协议地址，没有就自动转换。
 - **模型协议规则**：有些供应商的不同模型只在一种端点上提供（比如 OpenCode Go 的 MiniMax / Qwen 只走 `/messages`），可以按 `模型(支持 *) = openai|anthropic` 强制指定。相关预设已经预填好。
 - **自定义请求头**：每行写 `Header: 值`，会覆盖默认值。网关会透传 Anthropic 的 `anthropic-version` 和 `anthropic-beta`。
+- **请求参数规则**：某些模型要求额外参数时使用，每行写 `模型(可用*) [条件] = JSON`。JSON 会深度合并进发给上游的请求体（在协议转换之后），值写 `null` 表示删除该字段。条件可选：`stream` / `nonstream` 限定流式或非流式，`openai` / `anthropic` / `embeddings` 限定上游协议，多个条件用逗号分隔。例如百炼的 Qwen3 开源模型默认开启思考，非流式调用必须关掉：
+
+  ```
+  qwen3-* [nonstream, openai] = {"enable_thinking": false}
+  ```
+
+  “阿里云百炼（按量）”预设已经预填了这一条。
 
 #### User-Agent 策略
 
@@ -227,10 +234,19 @@ curl http://服务器:8080/v1/chat/completions \
 | 客户端 → 上游 | 处理方式 |
 |---|---|
 | OpenAI → OpenAI、Anthropic → Anthropic | 直通，只改写 `model` 字段，其他字段原样转发 |
-| OpenAI → Anthropic | `system`/`developer` 消息 → `system`；`tool_calls`/`tool` 消息 → `tool_use`/`tool_result`；图片 → image block；`reasoning_effort` → `thinking` 预算；`cache_control` 原样保留（写在内容块、消息或工具上都行，写在消息上时加到该消息的最后一个块）；`response_format` 见下文；流式事件转换成 chunk，包括 `reasoning_content` |
+| OpenAI → Anthropic | `system`/`developer` 消息 → `system`；`tool_calls`/`tool` 消息 → `tool_use`/`tool_result`；图片 → image block；`reasoning_effort` → `thinking`（见下文）；`cache_control` 原样保留（写在内容块、消息或工具上都行，写在消息上时加到该消息的最后一个块）；`response_format` 见下文；流式事件转换成 chunk，包括 `reasoning_content` |
 | Anthropic → OpenAI | `tool_use`/`tool_result` → `tool_calls`/`tool` 消息；`thinking` → `reasoning_content`；服务端工具（如 `web_search`）没有对应物，会被丢弃；流式 chunk 会还原成完整的 Anthropic 事件序列 |
 
 `response_format` 的处理：上游是 Anthropic 官方（`api.anthropic.com`）且为 `json_schema` + `strict: true` 时，转成原生结构化输出 `output_config.format`；其他情况（`json_object`、非 strict 的 schema、其他厂商的 Anthropic 兼容端点）在 `system` 末尾追加一段“只输出 JSON（并符合该 schema）”的要求。兼容端点不一定认识 `output_config`，贸然发送可能被 400 拒绝。
+
+`reasoning_effort` 的处理按上游模型区分：
+
+| 上游模型 | 转换结果 |
+|---|---|
+| Claude Opus / Sonnet 4.6 及以后、Fable、Mythos | `thinking: {type: "adaptive"}` + `output_config.effort`（`minimal` 记为 `low`）。Opus 4.7 及以后、Sonnet 5 及以后、Fable 不接受 `temperature` / `top_p`，会被去掉；Opus 5.5、Sonnet 5.5、Fable 5.1 不接受强制工具调用，`tool_choice` 的 `required` / 指定函数改为 `auto` |
+| 其他模型（更早的 Claude、各家兼容端点） | `thinking: {type: "enabled", budget_tokens}`，`low` 2048、`medium` 8192、`high` 16384 |
+
+模型按名称识别，带厂商前缀的写法（如 `anthropic/claude-sonnet-5`）也能识别。
 
 OpenAI 流式直通时，网关会自动向上游加上 `stream_options.include_usage` 来统计用量。如果客户端自己没有请求用量，这个仅含用量的 chunk 会被过滤掉，不会转发给客户端。
 
@@ -251,6 +267,7 @@ OpenAI 流式直通时，网关会自动向上游加上 `stream_options.include_
 |---|---|
 | `internal/gateway/mapping_test.go` | 模型映射：精确名、别名、通配别名的优先级，停用的模型，按 Key 限制模型；调度顺序（跳过不存在或停用的前缀、重试后再切换、冷却的上游排到最后）；修改配置立即生效 |
 | `internal/alert`、`internal/gateway/alerts_test.go` | 告警：飞书、钉钉的签名，企业微信、通用 JSON 的格式，机器人返回 200 但带错误码，静默去重；401/402、全部失败、无可用上游、长时间冷却四种触发 |
+| `internal/convert`（规则与 Claude 新模型）、`TestBodyRulesAppliedUpstream` | 请求参数规则的合并、删除、条件匹配；新版 Claude 的 adaptive thinking、effort 档位、去掉采样参数、强制工具改 auto |
 | `internal/gateway/limits_test.go` | Key 限额：RPM、TPM、月预算的拦截与错误格式，被拒请求记日志且不发上游，重启后从日志恢复本月费用，切换统计货币，滑动窗口到期恢复 |
 | `internal/gateway/logs_test.go` | 请求日志：成功请求每个字段的取值（Key、请求模型与对外模型、实际上游、协议、用量、客户端 IP、耗时）；费用（单价、通配单价、缓存价、未配单价、OpenRouter 实际费用）；四种协议组合下流式的用量；各种失败（模型不存在、模型不允许、全部上游失败、流中断）；按条件筛选、分页和统计 |
 | `internal/admin/e2e_test.go` | 端到端：通过管理 API 创建供应商（自动前缀、重名去重、自动拉取模型）、模型映射和 Key（拒绝自定义值、重新生成），调用对外 API，再通过管理 API 查日志和统计 |

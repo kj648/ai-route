@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"math"
 	"strings"
 	"testing"
@@ -436,5 +437,47 @@ func TestAlertConfigPersistAndImport(t *testing.T) {
 	mustNil(t, st.Import(e))
 	if len(st.GetAlerts().Webhooks) != 1 {
 		t.Fatal("import without alerts dropped the current alert config")
+	}
+}
+
+func TestBodyRules(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, bad := range []BodyRule{
+		{Model: "", Set: json.RawMessage(`{}`)},
+		{Model: "m", When: "sometimes", Set: json.RawMessage(`{}`)},
+		{Model: "m", Protocol: "grpc", Set: json.RawMessage(`{}`)},
+		{Model: "m", Set: json.RawMessage(`[1]`)},
+	} {
+		if err := st.CreateProvider(&Provider{Prefix: "x", OpenAIBaseURL: "http://a/v1", BodyRules: []BodyRule{bad}}); err == nil {
+			t.Errorf("accepted %+v", bad)
+		}
+	}
+	p := &Provider{Prefix: "bl", OpenAIBaseURL: "http://a/v1", AnthropicBaseURL: "http://a", Enabled: true, BodyRules: []BodyRule{
+		{Model: "qwen3-*", When: "nonstream", Protocol: "openai", Set: json.RawMessage(`{"enable_thinking":false}`)},
+		{Model: "qwen3-32b", Set: json.RawMessage(`{"top_k":20}`)},
+	}}
+	mustNil(t, st.CreateProvider(p))
+	got := st.Snapshot().Providers["bl"]
+	names := func(rs []BodyRule) (out []string) {
+		for _, r := range rs {
+			out = append(out, string(r.Set))
+		}
+		return
+	}
+	if r := names(got.RulesFor("qwen3-32b", "openai", false)); len(r) != 2 || r[0] != `{"enable_thinking":false}` {
+		t.Fatalf("non-stream openai: %v", r)
+	}
+	if r := got.RulesFor("qwen3-32b", "openai", true); len(r) != 1 {
+		t.Fatalf("stream: %v", names(r))
+	}
+	if r := got.RulesFor("qwen3-8b", "anthropic", false); len(r) != 0 {
+		t.Fatalf("anthropic: %v", names(r))
+	}
+	if r := got.RulesFor("qwen-plus", "openai", false); len(r) != 0 {
+		t.Fatalf("no match: %v", names(r))
 	}
 }

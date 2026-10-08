@@ -50,12 +50,43 @@ type Provider struct {
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	// Prices are per-million-token unit prices by upstream model (exact
 	// name or '*' glob), in Currency. Models without a price are not costed.
-	Prices    map[string]Price `json:"prices"`
-	Currency  string           `json:"currency"` // CNY | USD
-	Enabled   bool             `json:"enabled"`
-	Remark    string           `json:"remark"`
-	CreatedAt int64            `json:"created_at"`
-	UpdatedAt int64            `json:"updated_at"`
+	Prices   map[string]Price `json:"prices"`
+	Currency string           `json:"currency"` // CNY | USD
+	// BodyRules patch the upstream request body for matching models, e.g.
+	// enable_thinking=false for Qwen3 non-stream calls on Bailian.
+	BodyRules []BodyRule `json:"body_rules"`
+	Enabled   bool       `json:"enabled"`
+	Remark    string     `json:"remark"`
+	CreatedAt int64      `json:"created_at"`
+	UpdatedAt int64      `json:"updated_at"`
+}
+
+// BodyRule merges Set into the request body sent upstream (after protocol
+// conversion) when the upstream model matches.
+type BodyRule struct {
+	Model string `json:"model"` // exact name or '*' glob
+	// When: "" (always) | "stream" | "nonstream"
+	When string `json:"when,omitempty"`
+	// Protocol: "" (any) | "openai" | "anthropic" | "embeddings"
+	Protocol string `json:"protocol,omitempty"`
+	// Set is a JSON object deep-merged into the body; a null value deletes
+	// the field.
+	Set json.RawMessage `json:"set"`
+}
+
+// RulesFor returns the body rules that apply to a request, in order.
+func (p *Provider) RulesFor(model, proto string, stream bool) []BodyRule {
+	var out []BodyRule
+	for _, r := range p.BodyRules {
+		if r.Model != model && !(strings.Contains(r.Model, "*") && globMatch(r.Model, model)) {
+			continue
+		}
+		if r.Protocol != "" && r.Protocol != proto || r.When == "stream" && !stream || r.When == "nonstream" && stream {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // Price is a unit price per million tokens.
@@ -257,6 +288,7 @@ CREATE TABLE IF NOT EXISTS providers (
 	user_agent TEXT NOT NULL DEFAULT '',
 	timeout_seconds INTEGER NOT NULL DEFAULT 300,
 	prices TEXT NOT NULL DEFAULT '{}',
+	body_rules TEXT NOT NULL DEFAULT '[]',
 	currency TEXT NOT NULL DEFAULT 'CNY',
 	enabled INTEGER NOT NULL DEFAULT 1,
 	remark TEXT NOT NULL DEFAULT '',
@@ -333,6 +365,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_a
 		{"user_agent", `TEXT NOT NULL DEFAULT ''`},
 		{"prices", `TEXT NOT NULL DEFAULT '{}'`},
 		{"currency", `TEXT NOT NULL DEFAULT 'CNY'`},
+		{"body_rules", `TEXT NOT NULL DEFAULT '[]'`},
 	} {
 		if err := s.ensureColumn("providers", c[0], c[1]); err != nil {
 			return err
@@ -460,13 +493,13 @@ func (s *Store) reloadLocked() error {
 
 // ---------- providers ----------
 
-const providerCols = `id, prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, enabled, remark, created_at, updated_at`
+const providerCols = `id, prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, enabled, remark, created_at, updated_at`
 
 func scanProvider(sc interface{ Scan(...any) error }) (*Provider, error) {
 	p := &Provider{}
-	var headers, protos, models, prices string
+	var headers, protos, models, prices, rules string
 	var enabled int
-	if err := sc.Scan(&p.ID, &p.Prefix, &p.Name, &p.OpenAIBaseURL, &p.AnthropicBaseURL, &p.APIKey, &headers, &protos, &models, &p.Vendor, &p.UAMode, &p.UserAgent, &p.TimeoutSeconds, &prices, &p.Currency, &enabled, &p.Remark, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.Prefix, &p.Name, &p.OpenAIBaseURL, &p.AnthropicBaseURL, &p.APIKey, &headers, &protos, &models, &p.Vendor, &p.UAMode, &p.UserAgent, &p.TimeoutSeconds, &prices, &p.Currency, &rules, &enabled, &p.Remark, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	p.Enabled = enabled == 1
@@ -476,6 +509,10 @@ func scanProvider(sc interface{ Scan(...any) error }) (*Provider, error) {
 	_ = json.Unmarshal([]byte(prices), &p.Prices)
 	if p.Prices == nil {
 		p.Prices = map[string]Price{}
+	}
+	_ = json.Unmarshal([]byte(rules), &p.BodyRules)
+	if p.BodyRules == nil {
+		p.BodyRules = []BodyRule{}
 	}
 	if p.Models == nil {
 		p.Models = []string{}
@@ -560,6 +597,29 @@ func normalizeProvider(p *Provider) error {
 		prices[k] = v
 	}
 	p.Prices = prices
+	rules := []BodyRule{}
+	for i, r := range p.BodyRules {
+		r.Model = strings.TrimSpace(r.Model)
+		if r.Model == "" {
+			return fmt.Errorf("body_rules[%d]: model is required", i)
+		}
+		switch r.When {
+		case "", "stream", "nonstream":
+		default:
+			return fmt.Errorf("body_rules[%d]: when must be stream or nonstream, got %q", i, r.When)
+		}
+		switch r.Protocol {
+		case "", "openai", "anthropic", "embeddings":
+		default:
+			return fmt.Errorf("body_rules[%d]: unknown protocol %q", i, r.Protocol)
+		}
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(r.Set, &obj) != nil || obj == nil {
+			return fmt.Errorf("body_rules[%d]: set must be a JSON object", i)
+		}
+		rules = append(rules, r)
+	}
+	p.BodyRules = rules
 	p.UserAgent = strings.TrimSpace(p.UserAgent)
 	switch p.UAMode {
 	case "", "passthrough":
@@ -689,8 +749,8 @@ func (s *Store) CreateProvider(p *Provider) error {
 	}
 	p.Prefix = uniquePrefix(p.Prefix, taken)
 	t := now()
-	res, err := s.db.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, b2i(p.Enabled), p.Remark, t, t)
+	res, err := s.db.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), b2i(p.Enabled), p.Remark, t, t)
 	if err != nil {
 		return friendlyErr(err)
 	}
@@ -725,8 +785,8 @@ func (s *Store) UpdateProvider(p *Provider) error {
 	}
 	defer tx.Rollback()
 	t := now()
-	if _, err := tx.Exec(`UPDATE providers SET prefix=?, name=?, openai_base_url=?, anthropic_base_url=?, api_key=?, headers=?, model_protocols=?, models=?, vendor=?, ua_mode=?, user_agent=?, timeout_seconds=?, prices=?, currency=?, enabled=?, remark=?, updated_at=? WHERE id=?`,
-		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, b2i(p.Enabled), p.Remark, t, p.ID); err != nil {
+	if _, err := tx.Exec(`UPDATE providers SET prefix=?, name=?, openai_base_url=?, anthropic_base_url=?, api_key=?, headers=?, model_protocols=?, models=?, vendor=?, ua_mode=?, user_agent=?, timeout_seconds=?, prices=?, currency=?, body_rules=?, enabled=?, remark=?, updated_at=? WHERE id=?`,
+		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), b2i(p.Enabled), p.Remark, t, p.ID); err != nil {
 		return friendlyErr(err)
 	}
 	if old.Prefix != p.Prefix {
@@ -1181,8 +1241,8 @@ func (s *Store) Import(e *Export) error {
 	}
 	t := now()
 	for _, p := range e.Providers {
-		if _, err := tx.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, b2i(p.Enabled), p.Remark, t, t); err != nil {
+		if _, err := tx.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), b2i(p.Enabled), p.Remark, t, t); err != nil {
 			return friendlyErr(err)
 		}
 	}

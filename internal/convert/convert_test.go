@@ -276,3 +276,107 @@ func TestValidateResponse(t *testing.T) {
 		t.Fatal("anthropic error accepted")
 	}
 }
+
+func TestMergeJSON(t *testing.T) {
+	body := `{"model":"m","stream":false,"extra_body":{"a":1,"keep":{"x":true}},"user":"u","messages":[{"role":"user","content":"<hi>"}]}`
+	out, err := MergeJSON([]byte(body), json.RawMessage(`{"enable_thinking":false,"extra_body":{"a":2,"keep":{"y":1}},"user":null,"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decodeMap(t, out)
+	eb := m["extra_body"].(map[string]any)
+	if m["enable_thinking"] != false || m["stream"] != true || eb["a"].(float64) != 2 ||
+		eb["keep"].(map[string]any)["x"] != true || eb["keep"].(map[string]any)["y"].(float64) != 1 {
+		t.Fatalf("merged: %s", out)
+	}
+	if _, ok := m["user"]; ok {
+		t.Fatalf("null should delete: %s", out)
+	}
+	if !strings.Contains(string(out), `"messages":[{"role":"user","content":"<hi>"}]`) {
+		t.Fatalf("untouched fields must keep their bytes: %s", out)
+	}
+	if _, err := MergeJSON([]byte(body), json.RawMessage(`[1]`)); err == nil {
+		t.Fatal("non-object patch accepted")
+	}
+}
+
+func TestClaudeTraits(t *testing.T) {
+	cases := []struct {
+		model                                       string
+		adaptive, noBudget, noSampling, noForcedUse bool
+	}{
+		{"kimi-k3", false, false, false, false},
+		{"claude-3-7-sonnet-20250219", false, false, false, false},
+		{"claude-haiku-4-5", false, false, false, false},
+		{"claude-sonnet-4-5-20250929", false, false, false, false},
+		{"claude-opus-4-20250514", false, false, false, false},
+		{"claude-opus-4-6", true, false, false, false},
+		{"claude-sonnet-4-6", true, false, false, false},
+		{"claude-opus-4-8", true, true, true, false},
+		{"anthropic/claude-sonnet-5", true, true, true, false},
+		{"claude-opus-5-5", true, true, true, true},
+		{"us.anthropic.claude-sonnet-5-5", true, true, true, true},
+		{"claude-fable-5", true, true, true, false},
+		{"Claude-Fable-5.1", true, true, true, true},
+	}
+	for _, c := range cases {
+		tr := traitsFor(c.model)
+		if tr.adaptive != c.adaptive || tr.noBudget != c.noBudget || tr.noSampling != c.noSampling || tr.noForcedTool != c.noForcedUse {
+			t.Errorf("%s: %+v", c.model, tr)
+		}
+	}
+}
+
+func TestOpenAIToAnthropicNewerClaude(t *testing.T) {
+	const schema = `{"type":"object","properties":{"a":{"type":"string"}},"required":["a"],"additionalProperties":false}`
+	req := func(effort string) string {
+		return `{"model":"m","temperature":0.3,"top_p":0.9,"reasoning_effort":"` + effort + `",
+		  "messages":[{"role":"user","content":"hi"}],
+		  "tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+		  "tool_choice":{"type":"function","function":{"name":"f"}},
+		  "response_format":{"type":"json_schema","json_schema":{"name":"x","strict":true,"schema":` + schema + `}}}`
+	}
+	conv := func(model, effort string) map[string]any {
+		t.Helper()
+		out, err := OpenAIToAnthropicRequest([]byte(req(effort)), model, 4096, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decodeMap(t, out)
+	}
+
+	// adaptive thinking + effort, no sampling params, effort and format share output_config
+	m := conv("claude-opus-4-8", "high")
+	oc := m["output_config"].(map[string]any)
+	if m["thinking"].(map[string]any)["type"] != "adaptive" || oc["effort"] != "high" || oc["format"] == nil ||
+		m["temperature"] != nil || m["top_p"] != nil || m["max_tokens"].(float64) != 4096 {
+		t.Fatalf("opus 4.8: %v", m)
+	}
+	if tc := m["tool_choice"].(map[string]any); tc["type"] != "tool" || tc["name"] != "f" {
+		t.Fatalf("opus 4.8 still accepts forced tools: %v", tc)
+	}
+	// newer models also reject forced tool use; no effort means no thinking param
+	m = conv("claude-opus-5-5", "")
+	if tc := m["tool_choice"].(map[string]any); tc["type"] != "auto" || tc["name"] != nil {
+		t.Fatalf("opus 5.5 tool_choice: %v", tc)
+	}
+	if m["thinking"] != nil || m["temperature"] != nil || m["output_config"].(map[string]any)["effort"] != nil {
+		t.Fatalf("opus 5.5 without effort: %v", m)
+	}
+	// 4.6 is adaptive but keeps sampling when thinking is off, and has no xhigh
+	m = conv("claude-sonnet-4-6", "xhigh")
+	if m["thinking"].(map[string]any)["type"] != "adaptive" || m["output_config"].(map[string]any)["effort"] != "high" {
+		t.Fatalf("sonnet 4.6: %v", m)
+	}
+	if m = conv("claude-sonnet-4-6", ""); m["temperature"].(float64) != 0.3 {
+		t.Fatalf("sonnet 4.6 sampling: %v", m)
+	}
+	// older Claude and other vendors keep the budget form
+	for _, model := range []string{"claude-haiku-4-5", "kimi-k3"} {
+		m = conv(model, "medium")
+		th := m["thinking"].(map[string]any)
+		if th["type"] != "enabled" || th["budget_tokens"].(float64) != 8192 || m["max_tokens"].(float64) <= 8192 {
+			t.Fatalf("%s: %v", model, m)
+		}
+	}
+}

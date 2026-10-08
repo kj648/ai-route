@@ -471,6 +471,22 @@ func isOpenRouter(p *store.Provider) bool {
 	return false
 }
 
+// applyBodyRules merges the provider's matching body rules into the
+// upstream request body.
+func applyBodyRules(body []byte, c candidate) ([]byte, error) {
+	var probe struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(body, &probe)
+	for _, rule := range c.provider.RulesFor(c.model, c.proto, probe.Stream) {
+		var err error
+		if body, err = convert.MergeJSON(body, rule.Set); err != nil {
+			return nil, fmt.Errorf("body rule for %s: %w", rule.Model, err)
+		}
+	}
+	return body, nil
+}
+
 // isOfficialAnthropic reports whether base points at the Anthropic API itself.
 // Compatible endpoints of other vendors may reject newer request fields such
 // as output_config, so those are only sent here.
@@ -492,6 +508,9 @@ func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound st
 		clientUsage = convert.ClientWantsUsage(body)
 	default:
 		upBody, err = convert.AnthropicToOpenAIRequest(body, c.model)
+	}
+	if err == nil && len(c.provider.BodyRules) > 0 {
+		upBody, err = applyBodyRules(upBody, c)
 	}
 	if err != nil {
 		return nil, false, err

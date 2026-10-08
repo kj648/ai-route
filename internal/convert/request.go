@@ -97,6 +97,7 @@ func OpenAIToAnthropicRequest(body []byte, model string, defaultMaxTokens int, n
 		return nil, fmt.Errorf("invalid chat completions request: %w", err)
 	}
 	out := map[string]any{"model": model}
+	tr := traitsFor(model)
 
 	maxTokens := defaultMaxTokens
 	if req.MaxCompletionTokens != nil && *req.MaxCompletionTokens > 0 {
@@ -223,11 +224,24 @@ func OpenAIToAnthropicRequest(body []byte, model string, defaultMaxTokens int, n
 		if len(tools) > 0 {
 			out["tools"] = tools
 			if tc := oaToolChoiceToAnthropic(req.ToolChoice, req.ParallelToolCalls); tc != nil {
+				if tr.noForcedTool && (tc["type"] == "any" || tc["type"] == "tool") {
+					tc["type"] = "auto" // forced tool use is rejected by these models
+					delete(tc, "name")
+				}
 				out["tool_choice"] = tc
 			}
 		}
 	}
-	if budget := effortBudget(req.ReasoningEffort); budget > 0 {
+	outputConfig := map[string]any{}
+	if lvl := effortLevel(req.ReasoningEffort); tr.adaptive && lvl != "" {
+		if tr.major == 4 && tr.minor < 7 && lvl == "xhigh" {
+			lvl = "high" // xhigh arrived with Opus 4.7
+		}
+		out["thinking"] = map[string]any{"type": "adaptive"}
+		outputConfig["effort"] = lvl
+		delete(out, "temperature")
+		delete(out, "top_p")
+	} else if budget := effortBudget(req.ReasoningEffort); budget > 0 && !tr.noBudget {
 		if maxTokens <= budget {
 			maxTokens = budget + 4096
 		}
@@ -235,12 +249,19 @@ func OpenAIToAnthropicRequest(body []byte, model string, defaultMaxTokens int, n
 		delete(out, "temperature") // thinking requires default temperature
 		delete(out, "top_p")
 	}
+	if tr.noSampling {
+		delete(out, "temperature")
+		delete(out, "top_p")
+	}
 	out["max_tokens"] = maxTokens
 	if req.User != "" {
 		out["metadata"] = map[string]any{"user_id": req.User}
 	}
 	if schema := nativeOutputSchema(req.ResponseFormat, nativeStructured); schema != nil {
-		out["output_config"] = map[string]any{"format": map[string]any{"type": "json_schema", "schema": schema}}
+		outputConfig["format"] = map[string]any{"type": "json_schema", "schema": schema}
+	}
+	if len(outputConfig) > 0 {
+		out["output_config"] = outputConfig
 	}
 	return json.Marshal(out)
 }
@@ -312,7 +333,7 @@ func effortBudget(effort string) int {
 		return 2048
 	case "medium":
 		return 8192
-	case "high":
+	case "high", "xhigh", "max":
 		return 16384
 	}
 	return 0

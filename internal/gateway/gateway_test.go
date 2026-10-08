@@ -865,3 +865,33 @@ func TestIsOfficialAnthropic(t *testing.T) {
 		}
 	}
 }
+
+func TestBodyRulesAppliedUpstream(t *testing.T) {
+	h := newHarness(t)
+	oa := *h.st.Snapshot().Providers["oa"]
+	oa.BodyRules = []store.BodyRule{
+		{Model: "qwen3-*", When: "nonstream", Set: json.RawMessage(`{"enable_thinking":false}`)},
+		{Model: "qwen3-*", Protocol: "anthropic", Set: json.RawMessage(`{"never":true}`)}, // oa only speaks openai
+		{Model: "qwen3-32b", Set: json.RawMessage(`{"user":null,"extra":{"a":1}}`)},
+	}
+	mustNil(t, h.st.UpdateProvider(&oa))
+	h.model("q", "oa/qwen3-32b")
+
+	req := oaReq("q", false)
+	req["user"] = "someone"
+	if resp, body := h.post("/v1/chat/completions", req); resp.StatusCode != 200 {
+		t.Fatal(body)
+	}
+	up := h.mock.Body("qwen3-32b")
+	if up["enable_thinking"] != false || up["never"] != nil || up["user"] != nil || up["extra"].(map[string]any)["a"].(float64) != 1 {
+		t.Fatalf("non-stream upstream body: %v", up)
+	}
+	// converted from an Anthropic client, streaming: the nonstream rule is skipped
+	if resp, body := h.post("/v1/messages", anReq("q", true)); resp.StatusCode != 200 {
+		t.Fatal(body)
+	}
+	up = h.mock.Body("qwen3-32b")
+	if _, ok := up["enable_thinking"]; ok || up["extra"] == nil || up["messages"] == nil {
+		t.Fatalf("stream upstream body: %v", up)
+	}
+}

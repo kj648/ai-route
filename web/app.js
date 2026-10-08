@@ -335,6 +335,30 @@ function parsePrices(text) {
 }
 const toPriceLines = (prices) => Object.entries(prices || {})
   .map(([k, v]) => `${k} = ${v.input} / ${v.cache != null ? v.cache + ' / ' : ''}${v.output}`).join('\n');
+// request body rules: "model(*) [stream|nonstream, openai|anthropic|embeddings] = {json}"
+const RULE_TAGS = { stream: 'when', nonstream: 'when', openai: 'protocol', anthropic: 'protocol', embeddings: 'protocol' };
+function parseRules(text) {
+  const rules = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = line.match(/^(\S+)\s*(?:\[([^\]]*)\])?\s*=\s*(\{.*\})$/);
+    if (!m) throw new Error('参数规则格式不对：' + line);
+    const rule = { model: m[1] };
+    for (const tag of (m[2] || '').split(/[,\s]+/).filter(Boolean)) {
+      if (!RULE_TAGS[tag]) throw new Error(`参数规则的条件只能是 stream、nonstream、openai、anthropic、embeddings：${line}`);
+      rule[RULE_TAGS[tag]] = tag;
+    }
+    try { rule.set = JSON.parse(m[3]); } catch (e) { throw new Error('参数规则的 JSON 不对：' + line); }
+    if (!rule.set || Array.isArray(rule.set) || typeof rule.set !== 'object') throw new Error('参数规则必须是 JSON 对象：' + line);
+    rules.push(rule);
+  }
+  return rules;
+}
+const toRuleLines = (rules) => (rules || []).map((r) => {
+  const tags = [r.when, r.protocol].filter(Boolean);
+  return `${r.model}${tags.length ? ` [${tags.join(', ')}]` : ''} = ${JSON.stringify(r.set)}`;
+}).join('\n');
 const usesProvider = (m, prefix) => m.targets.some((t) => t.startsWith(prefix + '/'));
 
 function compatOf(p) {
@@ -497,7 +521,7 @@ function presetInfoHTML(ps) {
 
 function providerForm(p, models, providers) {
   const isNew = !p;
-  p = p || { prefix: '', name: '', vendor: '', openai_base_url: '', anthropic_base_url: '', api_key: '', headers: {}, model_protocols: {}, models: [], ua_mode: 'passthrough', user_agent: '', timeout_seconds: 300, prices: {}, currency: 'CNY', enabled: true, remark: '' };
+  p = p || { prefix: '', name: '', vendor: '', openai_base_url: '', anthropic_base_url: '', api_key: '', headers: {}, model_protocols: {}, models: [], ua_mode: 'passthrough', user_agent: '', timeout_seconds: 300, prices: {}, currency: 'CNY', body_rules: [], enabled: true, remark: '' };
   const state = {
     vendor: guessVendor(p),
     models: [...(p.models || [])],
@@ -556,6 +580,9 @@ function providerForm(p, models, providers) {
             <div class="field"><label>模型协议规则</label><textarea id="pf-protos" placeholder="minimax-* = anthropic&#10;glm-* = openai">${esc(toLines(p.model_protocols, ' ='))}</textarea><div class="help">每行 <code>模型(可用*) = openai|anthropic</code>，某些模型只在一种端点提供时使用</div></div>
             <div class="field"><label>自定义请求头</label><textarea id="pf-headers" placeholder="X-Custom: value">${esc(toLines(p.headers, ':'))}</textarea><div class="help">每行 <code>Header: 值</code>，值留空表示删除该头</div></div>
           </div>
+          <div class="field"><label>请求参数规则</label>
+            <textarea id="pf-rules" placeholder='qwen3-* [nonstream] = {"enable_thinking": false}'>${esc(toRuleLines(p.body_rules))}</textarea>
+            <div class="help">每行 <code>模型(可用*) [条件] = JSON</code>，把 JSON 合并进发给上游的请求体（协议转换之后），值为 <code>null</code> 表示删除该字段。条件可选：<code>stream</code> / <code>nonstream</code>，<code>openai</code> / <code>anthropic</code> / <code>embeddings</code>，多个用逗号分隔</div></div>
           <div class="field"><label>单价（每百万 tokens，用于成本核算）
               <select id="pf-currency" style="margin-left:8px">${['CNY', 'USD'].map((c) => `<option value="${c}" ${(p.currency || 'CNY') === c ? 'selected' : ''}>${c === 'CNY' ? '人民币 ¥' : '美元 $'}</option>`).join('')}</select></label>
             <textarea id="pf-prices" placeholder="glm-5.3 = 4 / 0.8 / 16&#10;deepseek-* = 2 / 8">${esc(toPriceLines(p.prices))}</textarea>
@@ -617,6 +644,7 @@ function providerForm(p, models, providers) {
         $('#pf-protos', m).value = toLines(ps.protocols || {}, ' =');
         $('#pf-headers', m).value = toLines(ps.headers || {}, ':');
         if (isNew) $('#pf-currency', m).value = ps.currency || 'CNY';
+        $('#pf-rules', m).value = toRuleLines(ps.rules || []);
         setCompat(ps.openai && ps.anthropic ? 'both' : ps.anthropic ? 'anthropic' : 'openai');
         if (ps.ua && ps.ua.mode) {
           $('#pf-ua-value', m).value = ps.ua.value || '';
@@ -700,8 +728,11 @@ function providerForm(p, models, providers) {
 
       $('#pf-save', m).onclick = async () => {
         addFromInput();
-        let prices;
-        try { prices = parsePrices($('#pf-prices', m).value); } catch (e) { return toast(e.message, 'err'); }
+        let prices, bodyRules;
+        try {
+          prices = parsePrices($('#pf-prices', m).value);
+          bodyRules = parseRules($('#pf-rules', m).value);
+        } catch (e) { return toast(e.message, 'err'); }
         const body = {
           ...formBody(),
           vendor: state.vendor,
@@ -712,6 +743,7 @@ function providerForm(p, models, providers) {
           model_protocols: parseLines($('#pf-protos', m).value, '='),
           models: state.models,
           prices,
+          body_rules: bodyRules,
           currency: $('#pf-currency', m).value,
           enabled: $('#pf-enabled', m).checked,
         };
