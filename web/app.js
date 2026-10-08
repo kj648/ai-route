@@ -224,6 +224,7 @@ function targetHealth(t, idx, providers) {
   if (!p.enabled) return { cls: 'missing', tip: '套餐已停用' };
   const ps = idx.provider[prefix];
   const ts = idx.target[t];
+  if (ps && ps.down) return { cls: 'cool', tip: `健康检查失败，已移出调度：${ps.last_error}` };
   if (ps && ps.open) return { cls: 'cool', tip: `套餐冷却中，剩余 ${fmtSecs(ps.remaining_seconds)}：${ps.last_error}` };
   if (ts && ts.open) return { cls: 'cool', tip: `冷却中，剩余 ${fmtSecs(ts.remaining_seconds)}：${ts.last_error}` };
   if (ts && ts.failures > 0) return { cls: '', tip: `连续失败 ${ts.failures} 次：${ts.last_error}` };

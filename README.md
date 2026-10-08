@@ -302,7 +302,7 @@ OpenAI 流式直通时，网关会自动向上游加上 `stream_options.include_
 | `internal/convert`、`internal/store` | 请求和响应格式转换、SSE 解析；前缀生成规则、导入导出、统计分桶；单价匹配与计算、费用按统计货币换算、旧数据库自动加列 |
 
 ```bash
-go test ./...          # 用模拟上游跑全部测试（约 50 个），不需要真实 Key
+go test -race ./...    # 用模拟上游跑全部测试（约 90 个），不需要真实 Key
 go build -o bin/ai-route .
 ```
 
