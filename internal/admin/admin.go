@@ -54,6 +54,9 @@ func (a *Admin) Register(mux *http.ServeMux) {
 
 	api.HandleFunc("GET /admin/api/status", a.status)
 	api.HandleFunc("POST /admin/api/status/reset", a.resetBreaker)
+	api.HandleFunc("GET /admin/api/runtime", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"in_flight": a.gw.InFlight(), "health": a.gw.Health.Status()})
+	})
 	api.HandleFunc("GET /admin/api/logs", a.logs)
 	api.HandleFunc("GET /admin/api/stats", a.stats)
 

@@ -37,6 +37,9 @@ type AlertConfig struct {
 	// LongCooldownMinutes in one go.
 	OnLongCooldown      bool `json:"on_long_cooldown"`
 	LongCooldownMinutes int  `json:"long_cooldown_minutes"`
+	// OnHealthCheck: a provider with active health checks goes down or
+	// recovers.
+	OnHealthCheck bool `json:"on_health_check"`
 	// SilenceMinutes: the same alert (same event and subject) is sent at
 	// most once per this many minutes.
 	SilenceMinutes int `json:"silence_minutes"`
@@ -49,6 +52,7 @@ func DefaultAlertConfig() AlertConfig {
 		OnAllFailed:         true,
 		OnLongCooldown:      true,
 		LongCooldownMinutes: 10,
+		OnHealthCheck:       true,
 		SilenceMinutes:      30,
 	}
 }

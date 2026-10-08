@@ -24,10 +24,12 @@ import (
 
 // Event kinds; also the first part of an alert's dedupe key.
 const (
-	EventAuthFailure  = "auth_failure"
-	EventAllFailed    = "all_failed"
-	EventLongCooldown = "long_cooldown"
-	EventTest         = "test"
+	EventAuthFailure     = "auth_failure"
+	EventAllFailed       = "all_failed"
+	EventLongCooldown    = "long_cooldown"
+	EventHealthDown      = "health_down"
+	EventHealthRecovered = "health_recovered"
+	EventTest            = "test"
 )
 
 // Alert is one notification.
@@ -70,6 +72,8 @@ func (n *Notifier) Enabled(event string) bool {
 		return c.OnAllFailed
 	case EventLongCooldown:
 		return c.OnLongCooldown
+	case EventHealthDown, EventHealthRecovered:
+		return c.OnHealthCheck
 	}
 	return false
 }

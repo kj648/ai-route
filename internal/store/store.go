@@ -55,10 +55,19 @@ type Provider struct {
 	// BodyRules patch the upstream request body for matching models, e.g.
 	// enable_thinking=false for Qwen3 non-stream calls on Bailian.
 	BodyRules []BodyRule `json:"body_rules"`
-	Enabled   bool       `json:"enabled"`
-	Remark    string     `json:"remark"`
-	CreatedAt int64      `json:"created_at"`
-	UpdatedAt int64      `json:"updated_at"`
+	// Self-hosted upstreams: MaxConcurrency caps in-flight requests (excess
+	// overflows to the next target); FirstTokenTimeoutSeconds bounds the wait
+	// for the first stream event; HealthCheckSeconds probes HealthCheckURL
+	// (default: the models endpoint) and takes the provider out of rotation
+	// while it fails. 0 = off.
+	MaxConcurrency           int    `json:"max_concurrency"`
+	FirstTokenTimeoutSeconds int    `json:"first_token_timeout_seconds"`
+	HealthCheckSeconds       int    `json:"health_check_seconds"`
+	HealthCheckURL           string `json:"health_check_url"`
+	Enabled                  bool   `json:"enabled"`
+	Remark                   string `json:"remark"`
+	CreatedAt                int64  `json:"created_at"`
+	UpdatedAt                int64  `json:"updated_at"`
 }
 
 // BodyRule merges Set into the request body sent upstream (after protocol
@@ -161,19 +170,23 @@ type Settings struct {
 	// other currency are converted with USDToCNY.
 	Currency string  `json:"currency"`
 	USDToCNY float64 `json:"usd_to_cny"`
+	// QueueTimeoutSeconds is how long a request waits for a free slot when
+	// every target with a concurrency cap is full.
+	QueueTimeoutSeconds int `json:"queue_timeout_seconds"`
 }
 
 func DefaultSettings() Settings {
 	return Settings{
-		MaxRetries:         2,
-		RetryBackoffMs:     1000,
-		FailureThreshold:   2,
-		CooldownSeconds:    60,
-		MaxCooldownSeconds: 1800,
-		LogRetentionDays:   30,
-		DefaultMaxTokens:   8192,
-		Currency:           CurrencyCNY,
-		USDToCNY:           7.2,
+		MaxRetries:          2,
+		RetryBackoffMs:      1000,
+		FailureThreshold:    2,
+		CooldownSeconds:     60,
+		MaxCooldownSeconds:  1800,
+		LogRetentionDays:    30,
+		DefaultMaxTokens:    8192,
+		Currency:            CurrencyCNY,
+		USDToCNY:            7.2,
+		QueueTimeoutSeconds: 30,
 	}
 }
 
@@ -289,6 +302,10 @@ CREATE TABLE IF NOT EXISTS providers (
 	timeout_seconds INTEGER NOT NULL DEFAULT 300,
 	prices TEXT NOT NULL DEFAULT '{}',
 	body_rules TEXT NOT NULL DEFAULT '[]',
+	max_concurrency INTEGER NOT NULL DEFAULT 0,
+	first_token_timeout_seconds INTEGER NOT NULL DEFAULT 0,
+	health_check_seconds INTEGER NOT NULL DEFAULT 0,
+	health_check_url TEXT NOT NULL DEFAULT '',
 	currency TEXT NOT NULL DEFAULT 'CNY',
 	enabled INTEGER NOT NULL DEFAULT 1,
 	remark TEXT NOT NULL DEFAULT '',
@@ -366,6 +383,10 @@ CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_a
 		{"prices", `TEXT NOT NULL DEFAULT '{}'`},
 		{"currency", `TEXT NOT NULL DEFAULT 'CNY'`},
 		{"body_rules", `TEXT NOT NULL DEFAULT '[]'`},
+		{"max_concurrency", `INTEGER NOT NULL DEFAULT 0`},
+		{"first_token_timeout_seconds", `INTEGER NOT NULL DEFAULT 0`},
+		{"health_check_seconds", `INTEGER NOT NULL DEFAULT 0`},
+		{"health_check_url", `TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := s.ensureColumn("providers", c[0], c[1]); err != nil {
 			return err
@@ -493,13 +514,13 @@ func (s *Store) reloadLocked() error {
 
 // ---------- providers ----------
 
-const providerCols = `id, prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, enabled, remark, created_at, updated_at`
+const providerCols = `id, prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, enabled, remark, created_at, updated_at`
 
 func scanProvider(sc interface{ Scan(...any) error }) (*Provider, error) {
 	p := &Provider{}
 	var headers, protos, models, prices, rules string
 	var enabled int
-	if err := sc.Scan(&p.ID, &p.Prefix, &p.Name, &p.OpenAIBaseURL, &p.AnthropicBaseURL, &p.APIKey, &headers, &protos, &models, &p.Vendor, &p.UAMode, &p.UserAgent, &p.TimeoutSeconds, &prices, &p.Currency, &rules, &enabled, &p.Remark, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.Prefix, &p.Name, &p.OpenAIBaseURL, &p.AnthropicBaseURL, &p.APIKey, &headers, &protos, &models, &p.Vendor, &p.UAMode, &p.UserAgent, &p.TimeoutSeconds, &prices, &p.Currency, &rules, &p.MaxConcurrency, &p.FirstTokenTimeoutSeconds, &p.HealthCheckSeconds, &p.HealthCheckURL, &enabled, &p.Remark, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	p.Enabled = enabled == 1
@@ -620,6 +641,17 @@ func normalizeProvider(p *Provider) error {
 		rules = append(rules, r)
 	}
 	p.BodyRules = rules
+	if p.MaxConcurrency < 0 || p.FirstTokenTimeoutSeconds < 0 || p.HealthCheckSeconds < 0 {
+		return errors.New("max_concurrency, first_token_timeout_seconds and health_check_seconds must not be negative")
+	}
+	if p.HealthCheckSeconds > 0 && p.HealthCheckSeconds < 5 {
+		p.HealthCheckSeconds = 5
+	}
+	if p.HealthCheckURL = strings.TrimSpace(p.HealthCheckURL); p.HealthCheckURL != "" {
+		if u, err := url.Parse(p.HealthCheckURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("invalid health_check_url %q", p.HealthCheckURL)
+		}
+	}
 	p.UserAgent = strings.TrimSpace(p.UserAgent)
 	switch p.UAMode {
 	case "", "passthrough":
@@ -749,8 +781,8 @@ func (s *Store) CreateProvider(p *Provider) error {
 	}
 	p.Prefix = uniquePrefix(p.Prefix, taken)
 	t := now()
-	res, err := s.db.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), b2i(p.Enabled), p.Remark, t, t)
+	res, err := s.db.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.Enabled), p.Remark, t, t)
 	if err != nil {
 		return friendlyErr(err)
 	}
@@ -785,8 +817,8 @@ func (s *Store) UpdateProvider(p *Provider) error {
 	}
 	defer tx.Rollback()
 	t := now()
-	if _, err := tx.Exec(`UPDATE providers SET prefix=?, name=?, openai_base_url=?, anthropic_base_url=?, api_key=?, headers=?, model_protocols=?, models=?, vendor=?, ua_mode=?, user_agent=?, timeout_seconds=?, prices=?, currency=?, body_rules=?, enabled=?, remark=?, updated_at=? WHERE id=?`,
-		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), b2i(p.Enabled), p.Remark, t, p.ID); err != nil {
+	if _, err := tx.Exec(`UPDATE providers SET prefix=?, name=?, openai_base_url=?, anthropic_base_url=?, api_key=?, headers=?, model_protocols=?, models=?, vendor=?, ua_mode=?, user_agent=?, timeout_seconds=?, prices=?, currency=?, body_rules=?, max_concurrency=?, first_token_timeout_seconds=?, health_check_seconds=?, health_check_url=?, enabled=?, remark=?, updated_at=? WHERE id=?`,
+		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.Enabled), p.Remark, t, p.ID); err != nil {
 		return friendlyErr(err)
 	}
 	if old.Prefix != p.Prefix {
@@ -1163,6 +1195,9 @@ func normalizeSettings(st Settings) Settings {
 	if st.USDToCNY <= 0 {
 		st.USDToCNY = d.USDToCNY
 	}
+	if st.QueueTimeoutSeconds < 0 {
+		st.QueueTimeoutSeconds = 0
+	}
 	return st
 }
 
@@ -1241,8 +1276,8 @@ func (s *Store) Import(e *Export) error {
 	}
 	t := now()
 	for _, p := range e.Providers {
-		if _, err := tx.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), b2i(p.Enabled), p.Remark, t, t); err != nil {
+		if _, err := tx.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.Enabled), p.Remark, t, t); err != nil {
 			return friendlyErr(err)
 		}
 	}

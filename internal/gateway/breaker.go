@@ -46,7 +46,14 @@ type breakerEntry struct {
 	LastSuccessAt time.Time `json:"last_success_at"`
 	TotalSuccess  int64     `json:"total_success"`
 	TotalFailure  int64     `json:"total_failure"`
+	// Down: the provider fails its active health check; it stays out of
+	// rotation (tried last) until a check passes.
+	Down bool `json:"down,omitempty"`
 }
+
+// downFor is how far in the future a down provider's OpenUntil is reported,
+// which sorts it behind every cooling target.
+const downFor = 24 * time.Hour
 
 // Breaker tracks health per provider ("p:<prefix>") and per target
 // ("t:<prefix>/<model>"). State is in memory only.
@@ -79,11 +86,33 @@ func (b *Breaker) OpenUntil(prefix, target string) time.Time {
 	now := time.Now()
 	var until time.Time
 	for _, k := range []string{providerKey(prefix), targetKey(target)} {
-		if e, ok := b.entries[k]; ok && e.OpenUntil.After(now) && e.OpenUntil.After(until) {
-			until = e.OpenUntil
+		e, ok := b.entries[k]
+		if !ok {
+			continue
+		}
+		open := e.OpenUntil
+		if e.Down {
+			open = now.Add(downFor)
+		}
+		if open.After(now) && open.After(until) {
+			until = open
 		}
 	}
 	return until
+}
+
+// SetDown marks a provider as failing (or passing) its health check and
+// reports whether the state changed.
+func (b *Breaker) SetDown(prefix string, down bool, msg string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e := b.entry(providerKey(prefix))
+	changed := e.Down != down
+	e.Down = down
+	if down {
+		e.LastError, e.LastErrorAt = msg, time.Now()
+	}
+	return changed
 }
 
 func (b *Breaker) Success(prefix, target string) {
@@ -183,6 +212,9 @@ func (b *Breaker) Status() []BreakerStatus {
 		if e.OpenUntil.After(now) {
 			s.Open = true
 			s.RemainingSecond = int64(e.OpenUntil.Sub(now).Seconds()) + 1
+		}
+		if e.Down {
+			s.Open = true
 		}
 		out = append(out, s)
 	}

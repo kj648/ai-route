@@ -53,6 +53,8 @@ func main() {
 	}
 
 	gw := gateway.New(st)
+	bg, stopBG := context.WithCancel(context.Background())
+	go gw.Health.Run(bg)
 	web, _ := fs.Sub(webFS, "web")
 	mux := http.NewServeMux()
 	gw.Register(mux)
@@ -84,6 +86,8 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	stopBG()
+	gw.Alerts.Wait()
 	_ = st.Close()
 }
 

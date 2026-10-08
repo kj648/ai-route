@@ -31,7 +31,9 @@ type Gateway struct {
 	Breaker *Breaker
 	Limiter *Limiter
 	Alerts  *alert.Notifier
+	Health  *HealthChecker
 	client  *http.Client
+	slots   *slots
 
 	touchMu sync.Mutex
 	touched map[int64]time.Time
@@ -48,15 +50,22 @@ func New(s *store.Store) *Gateway {
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
-	return &Gateway{
+	g := &Gateway{
 		store:   s,
 		Breaker: NewBreaker(s.GetSettings),
 		Limiter: NewLimiter(s),
 		Alerts:  alert.New(s.GetAlerts),
 		client:  &http.Client{Transport: transport},
+		slots:   newSlots(),
 		touched: map[int64]time.Time{},
 	}
+	g.Health = newHealthChecker(g)
+	return g
 }
+
+// InFlight returns the number of in-flight requests per provider that has
+// a concurrency cap.
+func (g *Gateway) InFlight() map[string]int { return g.slots.snapshot() }
 
 // Register mounts the public API routes.
 func (g *Gateway) Register(mux *http.ServeMux) {
@@ -303,7 +312,14 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 
 	lastStatus, lastMsg := http.StatusBadGateway, ""
 	st := snap.Settings
-	for i, c := range cands {
+	tried := false
+	// attempt runs one target (with retries) and reports whether the request
+	// is finished: answered, or the client went away.
+	attempt := func(i int, c candidate) bool {
+		if c.provider.MaxConcurrency > 0 {
+			defer g.slots.release(c.prefix) // the slot was taken by the caller
+		}
+		tried = true
 		var res tryResult
 		// transient errors are retried on the same target before switching,
 		// so a network blip doesn't move the conversation to another plan
@@ -333,7 +349,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		if res.clientGone {
 			entry.HTTPStatus, entry.Error = 499, "client disconnected"
 			entry.Provider, entry.UpstreamModel, entry.UpstreamProtocol = c.prefix, c.model, c.proto
-			return
+			return true
 		}
 		if res.committed {
 			entry.Provider, entry.UpstreamModel, entry.UpstreamProtocol = c.prefix, c.model, c.proto
@@ -352,11 +368,45 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 			} else {
 				g.failure(c, failSoft, 0, 200, res.streamErr)
 			}
-			return
+			return true
 		}
 		g.failure(c, res.kind, res.retryAfter, res.attempt.HTTPStatus, res.attempt.Error)
 		lastStatus, lastMsg = res.attempt.HTTPStatus, res.attempt.Error
 		log.Printf("[%s] target %s failed (%d): %s", m.Name, c.target, res.attempt.HTTPStatus, truncate(res.attempt.Error, 200))
+		return false
+	}
+
+	// targets at their concurrency cap are skipped (overflow to the next one)
+	var full []int
+	for i, c := range cands {
+		if c.provider.MaxConcurrency > 0 && !g.slots.tryAcquire(c.prefix, c.provider.MaxConcurrency) {
+			full = append(full, i)
+			entry.Attempts = append(entry.Attempts, store.Attempt{Target: c.target, Protocol: c.proto,
+				Error: fmt.Sprintf("at capacity (%d concurrent requests), skipped", c.provider.MaxConcurrency)})
+			continue
+		}
+		if attempt(i, c) {
+			return
+		}
+	}
+	// everything else failed: wait for a slot on one of the full targets
+	if len(full) > 0 && st.QueueTimeoutSeconds > 0 {
+		waiting := make([]candidate, len(full))
+		for k, i := range full {
+			waiting[k] = cands[i]
+		}
+		if k := g.slots.acquireAny(r.Context(), waiting, time.Duration(st.QueueTimeoutSeconds)*time.Second); k >= 0 {
+			if attempt(full[k], waiting[k]) {
+				return
+			}
+		} else if r.Context().Err() != nil {
+			entry.HTTPStatus, entry.Error = 499, "client disconnected while queued"
+			return
+		}
+	}
+	if !tried {
+		lastStatus, lastMsg = http.StatusTooManyRequests, "all upstream targets are at capacity"
+		w.Header().Set("Retry-After", "1")
 	}
 	if lastStatus < 400 {
 		lastStatus = http.StatusBadGateway
@@ -634,9 +684,15 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	timeout := time.Duration(c.provider.TimeoutSeconds) * time.Second
+	// a stream may have a shorter deadline for its first event (a queued
+	// self-hosted server should hand over to the next target quickly)
+	firstWait, firstLabel := timeout, "timeout"
+	if ft := time.Duration(c.provider.FirstTokenTimeoutSeconds) * time.Second; stream && ft > 0 && ft < timeout {
+		firstWait, firstLabel = ft, "first token timeout"
+	}
 	timedOut := false
 	var timerMu sync.Mutex
-	timer := time.AfterFunc(timeout, func() {
+	timer := time.AfterFunc(firstWait, func() {
 		timerMu.Lock()
 		timedOut = true
 		timerMu.Unlock()
@@ -659,7 +715,7 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 		}
 		if isTimeout() {
 			// we already waited the full timeout: switch rather than wait again
-			return fail(504, failSoft, fmt.Sprintf("timeout after %s", timeout))
+			return fail(504, failSoft, fmt.Sprintf("%s after %s", firstLabel, firstWait))
 		}
 		res.retryable = true
 		return fail(502, failSoft, err.Error())

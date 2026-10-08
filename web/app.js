@@ -283,7 +283,7 @@ async function pageDashboard() {
         </table></div>` : '<div class="empty">还没有配置模型映射</div>'}
         ${cooling.length ? `<div class="table-wrap"><table>
           <tr><th>冷却对象</th><th>剩余</th><th>最近错误</th><th></th></tr>
-          ${cooling.map((s) => `<tr><td><span class="badge ${s.kind === 'provider' ? 'err' : 'warn'}">${s.kind === 'provider' ? '整个套餐' : '模型'}</span> ${esc(s.name)}</td><td>${fmtSecs(s.remaining_seconds)}</td><td class="small err-text"><div class="ellipsis" title="${esc(s.last_error)}">${esc(s.last_error)}</div></td><td><button class="btn sm" data-reset="${esc(s.key)}">恢复</button></td></tr>`).join('')}
+          ${cooling.map((s) => `<tr><td><span class="badge ${s.kind === 'provider' ? 'err' : 'warn'}">${s.kind === 'provider' ? '整个套餐' : '模型'}</span> ${esc(s.name)}</td><td>${s.down ? '健康检查失败' : fmtSecs(s.remaining_seconds)}</td><td class="small err-text"><div class="ellipsis" title="${esc(s.last_error)}">${esc(s.last_error)}</div></td><td><button class="btn sm" data-reset="${esc(s.key)}">恢复</button></td></tr>`).join('')}
         </table></div>` : ''}
       </div>
     </div>
@@ -374,7 +374,7 @@ function vendorBadge(p) {
 }
 
 async function pageProviders() {
-  const [providers, status, models] = await Promise.all([api('GET', '/providers'), api('GET', '/status'), api('GET', '/models')]);
+  const [providers, status, models, rt] = await Promise.all([api('GET', '/providers'), api('GET', '/status'), api('GET', '/models'), api('GET', '/runtime')]);
   const idx = healthIndex(status);
   $('#page').innerHTML = `
     ${head('供应商', '编码套餐、官方 API、聚合平台都在这里配置。每个供应商有一个前缀，它的模型在映射里显示为 <code>前缀/模型名</code>', '<button class="btn primary" id="add-provider">+ 添加供应商</button>')}
@@ -382,7 +382,10 @@ async function pageProviders() {
       const ps = idx.provider[p.prefix];
       const used = models.filter((m) => usesProvider(m, p.prefix)).map((m) => m.name);
       let st = p.enabled ? '<span class="badge ok">启用</span>' : '<span class="badge">停用</span>';
-      if (p.enabled && ps && ps.open) st = `<span class="badge warn" title="${esc(ps.last_error)}">冷却中 ${fmtSecs(ps.remaining_seconds)}</span>`;
+      if (p.enabled && ps && ps.open) st = ps.down
+        ? `<span class="badge err" title="${esc(ps.last_error)}">健康检查失败</span>`
+        : `<span class="badge warn" title="${esc(ps.last_error)}">冷却中 ${fmtSecs(ps.remaining_seconds)}</span>`;
+      const hc = rt.health[p.prefix];
       return `<div class="card">
         <div class="card-head">
           <div class="toolbar"><code>${esc(p.prefix)}</code> <span>${esc(p.name || p.prefix)}</span> ${st}
@@ -402,6 +405,9 @@ async function pageProviders() {
             <div class="k">API Key</div><div class="mono small">${p.has_api_key ? esc(p.api_key) : '<span class="err-text">未设置</span>'}</div>
             <div class="k">User-Agent</div><div class="small">${p.ua_mode === 'override' ? `固定：<span class="mono">${esc(p.user_agent)}</span>` : `透传客户端${p.user_agent ? `（缺省：<span class="mono">${esc(p.user_agent)}</span>）` : ''}`}</div>
             <div class="k">被映射引用</div><div class="small">${used.length ? used.map(esc).join('，') : '<span class="muted">无</span>'}</div>
+            ${p.max_concurrency ? `<div class="k">并发</div><div class="small">${rt.in_flight[p.prefix] || 0} / ${p.max_concurrency}（满了会溢出到下一个候补）</div>` : ''}
+            ${p.health_check_seconds ? `<div class="k">健康检查</div><div class="small">每 ${p.health_check_seconds} 秒${hc && hc.last_check > 0 ? `，最近 ${fmtAgo(hc.last_check)}${hc.failures ? `，<span class="err-text">连续失败 ${hc.failures} 次</span>` : '，<span class="ok-text">正常</span>'}` : ''}</div>` : ''}
+            ${p.first_token_timeout_seconds ? `<div class="k">首包超时</div><div class="small">${p.first_token_timeout_seconds} 秒</div>` : ''}
             ${p.remark ? `<div class="k">备注</div><div class="small">${esc(p.remark)}</div>` : ''}
           </div>
           <div>
@@ -521,7 +527,7 @@ function presetInfoHTML(ps) {
 
 function providerForm(p, models, providers) {
   const isNew = !p;
-  p = p || { prefix: '', name: '', vendor: '', openai_base_url: '', anthropic_base_url: '', api_key: '', headers: {}, model_protocols: {}, models: [], ua_mode: 'passthrough', user_agent: '', timeout_seconds: 300, prices: {}, currency: 'CNY', body_rules: [], enabled: true, remark: '' };
+  p = p || { prefix: '', name: '', vendor: '', openai_base_url: '', anthropic_base_url: '', api_key: '', headers: {}, model_protocols: {}, models: [], ua_mode: 'passthrough', user_agent: '', timeout_seconds: 300, prices: {}, currency: 'CNY', body_rules: [], max_concurrency: 0, first_token_timeout_seconds: 0, health_check_seconds: 0, health_check_url: '', enabled: true, remark: '' };
   const state = {
     vendor: guessVendor(p),
     models: [...(p.models || [])],
@@ -579,6 +585,14 @@ function providerForm(p, models, providers) {
           <div class="row2">
             <div class="field"><label>模型协议规则</label><textarea id="pf-protos" placeholder="minimax-* = anthropic&#10;glm-* = openai">${esc(toLines(p.model_protocols, ' ='))}</textarea><div class="help">每行 <code>模型(可用*) = openai|anthropic</code>，某些模型只在一种端点提供时使用</div></div>
             <div class="field"><label>自定义请求头</label><textarea id="pf-headers" placeholder="X-Custom: value">${esc(toLines(p.headers, ':'))}</textarea><div class="help">每行 <code>Header: 值</code>，值留空表示删除该头</div></div>
+          </div>
+          <div class="field"><label>自建模型（vLLM、SGLang、Ollama 等）</label>
+            <div class="row3">
+              <div><input type="number" id="pf-maxc" min="0" value="${p.max_concurrency || ''}" placeholder="最大并发：不限"><div class="help">同时在途的请求数上限，满了就溢出到下一个候补；都满时排队（见设置）</div></div>
+              <div><input type="number" id="pf-ftt" min="0" value="${p.first_token_timeout_seconds || ''}" placeholder="首包超时（秒）：同超时"><div class="help">流式请求等第一个事件的时间，超过就切换；之后按上面的超时算</div></div>
+              <div><input type="number" id="pf-hc" min="0" value="${p.health_check_seconds || ''}" placeholder="健康检查间隔（秒）：不检查"><div class="help">连续 2 次失败就移出调度，恢复后自动加回</div></div>
+            </div>
+            <input type="text" id="pf-hc-url" value="${esc(p.health_check_url || '')}" placeholder="健康检查地址（可选，默认 GET 模型列表接口，如 http://gpu-1:8000/v1/models）" style="margin-top:8px">
           </div>
           <div class="field"><label>请求参数规则</label>
             <textarea id="pf-rules" placeholder='qwen3-* [nonstream] = {"enable_thinking": false}'>${esc(toRuleLines(p.body_rules))}</textarea>
@@ -744,6 +758,10 @@ function providerForm(p, models, providers) {
           models: state.models,
           prices,
           body_rules: bodyRules,
+          max_concurrency: Math.floor(Number($('#pf-maxc', m).value) || 0),
+          first_token_timeout_seconds: Math.floor(Number($('#pf-ftt', m).value) || 0),
+          health_check_seconds: Math.floor(Number($('#pf-hc', m).value) || 0),
+          health_check_url: $('#pf-hc-url', m).value.trim(),
           currency: $('#pf-currency', m).value,
           enabled: $('#pf-enabled', m).checked,
         };
@@ -1332,6 +1350,7 @@ claude</pre>
         </div>
         <div class="row2">
           <div class="field"><label>默认 max_tokens</label><input type="number" id="st-mt" min="1" value="${st.default_max_tokens}"><div class="help">OpenAI 请求转 Anthropic 上游且没带 max_tokens 时使用</div></div>
+          <div class="field"><label>排队等待（秒）</label><input type="number" id="st-queue" min="0" value="${st.queue_timeout_seconds}"><div class="help">设了最大并发的上游都满、其他候补也失败时，最多等这么久；0 = 不等，直接返回 429</div></div>
         </div>
         <div class="row2">
           <div class="field"><label>统计货币</label><select id="st-cur">${['CNY', 'USD'].map((c) => `<option value="${c}" ${st.currency === c ? 'selected' : ''}>${c === 'CNY' ? '人民币 ¥' : '美元 $'}</option>`).join('')}</select><div class="help">概览里的费用统一换算成这种货币；日志里显示原始货币</div></div>
@@ -1349,6 +1368,7 @@ claude</pre>
         <div class="field"><label>推送哪些事件</label>
           <label class="check"><input type="checkbox" id="al-auth" ${alerts.on_auth_failure ? 'checked' : ''}> 上游返回 401 / 402（Key 失效、欠费），整个套餐被冷却</label>
           <label class="check"><input type="checkbox" id="al-all" ${alerts.on_all_failed ? 'checked' : ''}> 某个对外模型的整条调度链全部失败（客户端收到错误）</label>
+          <label class="check"><input type="checkbox" id="al-health" ${alerts.on_health_check ? 'checked' : ''}> 开了健康检查的供应商连续检查失败被移出调度，以及恢复</label>
           <label class="check"><input type="checkbox" id="al-cool" ${alerts.on_long_cooldown ? 'checked' : ''}> 套餐或模型一次冷却超过 <input type="number" id="al-cool-min" min="1" value="${alerts.long_cooldown_minutes}" style="width:70px"> 分钟</label>
         </div>
         <div class="row2">
@@ -1374,6 +1394,7 @@ claude</pre>
         max_cooldown_seconds: Number($('#st-max').value), log_retention_days: Number($('#st-ret').value),
         default_max_tokens: Number($('#st-mt').value),
         currency: $('#st-cur').value, usd_to_cny: Number($('#st-rate').value),
+        queue_timeout_seconds: Math.max(0, Math.floor(Number($('#st-queue').value) || 0)),
       });
       toast('已保存', 'ok');
       route();
@@ -1458,7 +1479,7 @@ function alertHooksEditor(alerts) {
     try {
       await api('PUT', '/alerts', {
         webhooks: hooks,
-        on_auth_failure: $('#al-auth').checked, on_all_failed: $('#al-all').checked, on_long_cooldown: $('#al-cool').checked,
+        on_auth_failure: $('#al-auth').checked, on_all_failed: $('#al-all').checked, on_long_cooldown: $('#al-cool').checked, on_health_check: $('#al-health').checked,
         long_cooldown_minutes: Number($('#al-cool-min').value), silence_minutes: Number($('#al-silence').value),
       });
       toast('已保存', 'ok');

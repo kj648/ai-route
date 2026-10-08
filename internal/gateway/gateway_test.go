@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"ai-route/internal/convert"
 	"ai-route/internal/store"
@@ -87,6 +88,12 @@ func (m *mockUpstream) serve(w http.ResponseWriter, r *http.Request) {
 	case "fail400":
 		http.Error(w, `{"error":{"message":"bad request"}}`, 400)
 		return
+	case "slow": // holds the request for a moment
+		time.Sleep(300 * time.Millisecond)
+	case "slowfirst": // streams start late
+		if req.Stream {
+			time.Sleep(1500 * time.Millisecond)
+		}
 	case "fail401":
 		http.Error(w, `{"error":{"message":"invalid api key"}}`, 401)
 		return
