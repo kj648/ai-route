@@ -1296,8 +1296,13 @@ func (s *Store) Import(e *Export) error {
 		if err := normalizeKey(k); err != nil {
 			return fmt.Errorf("api key %q: %w", k.Name, err)
 		}
-		if _, err := tx.Exec(`INSERT INTO api_keys (name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
-			k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, t); err != nil {
+		// keep the id: request logs (and so monthly budgets) refer to it
+		var id any
+		if k.ID > 0 {
+			id = k.ID
+		}
+		if _, err := tx.Exec(`INSERT INTO api_keys (id, name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			id, k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, t); err != nil {
 			return friendlyErr(err)
 		}
 	}

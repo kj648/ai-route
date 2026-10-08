@@ -131,3 +131,26 @@ func TestLimiterWindowSlides(t *testing.T) {
 		t.Fatalf("after the window: %+v", rej)
 	}
 }
+
+func TestBudgetNeverDoubleCountsAcrossReload(t *testing.T) {
+	h := newHarness(t)
+	h.setProvider("oa", func(p *store.Provider) { p.Prices = map[string]store.Price{"*": {Input: 100_000}} }) // ¥1 per request
+	h.model("coder", "oa/ok")
+	key := h.limitedKey(store.APIKey{MonthlyBudget: 100})
+	k := h.st.Snapshot().Keys[key]
+	h.gw.Limiter.Admit(k) // loads 0
+	for i := 0; i < 5; i++ {
+		h.postAs(key, "/v1/chat/completions", oaReq("coder", false))
+	}
+	h.gw.Limiter.Forget() // force a reload: the logged total replaces the cached sum
+	h.gw.Limiter.Admit(k)
+	for i := 0; i < 3; i++ {
+		h.postAs(key, "/v1/chat/completions", oaReq("coder", false))
+	}
+	h.gw.Limiter.mu.Lock()
+	spend := h.gw.Limiter.keys[k.ID].spend
+	h.gw.Limiter.mu.Unlock()
+	if spend != 8 {
+		t.Fatalf("spend %v, want 8", spend)
+	}
+}

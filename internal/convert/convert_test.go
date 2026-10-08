@@ -295,6 +295,10 @@ func TestMergeJSON(t *testing.T) {
 	if !strings.Contains(string(out), `"messages":[{"role":"user","content":"<hi>"}]`) {
 		t.Fatalf("untouched fields must keep their bytes: %s", out)
 	}
+	out, err = MergeJSON([]byte(body), json.RawMessage(`{"chat_template_kwargs":{"enable_thinking":false,"drop":null}}`))
+	if err != nil || !strings.Contains(string(out), `"chat_template_kwargs":{"enable_thinking":false}`) {
+		t.Fatalf("null inside a new object must be dropped: %s %v", out, err)
+	}
 	if _, err := MergeJSON([]byte(body), json.RawMessage(`[1]`)); err == nil {
 		t.Fatal("non-object patch accepted")
 	}

@@ -55,8 +55,19 @@ func (h *HealthChecker) Run(ctx context.Context) {
 // waits for the probes to finish.
 func (h *HealthChecker) CheckDue(ctx context.Context) {
 	now := h.now()
+	providers := h.g.store.Snapshot().Providers
+	// providers whose checks were turned off (or that were disabled or
+	// deleted) must not stay marked down
+	h.mu.Lock()
+	for prefix := range h.states {
+		if p, ok := providers[prefix]; !ok || !p.Enabled || p.HealthCheckSeconds <= 0 {
+			delete(h.states, prefix)
+			h.g.Breaker.SetDown(prefix, false, "")
+		}
+	}
+	h.mu.Unlock()
 	var wg sync.WaitGroup
-	for _, p := range h.g.store.Snapshot().Providers {
+	for _, p := range providers {
 		if !p.Enabled || p.HealthCheckSeconds <= 0 {
 			continue
 		}
@@ -139,7 +150,11 @@ func (h *HealthChecker) probe(ctx context.Context, p *store.Provider) string {
 
 func (h *HealthChecker) record(p *store.Provider, problem string) {
 	h.mu.Lock()
-	st := h.states[p.Prefix]
+	st, ok := h.states[p.Prefix]
+	if !ok { // checks were turned off meanwhile
+		h.mu.Unlock()
+		return
+	}
 	if problem == "" {
 		st.failures = 0
 	} else {
@@ -155,18 +170,17 @@ func (h *HealthChecker) record(p *store.Provider, problem string) {
 		}
 		if alerted {
 			h.setAlerted(p.Prefix, false)
-			h.g.Alerts.Notify(alert.Alert{Event: alert.EventHealthRecovered, Subject: p.Prefix,
+			_ = h.g.Alerts.Notify(alert.Alert{Event: alert.EventHealthRecovered, Subject: p.Prefix,
 				Title: fmt.Sprintf("供应商 %s 已恢复", p.Prefix), Text: "健康检查通过，已重新加入调度。"})
 		}
 	case failures >= healthFailures:
 		if h.g.Breaker.SetDown(p.Prefix, true, "health check: "+problem) {
 			log.Printf("health check: %s is down: %s", p.Prefix, problem)
 		}
-		if !alerted && h.g.Alerts.Enabled(alert.EventHealthDown) {
+		if !alerted && h.g.Alerts.Notify(alert.Alert{Event: alert.EventHealthDown, Subject: p.Prefix,
+			Title: fmt.Sprintf("供应商 %s 健康检查失败", p.Prefix),
+			Text:  fmt.Sprintf("连续 %d 次检查失败，已移出调度（只在其他候补都不可用时兜底）：%s", failures, problem)}) {
 			h.setAlerted(p.Prefix, true)
-			h.g.Alerts.Notify(alert.Alert{Event: alert.EventHealthDown, Subject: p.Prefix,
-				Title: fmt.Sprintf("供应商 %s 健康检查失败", p.Prefix),
-				Text:  fmt.Sprintf("连续 %d 次检查失败，已移出调度（只在其他候补都不可用时兜底）：%s", failures, problem)})
 		}
 	}
 }
@@ -174,7 +188,9 @@ func (h *HealthChecker) record(p *store.Provider, problem string) {
 func (h *HealthChecker) setAlerted(prefix string, v bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.states[prefix].alerted = v
+	if st, ok := h.states[prefix]; ok {
+		st.alerted = v
+	}
 }
 
 // HealthStatus is the last check result per provider, for the console.

@@ -510,3 +510,24 @@ func TestTargetGroups(t *testing.T) {
 		t.Fatalf("after rename: %q", got)
 	}
 }
+
+func TestImportKeepsKeyIDs(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	a, b := &APIKey{Name: "a", Enabled: true}, &APIKey{Name: "b", Enabled: true}
+	mustNil(t, st.CreateKey(a))
+	mustNil(t, st.CreateKey(b))
+	mustNil(t, st.DeleteKey(a.ID)) // b keeps id 2 while it is the only key
+	st.insertLogs([]*RequestLog{{CreatedAt: time.Now().UnixMilli(), KeyID: b.ID, Cost: 3, Currency: "CNY"}})
+	e, _ := st.Export()
+	mustNil(t, st.Import(e))
+	if got := st.Snapshot().Keys[b.Key]; got == nil || got.ID != b.ID {
+		t.Fatalf("key id changed on import: %+v", got)
+	}
+	if spend, _ := st.KeySpend(MonthStart(time.Now())); spend[b.ID] != 3 {
+		t.Fatalf("spend lost: %v", spend)
+	}
+}

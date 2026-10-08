@@ -257,7 +257,7 @@ func (g *Gateway) handle(w http.ResponseWriter, r *http.Request, inbound string)
 		g.reject(w, r, inbound, body, key, rej)
 		return
 	}
-	g.Limiter.Record(key, g.route(w, r, inbound, body, key))
+	g.route(w, r, inbound, body, key)
 }
 
 // reject answers a request refused by the key's limits and logs it.
@@ -287,6 +287,10 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 	}
 	defer func() {
 		entry.LatencyMs = time.Since(start).Milliseconds()
+		// count usage before queueing the log: a concurrent budget reload
+		// replaces the cached spend with the logged total, so a request is
+		// never counted twice (at worst missed until the next reload)
+		g.Limiter.Record(key, entry)
 		g.store.AddLog(entry)
 	}()
 
@@ -411,13 +415,16 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		for k, i := range full {
 			waiting[k] = cands[i]
 		}
-		if k := g.slots.acquireAny(r.Context(), waiting, time.Duration(st.QueueTimeoutSeconds)*time.Second); k >= 0 {
+		k := g.slots.acquireAny(r.Context(), waiting, time.Duration(st.QueueTimeoutSeconds)*time.Second)
+		if k >= 0 {
 			if attempt(full[k], waiting[k]) {
 				return
 			}
 		} else if r.Context().Err() != nil {
 			entry.HTTPStatus, entry.Error = 499, "client disconnected while queued"
 			return
+		} else {
+			tried = false // the request ends waiting for capacity
 		}
 	}
 	if !tried {

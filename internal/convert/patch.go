@@ -41,11 +41,14 @@ func mergeObjects(dst, src map[string]json.RawMessage) error {
 			delete(dst, k)
 			continue
 		}
-		if isJSONObject(v) && isJSONObject(dst[k]) {
-			var d, s map[string]json.RawMessage
-			if err := json.Unmarshal(dst[k], &d); err != nil {
-				return err
+		if isJSONObject(v) {
+			d := map[string]json.RawMessage{}
+			if isJSONObject(dst[k]) {
+				if err := json.Unmarshal(dst[k], &d); err != nil {
+					return err
+				}
 			}
+			var s map[string]json.RawMessage
 			if err := json.Unmarshal(v, &s); err != nil {
 				return err
 			}

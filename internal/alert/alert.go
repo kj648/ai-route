@@ -92,11 +92,16 @@ func (n *Notifier) LongCooldown() time.Duration {
 	return time.Duration(n.config().LongCooldownMinutes) * time.Minute
 }
 
+// opposite pairs state-change events: sending one re-arms the other, so a
+// flapping provider always reports its latest state.
+var opposite = map[string]string{EventHealthDown: EventHealthRecovered, EventHealthRecovered: EventHealthDown}
+
 // Notify sends the alert to every enabled webhook in the background, unless
-// the same event/subject was sent within the silence window.
-func (n *Notifier) Notify(a Alert) {
+// the same event/subject was sent within the silence window. It reports
+// whether the alert was sent.
+func (n *Notifier) Notify(a Alert) bool {
 	if !n.Enabled(a.Event) {
-		return
+		return false
 	}
 	c := n.config()
 	key := a.Event + "|" + a.Subject
@@ -104,9 +109,12 @@ func (n *Notifier) Notify(a Alert) {
 	n.mu.Lock()
 	if last, ok := n.last[key]; ok && now.Sub(last) < time.Duration(c.SilenceMinutes)*time.Minute {
 		n.mu.Unlock()
-		return
+		return false
 	}
 	n.last[key] = now
+	if o, ok := opposite[a.Event]; ok {
+		delete(n.last, o+"|"+a.Subject)
+	}
 	n.mu.Unlock()
 	for _, h := range c.Webhooks {
 		if !h.Enabled {
@@ -122,6 +130,7 @@ func (n *Notifier) Notify(a Alert) {
 			}
 		}(h)
 	}
+	return true
 }
 
 // Wait blocks until alerts sent so far have been delivered (tests, shutdown).

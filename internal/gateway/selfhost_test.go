@@ -184,3 +184,85 @@ func TestHealthURLDefaults(t *testing.T) {
 		}
 	}
 }
+
+// Review regressions.
+
+func TestHealthDownClearedWhenChecksTurnedOff(t *testing.T) {
+	h := newHarness(t)
+	hc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "down", 503) }))
+	t.Cleanup(hc.Close)
+	h.setProvider("oa", func(p *store.Provider) { p.HealthCheckSeconds = 10; p.HealthCheckURL = hc.URL })
+	h.model("coder", "oa/ok", "an/ok")
+	now := time.Now()
+	h.gw.Health.now = func() time.Time { return now }
+	for i := 0; i < 2; i++ {
+		h.gw.Health.CheckDue(context.Background())
+		now = now.Add(10 * time.Second)
+	}
+	if resp, _ := h.post("/v1/chat/completions", oaReq("coder", false)); resp.Header.Get("X-Route-Target") != "an/ok" {
+		t.Fatal("setup: oa should be down")
+	}
+	h.setProvider("oa", func(p *store.Provider) { p.HealthCheckSeconds = 0 })
+	h.gw.Health.CheckDue(context.Background())
+	if resp, _ := h.post("/v1/chat/completions", oaReq("coder", false)); resp.Header.Get("X-Route-Target") != "oa/ok" {
+		t.Fatal("turning health checks off must bring the provider back")
+	}
+}
+
+func TestHealthFlapReportsLatestState(t *testing.T) {
+	h := newHarness(t)
+	sink := h.alertSink(nil)
+	var healthy atomic.Bool
+	hc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !healthy.Load() {
+			http.Error(w, "down", 503)
+		}
+	}))
+	t.Cleanup(hc.Close)
+	h.setProvider("oa", func(p *store.Provider) { p.HealthCheckSeconds = 10; p.HealthCheckURL = hc.URL })
+	now := time.Now()
+	h.gw.Health.now = func() time.Time { return now }
+	check := func() { h.gw.Health.CheckDue(context.Background()); now = now.Add(10 * time.Second) }
+	check()
+	check() // down
+	healthy.Store(true)
+	check() // recovered
+	healthy.Store(false)
+	check()
+	check() // down again, within the silence window
+	var events []string
+	for _, a := range sink.get(h) {
+		events = append(events, a["event"].(string))
+	}
+	if strings.Join(events, ",") != "health_down,health_recovered,health_down" {
+		t.Fatalf("events: %v", events)
+	}
+}
+
+func TestQueueTimeoutAfterOtherFailuresIs429(t *testing.T) {
+	h := newHarness(t)
+	h.setProvider("oa", func(p *store.Provider) { p.MaxConcurrency = 1 })
+	st := h.st.GetSettings()
+	st.QueueTimeoutSeconds = 1
+	mustNil(t, h.st.UpdateSettings(st))
+	h.model("coder", "oa/slowfirst", "an/fail400")
+	var codes [2]int
+	var retry string
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, _ := h.post("/v1/chat/completions", oaReq("coder", true))
+			codes[i] = resp.StatusCode
+			if i == 1 {
+				retry = resp.Header.Get("Retry-After")
+			}
+		}(i)
+		time.Sleep(50 * time.Millisecond)
+	}
+	wg.Wait()
+	if codes[0] != 200 || codes[1] != 429 || retry != "1" {
+		t.Fatalf("codes %v, Retry-After %q", codes, retry)
+	}
+}
