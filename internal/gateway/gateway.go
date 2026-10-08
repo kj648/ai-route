@@ -80,6 +80,12 @@ func (g *Gateway) Register(mux *http.ServeMux) {
 		g.handle(w, r, convert.ProtoAnthropic)
 	})
 	mux.HandleFunc("POST /v1/messages/count_tokens", g.countTokens)
+	mux.HandleFunc("POST /v1/responses", func(w http.ResponseWriter, r *http.Request) {
+		g.handle(w, r, convert.ProtoResponses)
+	})
+	mux.HandleFunc("POST /responses", func(w http.ResponseWriter, r *http.Request) {
+		g.handle(w, r, convert.ProtoResponses)
+	})
 	mux.HandleFunc("POST /v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
 		g.handle(w, r, convert.ProtoEmbeddings)
 	})
@@ -197,6 +203,16 @@ func chooseProtocol(p *store.Provider, model, inbound string) string {
 	}
 	if f := p.ForcedProtocol(model); f != "" {
 		return f
+	}
+	if inbound == convert.ProtoResponses {
+		// only some OpenAI-compatible vendors serve /responses
+		if p.ResponsesAPI {
+			return convert.ProtoResponses
+		}
+		if p.OpenAIBaseURL != "" {
+			return convert.ProtoOpenAI
+		}
+		return convert.ProtoAnthropic
 	}
 	if inbound == convert.ProtoOpenAI && p.OpenAIBaseURL != "" || inbound == convert.ProtoAnthropic && p.AnthropicBaseURL != "" {
 		return inbound
@@ -325,7 +341,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		return
 	}
 	affinity := ""
-	if conv := convert.ConversationKey(body); conv != "" {
+	if conv := convert.ConversationKey(body, inbound); conv != "" {
 		affinity = strconv.FormatInt(key.ID, 10) + "\x00" + conv
 	}
 	meta := &requestMeta{RequestID: entry.RequestID, Conversation: conversationID(affinity), Key: key, Header: r.Header}
@@ -509,6 +525,13 @@ func openaiURL(base string) string {
 	return base + "/chat/completions"
 }
 
+func responsesURL(base string) string {
+	if strings.HasSuffix(base, "/responses") {
+		return base
+	}
+	return strings.TrimSuffix(base, "/chat/completions") + "/responses"
+}
+
 func rerankURL(base string) string {
 	if strings.HasSuffix(base, "/rerank") {
 		return base
@@ -588,18 +611,7 @@ func isOfficialAnthropic(base string) bool {
 // buildUpstream converts the client body for the candidate and creates the request.
 // It also returns the resolved values of the provider's dynamic headers.
 func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound string, body []byte, st store.Settings, path string) (*http.Request, bool, map[string]string, error) {
-	var upBody []byte
-	var err error
-	clientUsage := false
-	switch {
-	case c.proto == inbound:
-		upBody, clientUsage, err = convert.RewriteModel(body, c.model, c.proto)
-	case inbound == convert.ProtoOpenAI:
-		upBody, err = convert.OpenAIToAnthropicRequest(body, c.model, st.DefaultMaxTokens, isOfficialAnthropic(c.provider.AnthropicBaseURL))
-		clientUsage = convert.ClientWantsUsage(body)
-	default:
-		upBody, err = convert.AnthropicToOpenAIRequest(body, c.model)
-	}
+	upBody, clientUsage, err := convert.ConvertRequest(inbound, c.proto, body, c.model, st.DefaultMaxTokens, isOfficialAnthropic(c.provider.AnthropicBaseURL))
 	if err == nil && len(c.provider.BodyRules) > 0 {
 		upBody, err = applyBodyRules(upBody, c)
 	}
@@ -612,6 +624,8 @@ func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound st
 		url = embeddingsURL(c.provider.OpenAIBaseURL)
 	case convert.ProtoRerank:
 		url = rerankURL(c.provider.OpenAIBaseURL)
+	case convert.ProtoResponses:
+		url = responsesURL(c.provider.OpenAIBaseURL)
 	case convert.ProtoOpenAI:
 		url = openaiURL(c.provider.OpenAIBaseURL)
 	default:
@@ -798,14 +812,7 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 			return fail(502, failSoft, err.Error())
 		}
 		var out []byte
-		switch {
-		case c.proto == inbound:
-			out, res.usage = b, convert.ExtractUsage(b, c.proto)
-		case inbound == convert.ProtoOpenAI:
-			out, res.usage, err = convert.AnthropicToOpenAIResponse(b, publicModel)
-		default:
-			out, res.usage, err = convert.OpenAIToAnthropicResponse(b, publicModel)
-		}
+		out, res.usage, err = convert.ConvertResponse(inbound, c.proto, b, publicModel, body)
 		if err != nil {
 			return fail(502, failSoft, "convert response: "+err.Error())
 		}
@@ -838,17 +845,7 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 		return fail(502, failSoft, "stream error: "+msg)
 	}
 
-	var conv convert.StreamConverter
-	switch {
-	case c.proto == inbound && inbound == convert.ProtoOpenAI:
-		conv = convert.NewOpenAIPassthrough(clientUsage)
-	case c.proto == inbound:
-		conv = convert.NewAnthropicPassthrough()
-	case inbound == convert.ProtoOpenAI:
-		conv = convert.NewAnthropicToOpenAIStream(publicModel, clientUsage)
-	default:
-		conv = convert.NewOpenAIToAnthropicStream(publicModel)
-	}
+	conv := convert.NewStreamConverter(inbound, c.proto, publicModel, clientUsage, body)
 
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -910,6 +907,9 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 }
 
 func streamErrorEvents(proto, msg string) []convert.SSEEvent {
+	if proto == convert.ProtoResponses {
+		return convert.ResponsesErrorEvents(msg)
+	}
 	if proto == convert.ProtoAnthropic {
 		b, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": msg}})
 		return []convert.SSEEvent{{Event: "error", Data: string(b)}}

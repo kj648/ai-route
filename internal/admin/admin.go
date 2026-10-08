@@ -216,7 +216,7 @@ func (a *Admin) testProvider(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errors.New("model is required"))
 		return
 	}
-	if req.Protocol == "openai" && p.OpenAIBaseURL == "" || req.Protocol == "anthropic" && p.AnthropicBaseURL == "" {
+	if (req.Protocol == "openai" || req.Protocol == "responses") && p.OpenAIBaseURL == "" || req.Protocol == "anthropic" && p.AnthropicBaseURL == "" {
 		writeErr(w, 400, errors.New("this provider has no "+req.Protocol+" base URL"))
 		return
 	}

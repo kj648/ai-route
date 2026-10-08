@@ -150,7 +150,11 @@ func (g *Gateway) TestTarget(ctx context.Context, p *store.Provider, model, prot
 	r.Header.Set("User-Agent", "ai-route-admin-test")
 	rec := httptest.NewRecorder()
 	start := time.Now()
-	tr := g.try(ctx, rec, r, c, proto, body, stream, model, g.store.GetSettings())
+	inbound := proto
+	if proto == convert.ProtoResponses {
+		inbound = convert.ProtoOpenAI // a chat request, converted on the way
+	}
+	tr := g.try(ctx, rec, r, c, inbound, body, stream, model, g.store.GetSettings())
 	res := TestResult{
 		LatencyMs: time.Since(start).Milliseconds(),
 		Target:    c.target,
@@ -161,7 +165,7 @@ func (g *Gateway) TestTarget(ctx context.Context, p *store.Provider, model, prot
 		res.HTTPStatus = rec.Code
 		res.OK = tr.streamErr == ""
 		res.Raw = truncate(rec.Body.String(), 4000)
-		res.Reply = extractReply(proto, stream, rec.Body.String())
+		res.Reply = extractReply(inbound, stream, rec.Body.String())
 	} else {
 		res.HTTPStatus = tr.attempt.HTTPStatus
 		res.Raw = tr.attempt.Error

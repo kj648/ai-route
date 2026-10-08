@@ -618,13 +618,14 @@ function providerForm(p, models, providers) {
             <div class="field"><label>备注</label><input type="text" id="pf-remark" value="${esc(p.remark)}"></div>
           </div>
           <div class="row2">
-            <div class="field"><label>模型协议规则</label><textarea id="pf-protos" placeholder="minimax-* = anthropic&#10;glm-* = openai">${esc(toLines(p.model_protocols, ' ='))}</textarea><div class="help">每行 <code>模型(可用*) = openai|anthropic</code>，某些模型只在一种端点提供时使用</div></div>
+            <div class="field"><label>模型协议规则</label><textarea id="pf-protos" placeholder="minimax-* = anthropic&#10;glm-* = openai&#10;gpt-* = responses">${esc(toLines(p.model_protocols, ' ='))}</textarea><div class="help">每行 <code>模型(可用*) = openai|anthropic|responses</code>，某些模型只在一种端点提供时使用（<code>responses</code> 指 OpenAI 地址下的 /responses）</div></div>
             <div class="field"><label>自定义请求头</label><textarea id="pf-headers" placeholder="X-Custom: value&#10;x-opencode-session: {{header.x-opencode-session ?? $conversation}}">${esc(toLines(p.headers, ':'))}</textarea>
               <div class="help">每行 <code>Header: 值</code>，覆盖调用方的同名头；值留空表示删除该头。值里可以写：
                 <code>{{header.X-Foo}}</code> 取调用方的头，<b>必传</b>（首选上游缺了直接报 400，候补上缺了就不发）；
                 <code>{{header.X-Foo?}}</code> 可选；<code>{{header.X-Foo ?? $conversation}}</code> 没传就用平台生成的；
                 内置变量 <code>$conversation</code>（同一会话稳定的 ses_…）、<code>$uuid</code>（每次请求新的）、<code>$requestId</code>、<code>$timestamp</code>、<code>$keyName</code>、<code>$keyId</code>、<code>$model</code></div></div>
           </div>
+          <label class="check"><input type="checkbox" id="pf-responses" ${p.responses_api ? 'checked' : ''}> OpenAI 地址也支持 Responses API（/responses） <span class="muted small">（勾选后，Codex 等 Responses 客户端的请求原样转发；不勾选就转换成 Chat Completions 发送。多数 OpenAI 兼容厂商不支持，别乱勾）</span></label>
           <label class="check"><input type="checkbox" id="pf-pass-headers" ${p.drop_client_headers ? '' : 'checked'}> 透传调用方的请求头 <span class="muted small">（不会转发 Authorization、x-api-key、Cookie、Accept-Encoding、X-Forwarded-*、Origin 等凭证、逐跳和隐私相关的头）</span></label>
           <div class="field"><label>自建模型（vLLM、SGLang、Ollama 等）</label>
             <div class="row3">
@@ -699,6 +700,7 @@ function providerForm(p, models, providers) {
         $('#pf-openai', m).value = ps.openai || '';
         $('#pf-anthropic', m).value = ps.anthropic || '';
         $('#pf-protos', m).value = toLines(ps.protocols || {}, ' =');
+        $('#pf-responses', m).checked = !!ps.responses;
         $('#pf-headers', m).value = toLines(ps.headers || {}, ':');
         if (isNew) $('#pf-currency', m).value = ps.currency || 'CNY';
         $('#pf-rules', m).value = toRuleLines(ps.rules || []);
@@ -753,6 +755,7 @@ function providerForm(p, models, providers) {
         api_key: $('#pf-key', m).value.trim(),
         headers: parseLines($('#pf-headers', m).value, ':'),
         drop_client_headers: !$('#pf-pass-headers', m).checked,
+        responses_api: $('#pf-responses', m).checked,
         ua_mode: state.ua,
         user_agent: $('#pf-ua-value', m).value.trim(),
       });
@@ -853,7 +856,7 @@ function providerTest(p) {
     body: `<div class="form">
       <div class="row2">
         <div class="field"><label>模型</label><input type="text" id="pt-model" list="pt-models" value="${esc(p.models[0] || '')}"><datalist id="pt-models">${p.models.map((x) => `<option value="${esc(x)}">`).join('')}</datalist></div>
-        <div class="field"><label>协议</label><select id="pt-proto"><option value="">自动</option>${p.openai_base_url ? '<option value="openai">OpenAI</option>' : ''}${p.anthropic_base_url ? '<option value="anthropic">Anthropic</option>' : ''}</select></div>
+        <div class="field"><label>协议</label><select id="pt-proto"><option value="">自动</option>${p.openai_base_url ? '<option value="openai">OpenAI Chat</option><option value="responses">OpenAI Responses</option>' : ''}${p.anthropic_base_url ? '<option value="anthropic">Anthropic</option>' : ''}</select></div>
       </div>
       <label class="check"><input type="checkbox" id="pt-stream"> 流式</label>
       <div class="muted small">直连该套餐发一句简短的测试消息，不重试、不经过熔断，也不记日志。</div>
@@ -1388,7 +1391,7 @@ async function pageSettings() {
       <div class="card-head">客户端接入</div>
       <div class="card-body form">
         <div class="kv">
-          <div class="k">OpenAI 兼容</div><div><code class="copy" data-copy="${esc(origin)}/v1">${esc(origin)}/v1</code> <span class="muted small">（POST /v1/chat/completions、POST /v1/embeddings、POST /v1/rerank、GET /v1/models）</span></div>
+          <div class="k">OpenAI 兼容</div><div><code class="copy" data-copy="${esc(origin)}/v1">${esc(origin)}/v1</code> <span class="muted small">（POST /v1/chat/completions、POST /v1/responses、POST /v1/embeddings、POST /v1/rerank、GET /v1/models）</span></div>
           <div class="k">Anthropic 兼容</div><div><code class="copy" data-copy="${esc(origin)}">${esc(origin)}</code> <span class="muted small">（POST /v1/messages，即 ANTHROPIC_BASE_URL）</span></div>
           <div class="k">鉴权</div><div><code>Authorization: Bearer sk-route-…</code> 或 <code>x-api-key: sk-route-…</code></div>
         </div>
@@ -1529,7 +1532,7 @@ const HDR_RESPONSE = [
 ];
 // [vendor, requirement, how this gateway handles it, source]
 const HDR_VENDORS = [
-  ['OpenCode Go', '每个会话带一个稳定的 x-opencode-session（官方说明用于路由和提示词缓存，没有规定格式）；客户端用自己的 User-Agent，不要用 SDK 或 HTTP 库的默认值。对 Claude Code 等客户端也能识别它们自带的会话头', '预设：x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? $conversation}}，UA 透传客户端。走 /v1/responses 的模型（Grok、GPT Luna 等）暂不支持', 'https://opencode.ai/docs/go/'],
+  ['OpenCode Go', '每个会话带一个稳定的 x-opencode-session（官方说明用于路由和提示词缓存，没有规定格式）；客户端用自己的 User-Agent，不要用 SDK 或 HTTP 库的默认值。对 Claude Code、Codex 等客户端也能识别它们自带的会话头。GPT Luna、Grok、Muse Spark 只走 /responses', '预设：x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}，UA 透传客户端；协议规则已预填（gpt-*、grok-*、muse-* = responses）', 'https://opencode.ai/docs/go/'],
   ['Kimi Code', '会员条款：篡改客户端标识（User-Agent）视为违规，可能暂停会员权益。接口只接受 Kimi CLI、Claude Code、Roo Code、Kilo Code 等编码工具，其他客户端会收到 403', '预设 UA 透传客户端，不要改成固定 UA 或平台标识', 'https://www.kimi.com/help/kimi-code/membership-guide'],
   ['Claude Code（作为调用方）', '发给网关的请求带 x-claude-code-session-id（当前会话的唯一 ID，v2.1.86 起），以及 anthropic-version、anthropic-beta', '默认透传；OpenCode Go 预设用它作为会话 ID，比按消息计算的 $conversation 更准（压缩上下文后也不变）', 'https://code.claude.com/docs/en/llm-gateway-protocol'],
   ['Anthropic 及兼容端点', 'anthropic-version 必填（目前是 2023-06-01）；beta 功能用 anthropic-beta，多个用逗号分隔', '调用方带了就透传，没带补 2023-06-01；鉴权同时发 x-api-key 和 Authorization: Bearer', 'https://platform.claude.com/docs/en/api/versioning'],
@@ -1584,6 +1587,7 @@ function headerDocsHTML() {
 // ---------------------------------------------------------------- client setup wizard
 const CLIENTS = [
   { id: 'claude-code', label: 'Claude Code', small: true },
+  { id: 'codex', label: 'Codex CLI' },
   { id: 'opencode', label: 'OpenCode' },
   { id: 'cline', label: 'Cline / Roo Code / Kilo Code' },
   { id: 'cherry', label: 'Cherry Studio' },
@@ -1598,6 +1602,10 @@ function clientSnippets(client, o, key, model, small) {
     case 'claude-code': return [
       { title: '终端里临时使用（bash / zsh）', lang: 'bash', text: `export ANTHROPIC_BASE_URL=${o}\nexport ANTHROPIC_AUTH_TOKEN=${key}\nexport ANTHROPIC_MODEL=${model}\nexport ANTHROPIC_DEFAULT_HAIKU_MODEL=${small}\nclaude` },
       { title: '长期使用：写进 ~/.claude/settings.json', lang: 'json', text: JSON.stringify({ env: { ANTHROPIC_BASE_URL: o, ANTHROPIC_AUTH_TOKEN: key, ANTHROPIC_MODEL: model, ANTHROPIC_DEFAULT_HAIKU_MODEL: small } }, null, 2) },
+    ];
+    case 'codex': return [
+      { title: '写进 ~/.codex/config.toml（Codex 只支持 Responses API，网关会按上游自动转换）', lang: 'toml', text: `model = "${model}"\nmodel_provider = "ai-route"\n\n[model_providers.ai-route]\nname = "AI Route"\nbase_url = "${v1}"\nenv_key = "AI_ROUTE_API_KEY"\nwire_api = "responses"` },
+      { title: '然后在终端里设置 Key 并启动', lang: 'bash', text: `export AI_ROUTE_API_KEY=${key}\ncodex` },
     ];
     case 'opencode': return [
       { title: '写进项目根目录的 opencode.json（或 ~/.config/opencode/opencode.json），然后在 /models 里选 ai-route/' + model, lang: 'json', text: JSON.stringify({

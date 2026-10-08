@@ -102,6 +102,10 @@ func (m *mockUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"insufficient balance"}}`, 402)
 		return
 	}
+	if strings.HasSuffix(r.URL.Path, "/responses") {
+		serveResponses(w, req.Model, req.Stream)
+		return
+	}
 	if strings.HasSuffix(r.URL.Path, "/rerank") {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -911,4 +915,61 @@ func TestBodyRulesAppliedUpstream(t *testing.T) {
 	if _, ok := up["enable_thinking"]; ok || up["extra"] == nil || up["messages"] == nil {
 		t.Fatalf("stream upstream body: %v", up)
 	}
+}
+
+// serveResponses mimics the OpenAI Responses API (event order and fields as
+// in the openai-python types / OpenAPI spec).
+func serveResponses(w http.ResponseWriter, model string, stream bool) {
+	usage := map[string]any{"input_tokens": 12, "input_tokens_details": map[string]any{"cached_tokens": 2},
+		"output_tokens": 6, "output_tokens_details": map[string]any{"reasoning_tokens": 1}, "total_tokens": 18}
+	reasoning := map[string]any{"type": "reasoning", "id": "rs_1", "summary": []map[string]any{{"type": "summary_text", "text": "hmm"}}}
+	message := map[string]any{"type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+		"content": []map[string]any{{"type": "output_text", "text": "hello from " + model, "annotations": []any{}}}}
+	call := map[string]any{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather", "arguments": `{"city":"bj"}`, "status": "completed"}
+	output := []map[string]any{reasoning, message}
+	if model == "tool" {
+		output = []map[string]any{call}
+	}
+	resp := func(status string, out []map[string]any) map[string]any {
+		return map[string]any{"id": "resp_1", "object": "response", "created_at": 1, "status": status, "model": model,
+			"output": out, "usage": usage, "error": nil, "incomplete_details": nil}
+	}
+	if !stream {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp("completed", output))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+	seq := 0
+	send := func(typ string, fields map[string]any) {
+		fields["type"], fields["sequence_number"] = typ, seq
+		seq++
+		b, _ := json.Marshal(fields)
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", typ, b)
+		w.(http.Flusher).Flush()
+	}
+	if model == "rsfail" {
+		send("response.failed", map[string]any{"response": map[string]any{"id": "resp_1", "status": "failed", "error": map[string]any{"code": "server_error", "message": "boom"}}})
+		return
+	}
+	send("response.created", map[string]any{"response": resp("in_progress", []map[string]any{})})
+	if model == "tool" {
+		send("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather", "arguments": "", "status": "in_progress"}})
+		send("response.function_call_arguments.delta", map[string]any{"item_id": "fc_1", "output_index": 0, "delta": `{"city":`})
+		send("response.function_call_arguments.delta", map[string]any{"item_id": "fc_1", "output_index": 0, "delta": `"bj"}`})
+		send("response.function_call_arguments.done", map[string]any{"item_id": "fc_1", "output_index": 0, "arguments": `{"city":"bj"}`})
+		send("response.output_item.done", map[string]any{"output_index": 0, "item": call})
+	} else {
+		send("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_1", "summary": []any{}}})
+		send("response.reasoning_summary_text.delta", map[string]any{"item_id": "rs_1", "output_index": 0, "summary_index": 0, "delta": "hmm"})
+		send("response.output_item.done", map[string]any{"output_index": 0, "item": reasoning})
+		send("response.output_item.added", map[string]any{"output_index": 1, "item": map[string]any{"type": "message", "id": "msg_1", "status": "in_progress", "role": "assistant", "content": []any{}}})
+		send("response.content_part.added", map[string]any{"item_id": "msg_1", "output_index": 1, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
+		send("response.output_text.delta", map[string]any{"item_id": "msg_1", "output_index": 1, "content_index": 0, "delta": "hello ", "logprobs": []any{}})
+		send("response.output_text.delta", map[string]any{"item_id": "msg_1", "output_index": 1, "content_index": 0, "delta": "from " + model, "logprobs": []any{}})
+		send("response.output_text.done", map[string]any{"item_id": "msg_1", "output_index": 1, "content_index": 0, "text": "hello from " + model})
+		send("response.output_item.done", map[string]any{"output_index": 1, "item": message})
+	}
+	send("response.completed", map[string]any{"response": resp("completed", output)})
 }

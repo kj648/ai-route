@@ -10,7 +10,8 @@
 //   openai     OpenAI-compatible base URL incl. version segment ('' = none)
 //   anthropic  Anthropic-compatible base URL, i.e. ANTHROPIC_BASE_URL ('' = none)
 //   models     common model ids (pre-filled; the upstream list is fetched too)
-//   protocols  per-model protocol overrides (glob -> openai|anthropic)
+//   protocols  per-model protocol overrides (glob -> openai|anthropic|responses)
+//   responses  the OpenAI base URL also serves /responses (Responses API)
 //   rules      request body rules ({model, when?, protocol?, set}) merged upstream
 //   headers    extra request headers the vendor asks for
 //   ua         { mode: 'passthrough'|'override', value, note }
@@ -121,12 +122,13 @@ const PRESETS = [
     models: ['glm-5.3', 'kimi-k3', 'deepseek-v4-pro', 'deepseek-v4-flash', 'minimax-m3', 'qwen3.8-max'],
     protocols: {
       'glm-*': 'openai', 'kimi-*': 'openai', 'deepseek-*': 'openai', 'mimo-*': 'openai', 'longcat-*': 'openai', 'hy3': 'openai',
-      'minimax-*': 'anthropic', 'qwen*': 'anthropic',
+      'minimax-*': 'anthropic', 'qwen*': 'anthropic', 'claude-*': 'anthropic',
+      'gpt-*': 'responses', 'grok-*': 'responses', 'muse-*': 'responses',
     },
     // the caller's own session id, else Claude Code's, else a stable id per conversation
-    headers: { 'x-opencode-session': '{{header.x-opencode-session ?? header.x-claude-code-session-id ?? $conversation}}' },
+    headers: { 'x-opencode-session': '{{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}' },
     docs: 'https://opencode.ai/docs/go/', keyUrl: 'https://opencode.ai/go',
-    note: '月订阅。MiniMax / Qwen 只走 /messages，GLM / Kimi / DeepSeek / MiMo 走 chat，已预填“模型协议规则”；官方要求每个会话带稳定的 x-opencode-session 头：已预填为调用方传了就透传，否则用 Claude Code 的会话 ID（x-claude-code-session-id），再没有由网关按会话生成。走 /v1/responses 的模型（Grok、GPT Luna 等）网关暂不支持。',
+    note: '月订阅。MiniMax / Qwen 只走 /messages，GLM / Kimi / DeepSeek / MiMo 走 chat，已预填“模型协议规则”；官方要求每个会话带稳定的 x-opencode-session 头：已预填为调用方传了就透传，否则用 Claude Code 的会话 ID（x-claude-code-session-id），或 Codex 的会话 ID（session-id），再没有由网关按会话生成。GPT Luna、Grok、Muse Spark 走 /responses，Claude Haiku 走 /messages，已预填协议规则。',
     ua: { mode: 'passthrough', note: '官方要求客户端用自己的 UA（如 my-agent/1.0），不要用 SDK / HTTP 库的默认 UA。透传客户端即可；客户端没带 UA 时使用平台标识 ai-route/版本号。' },
   },
   {
@@ -245,10 +247,10 @@ const PRESETS = [
   },
   {
     id: 'openai', currency: 'USD', name: 'OpenAI', category: 'official', prefix: 'openai', keywords: 'gpt',
-    openai: 'https://api.openai.com/v1', anthropic: '',
+    openai: 'https://api.openai.com/v1', anthropic: '', responses: true,
     models: ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-5.6-sol'],
     docs: 'https://developers.openai.com/api/docs/models', keyUrl: 'https://platform.openai.com/api-keys',
-    note: '按量计费，走 Chat Completions 接口。',
+    note: '按量计费。Chat Completions 和 Responses API 都支持：Codex 等 Responses 客户端的请求原样转发。',
   },
   {
     id: 'anthropic', currency: 'USD', name: 'Anthropic', category: 'official', prefix: 'anthropic', keywords: 'claude',

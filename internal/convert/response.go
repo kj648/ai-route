@@ -19,6 +19,13 @@ func ExtractUsage(body []byte, proto string) Usage {
 	if proto == ProtoRerank {
 		return rerankUsage(body)
 	}
+	if proto == ProtoResponses {
+		var r struct {
+			Usage *rsUsage `json:"usage"`
+		}
+		_ = json.Unmarshal(body, &r)
+		return r.Usage.toUsage()
+	}
 	if proto == ProtoAnthropic {
 		var r struct {
 			Usage ANUsage `json:"usage"`
@@ -81,6 +88,15 @@ func ValidateResponse(body []byte, proto string) error {
 		}
 		if _, ok := probe["content"]; !ok {
 			return fmt.Errorf("response has no content: %s", truncate(string(body), 300))
+		}
+		return nil
+	}
+	if proto == ProtoResponses {
+		if _, ok := probe["output"]; !ok {
+			return fmt.Errorf("response has no output: %s", truncate(string(body), 300))
+		}
+		if string(probe["status"]) == `"failed"` {
+			return fmt.Errorf("upstream response failed: %s", truncate(string(body), 500))
 		}
 		return nil
 	}

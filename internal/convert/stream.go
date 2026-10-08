@@ -101,6 +101,9 @@ func StreamErrorMessage(ev SSEEvent, proto string) (string, bool) {
 	if proto == ProtoAnthropic && (ev.Event == "error" || probe.Type == "error") {
 		return truncate(ev.Data, 500), true
 	}
+	if proto == ProtoResponses {
+		return isResponsesErrorEvent(ev)
+	}
 	if !isNullOrEmpty(probe.Error) {
 		return truncate(string(probe.Error), 500), true
 	}

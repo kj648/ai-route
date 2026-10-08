@@ -2,7 +2,7 @@
 
 把多个大模型套餐（Kimi Code、GLM Coding Plan、OpenCode Go、百炼 Coding Plan、火山方舟 Coding Plan 等）聚合成**一个**对外入口。客户端只需要知道平台地址、平台发的 Key 和平台定义的模型名。上游套餐的地址、Key、模型映射和候补顺序都在 Web 后台里配置，改完立即生效。
 
-- **两种协议都支持**：对外同时提供 OpenAI 兼容的 `/v1/chat/completions` 和 Anthropic 兼容的 `/v1/messages`（Claude Code 可以直接用）。上游有同协议端点就直通，没有就自动转换协议，流式和非流式都支持，包括工具调用和思考内容。
+- **三种协议都支持**：对外同时提供 OpenAI 的 `/v1/chat/completions` 和 `/v1/responses`（Codex CLI 可以直接用），以及 Anthropic 兼容的 `/v1/messages`（Claude Code 可以直接用）。上游有同协议端点就直通，没有就自动转换协议，流式和非流式都支持，包括工具调用和思考内容。
 - **供应商**：内置 40 个预设，覆盖编码套餐、各家官方按量 API、聚合平台，选中后自动填好地址、协议、常用模型和需要的请求头，也支持自定义；每个供应商可以单独设置 User-Agent 策略。填写 Key 后模型列表会自动从上游拉取，也可以手动增删。每个套餐有一个前缀，它的模型统一显示为 `前缀/模型名`，用来区分不同套餐。
 - **模型映射 + 调度顺序**：给模型起一个对外名字（如 `dess`），从全部 `前缀/模型名` 里点选要映射的模型并排好顺序，例如 `kimi/k3 → bailian/kimi-k3 → opencode/deepseek`。前一个不可用时自动切到下一个。同一优先级可以放多个上游（比如同一家的多个 Key），按权重分流。
 - **先重试再切换**：遇到短暂错误（断连、5xx、上游过载、短时限流），先在同一个模型上按退避间隔重试，仍然失败才切换。这样网络抖动不会把会话切到别的套餐，避免提示词缓存失效和效果变差。
@@ -72,7 +72,8 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 
   前缀创建后固定不变。
 - 两个地址**至少填一个**。客户端用哪种协议请求，就优先走同协议地址，没有就自动转换。
-- **模型协议规则**：有些供应商的不同模型只在一种端点上提供（比如 OpenCode Go 的 MiniMax / Qwen 只走 `/messages`），可以按 `模型(支持 *) = openai|anthropic` 强制指定。相关预设已经预填好。
+- **模型协议规则**：有些供应商的不同模型只在一种端点上提供（比如 OpenCode Go 的 MiniMax / Qwen 只走 `/messages`，GPT Luna / Grok 只走 `/responses`），可以按 `模型(支持 *) = openai|anthropic|responses` 强制指定，`responses` 指 OpenAI 地址下的 `/responses`。相关预设已经预填好。
+- **Responses API**：勾选“OpenAI 地址也支持 Responses API”后，Codex 等 Responses 客户端的请求会原样转发给这个供应商；不勾选就转换成 Chat Completions 发送。OpenAI 官方预设已经勾选。多数 OpenAI 兼容厂商（Kimi、GLM、DeepSeek 等）没有 `/responses`，不要勾。
 - **请求头透传**：调用方的请求头默认原样转发给上游，但不会转发：网关自己的凭证（`Authorization`、`x-api-key`）、`Cookie`、`Accept-Encoding`、逐跳头（`Connection` 等）、暴露用户身份的头（`X-Forwarded-*`、`X-Real-IP`、`Origin`、`Referer`、`Sec-*`、`CF-*`），以及跨协议时对面协议专属的头（`anthropic-*` / `openai-*`）。个别上游对多余请求头敏感时，可以在“高级设置”里关掉“透传调用方的请求头”。
 - **自定义请求头**：每行写 `Header: 值`，会覆盖调用方的同名头，值留空表示删除该头。值可以是固定文本，也可以引用调用方的头或内置变量：
 
@@ -86,12 +87,12 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 
   内置变量：`$conversation`（`ses_` 开头，同一会话内不变：按“API Key + 第一条用户消息”计算）、`$uuid`（每个请求一个新的）、`$requestId`（网关的请求 ID，也在响应头 `X-Route-Request-Id` 和日志里）、`$timestamp`、`$keyName`、`$keyId`、`$model`（上游模型名）。变量名写错，或者引用 `header.Authorization` 这类凭证，保存时会报错。日志详情里能看到每次尝试实际发出的动态请求头。
 
-  OpenCode Go 预设已经写好 `x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? $conversation}}`：
+  OpenCode Go 预设已经写好 `x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}`：
   - 自研 Agent 传了自己的会话 ID，就原样透传；
-  - Claude Code 会自带 `x-claude-code-session-id`（[官方文档](https://code.claude.com/docs/en/llm-gateway-protocol)），就用它；
+  - Claude Code 会自带 `x-claude-code-session-id`（[官方文档](https://code.claude.com/docs/en/llm-gateway-protocol)），Codex 会自带 `session-id`，就用它们；
   - 其他客户端由网关按会话生成。
 
-  旧版本建的 OpenCode Go 供应商里，写死的 `ai-route` 会在启动时自动改成这个写法。OpenCode Go 官方[只要求](https://opencode.ai/docs/go/)每个会话带一个稳定的 ID，没有规定格式。走 `/v1/responses` 的模型（Grok、GPT Luna 等）网关暂不支持。
+  旧版本建的 OpenCode Go 供应商里，写死的 `ai-route` 会在启动时自动改成这个写法。OpenCode Go 官方[只要求](https://opencode.ai/docs/go/)每个会话带一个稳定的 ID，没有规定格式。
 
   “设置与接入 → 请求头说明”里整理了每段请求头的规则，以及已核实的厂商要求和出处。
 - 网关会透传 Anthropic 的 `anthropic-version` 和 `anthropic-beta`。
@@ -192,7 +193,7 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 
 | 协议 | Base URL | 端点 |
 |---|---|---|
-| OpenAI 兼容 | `http://服务器:8080/v1` | `POST /v1/chat/completions`、`POST /v1/embeddings`、`POST /v1/rerank`、`GET /v1/models` |
+| OpenAI 兼容 | `http://服务器:8080/v1` | `POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/embeddings`、`POST /v1/rerank`、`GET /v1/models` |
 | Anthropic 兼容 | `http://服务器:8080` | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
 
 鉴权方式：`Authorization: Bearer sk-route-…` 或 `x-api-key: sk-route-…` 都可以。
@@ -210,6 +211,21 @@ export ANTHROPIC_MODEL=coder
 export ANTHROPIC_DEFAULT_HAIKU_MODEL=fast
 claude
 ```
+
+**Codex CLI**（只支持 Responses API，网关会按上游自动转换）：在 `~/.codex/config.toml` 里写
+
+```toml
+model = "coder"
+model_provider = "ai-route"
+
+[model_providers.ai-route]
+name = "AI Route"
+base_url = "http://服务器:8080/v1"
+env_key = "AI_ROUTE_API_KEY"
+wire_api = "responses"
+```
+
+然后 `export AI_ROUTE_API_KEY=sk-route-xxxx` 再运行 `codex`。
 
 **OpenAI SDK、opencode、Cline、Cherry Studio 等**：Base URL 填 `http://服务器:8080/v1`，API Key 填 `sk-route-…`，模型填对外模型名。
 
@@ -283,6 +299,9 @@ curl http://服务器:8080/v1/chat/completions \
 | OpenAI → OpenAI、Anthropic → Anthropic | 直通，只改写 `model` 字段，其他字段原样转发 |
 | OpenAI → Anthropic | `system`/`developer` 消息 → `system`；`tool_calls`/`tool` 消息 → `tool_use`/`tool_result`；图片 → image block；`reasoning_effort` → `thinking`（见下文）；`cache_control` 原样保留（写在内容块、消息或工具上都行，写在消息上时加到该消息的最后一个块）；`response_format` 见下文；流式事件转换成 chunk，包括 `reasoning_content` |
 | Anthropic → OpenAI | `tool_use`/`tool_result` → `tool_calls`/`tool` 消息；`thinking` → `reasoning_content`；服务端工具（如 `web_search`）没有对应物，会被丢弃；流式 chunk 会还原成完整的 Anthropic 事件序列 |
+| Responses → Chat | `instructions` 和 `developer` 消息 → `system`；`function_call`/`function_call_output` → `tool_calls`/`tool` 消息；推理摘要 → 下一条助手消息的 `reasoning_content`；`max_output_tokens` → `max_tokens`；`text.format` → `response_format`。自定义（freeform）工具，比如 Codex 的 `apply_patch`，会变成只有一个字符串参数 `input` 的函数，调用结果再还原成 `custom_tool_call`。内置工具（`web_search` 等）和 `web_search_call` 这类服务端状态没有对应物，会被丢弃 |
+| Chat → Responses | 消息 → `input` 数组，`tool_calls`/`tool` → `function_call`/`function_call_output`；工具改成扁平格式，`strict: false` 保持 Chat 的语义；`store: false`，每次都带完整历史。流式 chunk 会转成完整的 Responses 事件序列（`response.created` … `response.completed`，带 `sequence_number`，没有 `[DONE]`） |
+| Responses ⇄ Anthropic | 经过 Chat 中转：Responses → Chat → Anthropic，反之亦然 |
 
 `response_format` 的处理：上游是 Anthropic 官方（`api.anthropic.com`）且为 `json_schema` + `strict: true` 时，转成原生结构化输出 `output_config.format`；其他情况（`json_object`、非 strict 的 schema、其他厂商的 Anthropic 兼容端点）在 `system` 末尾追加一段“只输出 JSON（并符合该 schema）”的要求。兼容端点不一定认识 `output_config`，贸然发送可能被 400 拒绝。
 
@@ -294,6 +313,8 @@ curl http://服务器:8080/v1/chat/completions \
 | 其他模型（更早的 Claude、各家兼容端点） | `thinking: {type: "enabled", budget_tokens}`，`low` 2048、`medium` 8192、`high` 16384 |
 
 模型按名称识别，带厂商前缀的写法（如 `anthropic/claude-sonnet-5`）也能识别。
+
+Responses API 的限制：网关不保存会话状态，所以转换到非 Responses 上游时，不支持 `previous_response_id` 和 `conversation`（返回 400，请改用 `store: false` 加完整 `input`，Codex 默认就是这样）；`reasoning.encrypted_content` 只能在同一家 Responses 上游之间往返。
 
 OpenAI 流式直通时，网关会自动向上游加上 `stream_options.include_usage` 来统计用量。如果客户端自己没有请求用量，这个仅含用量的 chunk 会被过滤掉，不会转发给客户端。
 
@@ -318,6 +339,7 @@ OpenAI 流式直通时，网关会自动向上游加上 `stream_options.include_
 | `internal/gateway/selfhost_test.go` | 自建模型：并发满时溢出到下一个候补且不计失败、排队等待空位、不排队时返回 429、首包超时只作用于流式、健康检查连续失败移出调度并告警、恢复后加回 |
 | `internal/gateway/item7_test.go` 等 | 重排序转发与用量；同级分流的权重分布、会话粘性、同级兜底；目标分组的解析、校验和前缀改名 |
 | `internal/hdrtpl`、`internal/gateway/headers_test.go` | 请求头模板的解析、校验和取值；透传与不透传清单；必传头只在首选上校验（冷却中也按配置顺序）、候补上缺了不发；会话 ID 在同一会话内稳定；平台标识 UA；旧 OpenCode Go 配置的自动迁移 |
+| `internal/convert/responses_test.go`、`internal/gateway/responses_test.go` | Responses API：Responses 客户端到 Chat / Anthropic / Responses 上游，Chat / Messages 客户端到 Responses 上游，流式事件顺序和 `sequence_number`，Codex 风格请求（自定义工具、推理回放、内置工具丢弃），`previous_response_id` 返回 400，直通时的用量与失败切换 |
 | `internal/gateway/limits_test.go` | Key 限额：RPM、TPM、月预算的拦截与错误格式，被拒请求记日志且不发上游，重启后从日志恢复本月费用，切换统计货币，滑动窗口到期恢复 |
 | `internal/gateway/logs_test.go` | 请求日志：成功请求每个字段的取值（Key、请求模型与对外模型、实际上游、协议、用量、客户端 IP、耗时）；费用（单价、通配单价、缓存价、未配单价、OpenRouter 实际费用）；四种协议组合下流式的用量；各种失败（模型不存在、模型不允许、全部上游失败、流中断）；按条件筛选、分页和统计 |
 | `internal/admin/e2e_test.go` | 端到端：通过管理 API 创建供应商（自动前缀、重名去重、自动拉取模型）、模型映射和 Key（拒绝自定义值、重新生成），调用对外 API，再通过管理 API 查日志和统计 |

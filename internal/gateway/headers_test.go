@@ -120,6 +120,11 @@ func TestGeneratedSessionHeader(t *testing.T) {
 	if l.Attempts[0].Headers["x-opencode-session"] != s3 || !strings.HasPrefix(l.RequestID, "req_") {
 		t.Fatalf("log: %+v", l)
 	}
+	// Codex's native session-id is used as well
+	h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"Session-Id": "codex-9"})
+	if got := h.mock.lastHdr["ok"].Get("x-opencode-session"); got != "codex-9" {
+		t.Fatalf("Codex session: %q", got)
+	}
 	// Claude Code's own session id beats the generated one
 	h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"X-Claude-Code-Session-Id": "cc-123"})
 	if got := h.mock.lastHdr["ok"].Get("x-opencode-session"); got != "cc-123" {

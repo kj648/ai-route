@@ -14,6 +14,8 @@ const (
 	ProtoEmbeddings = "embeddings"
 	// ProtoRerank is the Jina / Cohere style /rerank endpoint (no conversion).
 	ProtoRerank = "rerank"
+	// ProtoResponses is the OpenAI Responses API (/responses).
+	ProtoResponses = "responses"
 )
 
 // Usage is normalized token usage. Input includes cached tokens.

@@ -403,12 +403,17 @@ func TestRerankUsageFormats(t *testing.T) {
 }
 
 func TestConversationKey(t *testing.T) {
-	a := ConversationKey([]byte(`{"messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"},{"role":"assistant","content":"x"}]}`))
-	b := ConversationKey([]byte(`{"system":"other","messages":[{"role":"user","content":"hello"}]}`))
+	a := ConversationKey([]byte(`{"messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"},{"role":"assistant","content":"x"}]}`), ProtoOpenAI)
+	b := ConversationKey([]byte(`{"system":"other","messages":[{"role":"user","content":"hello"}]}`), ProtoAnthropic)
 	if a != `"hello"` || a != b {
 		t.Fatalf("%q %q", a, b)
 	}
-	if ConversationKey([]byte(`{"input":"x"}`)) != "" {
+	if ConversationKey([]byte(`{"input":"x"}`), ProtoEmbeddings) != "" {
 		t.Fatal("no user message should give no key")
+	}
+	r1 := ConversationKey([]byte(`{"input":[{"role":"developer","content":"d"},{"type":"message","role":"user","content":"hello"}]}`), ProtoResponses)
+	r2 := ConversationKey([]byte(`{"input":"hello"}`), ProtoResponses)
+	if r1 != `"hello"` || r2 != `"hello"` {
+		t.Fatalf("responses: %q %q", r1, r2)
 	}
 }

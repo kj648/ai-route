@@ -631,17 +631,28 @@ func ParseRequestInfo(body []byte) (RequestInfo, error) {
 // user message stays the same while the conversation grows, so requests of
 // one conversation can keep hitting the same upstream (and its prompt
 // cache). It is "" when the body has no user message.
-func ConversationKey(body []byte) string {
+// proto is the client protocol: only Responses requests keep their
+// messages in "input" (for embeddings it is the text to embed).
+func ConversationKey(body []byte, proto string) string {
+	type message struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
 	var req struct {
-		Messages []struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
+		Messages []message       `json:"messages"`
+		Input    json.RawMessage `json:"input"` // Responses API
 	}
 	if json.Unmarshal(body, &req) != nil {
 		return ""
 	}
-	for _, m := range req.Messages {
+	msgs := req.Messages
+	if proto == ProtoResponses {
+		if isJSONString(req.Input) {
+			return string(req.Input)
+		}
+		_ = json.Unmarshal(req.Input, &msgs)
+	}
+	for _, m := range msgs {
 		if m.Role == "user" {
 			return string(m.Content)
 		}
