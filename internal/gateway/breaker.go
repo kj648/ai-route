@@ -99,7 +99,10 @@ func (b *Breaker) Success(prefix, target string) {
 	}
 }
 
-func (b *Breaker) Failure(prefix, target string, kind failKind, retryAfter time.Duration, msg string) {
+// Failure records a failed request on a target. When it cools something
+// down, it returns the entry key ("p:<prefix>" or "t:<target>") and the
+// cooldown length.
+func (b *Breaker) Failure(prefix, target string, kind failKind, retryAfter time.Duration, msg string) (string, time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	st := b.settings()
@@ -110,7 +113,7 @@ func (b *Breaker) Failure(prefix, target string, kind failKind, retryAfter time.
 	var open *breakerEntry
 	switch kind {
 	case failIgnore:
-		return
+		return "", 0
 	case failSoft:
 		t.Failures++
 		if t.Failures >= st.FailureThreshold {
@@ -125,7 +128,7 @@ func (b *Breaker) Failure(prefix, target string, kind failKind, retryAfter time.
 		open = p
 	}
 	if open == nil {
-		return
+		return "", 0
 	}
 	open.Opens++
 	open.Failures = 0
@@ -143,6 +146,7 @@ func (b *Breaker) Failure(prefix, target string, kind failKind, retryAfter time.
 		}
 	}
 	open.OpenUntil = now.Add(cooldown)
+	return open.Key, cooldown
 }
 
 // Reset clears one entry (or all entries when key is empty).

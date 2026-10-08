@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"ai-route/internal/alert"
 	"ai-route/internal/convert"
 	"ai-route/internal/store"
 )
@@ -29,6 +30,7 @@ type Gateway struct {
 	store   *store.Store
 	Breaker *Breaker
 	Limiter *Limiter
+	Alerts  *alert.Notifier
 	client  *http.Client
 
 	touchMu sync.Mutex
@@ -50,6 +52,7 @@ func New(s *store.Store) *Gateway {
 		store:   s,
 		Breaker: NewBreaker(s.GetSettings),
 		Limiter: NewLimiter(s),
+		Alerts:  alert.New(s.GetAlerts),
 		client:  &http.Client{Transport: transport},
 		touched: map[int64]time.Time{},
 	}
@@ -291,6 +294,9 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 	cands := g.plan(snap, m, inbound)
 	if len(cands) == 0 {
 		entry.HTTPStatus, entry.Error = 503, "no enabled targets"
+		g.Alerts.Notify(alert.Alert{Event: alert.EventAllFailed, Subject: m.Name,
+			Title: fmt.Sprintf("模型 %s 没有可用的上游", m.Name),
+			Text:  "调度顺序里的供应商都已停用，或都不支持这类请求。"})
 		writeError(w, inbound, http.StatusServiceUnavailable, fmt.Sprintf("model %q has no enabled upstream targets", m.Name))
 		return
 	}
@@ -344,11 +350,11 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 			if res.streamErr == "" {
 				g.Breaker.Success(c.prefix, c.target)
 			} else {
-				g.Breaker.Failure(c.prefix, c.target, failSoft, 0, res.streamErr)
+				g.failure(c, failSoft, 0, 200, res.streamErr)
 			}
 			return
 		}
-		g.Breaker.Failure(c.prefix, c.target, res.kind, res.retryAfter, res.attempt.Error)
+		g.failure(c, res.kind, res.retryAfter, res.attempt.HTTPStatus, res.attempt.Error)
 		lastStatus, lastMsg = res.attempt.HTTPStatus, res.attempt.Error
 		log.Printf("[%s] target %s failed (%d): %s", m.Name, c.target, res.attempt.HTTPStatus, truncate(res.attempt.Error, 200))
 	}
@@ -361,6 +367,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 	}
 	entry.HTTPStatus = lastStatus
 	entry.Error = lastMsg
+	g.alertAllFailed(m.Name, entry.Attempts)
 	writeError(w, inbound, lastStatus, "all upstream targets failed: "+strings.Join(parts, " | "))
 	return entry
 }

@@ -1252,7 +1252,7 @@ function logDetail(l) {
 
 // ---------------------------------------------------------------- settings
 async function pageSettings() {
-  const [st, models] = await Promise.all([api('GET', '/settings'), api('GET', '/models')]);
+  const [st, models, alerts] = await Promise.all([api('GET', '/settings'), api('GET', '/models'), api('GET', '/alerts')]);
   const origin = location.origin;
   const sample = models.find((m) => m.enabled);
   const mn = sample ? sample.name : '你的模型名';
@@ -1309,6 +1309,23 @@ claude</pre>
       </div>
     </div>
     <div class="card">
+      <div class="card-head">告警通知</div>
+      <div class="card-body form">
+        <div class="muted small">出问题时推送到飞书、钉钉、企业微信群机器人，或任意接收 JSON 的地址。同一件事在静默时间内只推送一次。</div>
+        <div id="al-hooks"></div>
+        <div><button type="button" class="btn sm" id="al-add">+ 添加 Webhook</button></div>
+        <div class="field"><label>推送哪些事件</label>
+          <label class="check"><input type="checkbox" id="al-auth" ${alerts.on_auth_failure ? 'checked' : ''}> 上游返回 401 / 402（Key 失效、欠费），整个套餐被冷却</label>
+          <label class="check"><input type="checkbox" id="al-all" ${alerts.on_all_failed ? 'checked' : ''}> 某个对外模型的整条调度链全部失败（客户端收到错误）</label>
+          <label class="check"><input type="checkbox" id="al-cool" ${alerts.on_long_cooldown ? 'checked' : ''}> 套餐或模型一次冷却超过 <input type="number" id="al-cool-min" min="1" value="${alerts.long_cooldown_minutes}" style="width:70px"> 分钟</label>
+        </div>
+        <div class="row2">
+          <div class="field"><label>静默时间（分钟）</label><input type="number" id="al-silence" min="1" value="${alerts.silence_minutes}"><div class="help">同一事件、同一对象在这段时间内只推送一次</div></div>
+        </div>
+        <div><button class="btn primary" id="al-save">保存告警设置</button></div>
+      </div>
+    </div>
+    <div class="card">
       <div class="card-head">备份 / 迁移</div>
       <div class="card-body form">
         <div class="muted small">导出全部套餐（含上游 Key）、模型映射、API Key 和设置为 JSON。导入会<b>覆盖</b>现有配置（日志不受影响）。导出文件含密钥，请妥善保管。</div>
@@ -1316,6 +1333,7 @@ claude</pre>
       </div>
     </div>`;
   $$('[data-copy]').forEach((el) => el.onclick = () => copyText(el.dataset.copy));
+  alertHooksEditor(alerts);
   $('#st-save').onclick = async () => {
     try {
       await api('PUT', '/settings', {
@@ -1351,6 +1369,69 @@ claude</pre>
       route();
     } catch (err) { toast('导入失败：' + err.message, 'err'); }
     e.target.value = '';
+  };
+}
+
+const HOOK_TYPES = {
+  feishu: { label: '飞书 / Lark', help: '群设置 → 群机器人 → 添加自定义机器人。开启“签名校验”时把密钥填在右边；用“自定义关键词”时关键词填 AI Route' },
+  dingtalk: { label: '钉钉', help: '群设置 → 机器人 → 自定义。安全设置选“加签”时填密钥（SEC 开头）；选“自定义关键词”时关键词填 AI Route' },
+  wecom: { label: '企业微信', help: '群聊 → 添加群机器人，复制 Webhook 地址，不需要密钥' },
+  generic: { label: '通用 JSON', help: 'POST JSON：{event, subject, title, text, time}' },
+};
+
+function alertHooksEditor(alerts) {
+  const hooks = (alerts.webhooks || []).map((h) => ({ ...h }));
+  const box = $('#al-hooks');
+  const render = () => {
+    box.innerHTML = hooks.length ? hooks.map((h, i) => `
+      <div class="hook-row" data-i="${i}">
+        <div class="toolbar">
+          <select data-k="type">${Object.entries(HOOK_TYPES).map(([v, t]) => `<option value="${v}" ${h.type === v ? 'selected' : ''}>${t.label}</option>`).join('')}</select>
+          <input type="text" data-k="name" value="${esc(h.name || '')}" placeholder="名称（可选）" style="width:140px">
+          <label class="check"><input type="checkbox" data-k="enabled" ${h.enabled ? 'checked' : ''}> 启用</label>
+          <span class="btns" style="margin-left:auto"><button type="button" class="btn sm" data-test>发送测试</button><button type="button" class="btn sm danger" data-del>删除</button></span>
+        </div>
+        <div class="toolbar" style="margin-top:6px">
+          <input type="text" data-k="url" value="${esc(h.url || '')}" placeholder="Webhook 地址" style="flex:2;min-width:240px">
+          ${h.type === 'feishu' || h.type === 'dingtalk' ? `<input type="password" data-k="secret" value="${esc(h.secret || '')}" placeholder="签名密钥（可选）" style="flex:1;min-width:160px" autocomplete="new-password">` : ''}
+        </div>
+        <div class="help">${HOOK_TYPES[h.type] ? HOOK_TYPES[h.type].help : ''} <span data-result></span></div>
+      </div>`).join('') : '<div class="muted small">还没有 Webhook，添加后才会推送</div>';
+    $$('.hook-row', box).forEach((row) => {
+      const h = hooks[Number(row.dataset.i)];
+      $$('[data-k]', row).forEach((el) => {
+        const k = el.dataset.k;
+        el.onchange = el.oninput = () => {
+          h[k] = el.type === 'checkbox' ? el.checked : el.value;
+          if (k === 'type') render();
+        };
+      });
+      $('[data-del]', row).onclick = () => { hooks.splice(Number(row.dataset.i), 1); render(); };
+      $('[data-test]', row).onclick = async (e) => {
+        const out = $('[data-result]', row);
+        e.target.disabled = true;
+        out.className = 'muted'; out.textContent = '发送中…';
+        try {
+          const r = await api('POST', '/alerts/test', h);
+          out.className = r.ok ? 'ok-text' : 'err-text';
+          out.textContent = r.ok ? '已发送，请到群里查看' : '发送失败：' + r.error;
+        } catch (err) { out.className = 'err-text'; out.textContent = err.message; }
+        e.target.disabled = false;
+      };
+    });
+  };
+  render();
+  $('#al-add').onclick = () => { hooks.push({ type: 'feishu', name: '', url: '', secret: '', enabled: true }); render(); };
+  $('#al-save').onclick = async () => {
+    try {
+      await api('PUT', '/alerts', {
+        webhooks: hooks,
+        on_auth_failure: $('#al-auth').checked, on_all_failed: $('#al-all').checked, on_long_cooldown: $('#al-cool').checked,
+        long_cooldown_minutes: Number($('#al-cool-min').value), silence_minutes: Number($('#al-silence').value),
+      });
+      toast('已保存', 'ok');
+      route();
+    } catch (e) { toast(e.message, 'err'); }
   };
 }
 

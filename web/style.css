@@ -222,3 +222,5 @@ pre.box { background: var(--code); border-radius: 8px; padding: 10px 12px; overf
   .grid.cols-2, .row2, .row3 { grid-template-columns: 1fr; }
   .target-row { grid-template-columns: 40px 100px 1fr auto; }
 }
+
+.hook-row { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 8px; }

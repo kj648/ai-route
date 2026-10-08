@@ -87,6 +87,12 @@ func (m *mockUpstream) serve(w http.ResponseWriter, r *http.Request) {
 	case "fail400":
 		http.Error(w, `{"error":{"message":"bad request"}}`, 400)
 		return
+	case "fail401":
+		http.Error(w, `{"error":{"message":"invalid api key"}}`, 401)
+		return
+	case "fail402":
+		http.Error(w, `{"error":{"message":"insufficient balance"}}`, 402)
+		return
 	}
 	if strings.HasSuffix(r.URL.Path, "/embeddings") {
 		w.Header().Set("Content-Type", "application/json")

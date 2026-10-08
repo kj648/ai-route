@@ -402,3 +402,39 @@ func TestKeySpend(t *testing.T) {
 		t.Fatalf("spend: %v", got)
 	}
 }
+
+func TestAlertConfigPersistAndImport(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if d := st.GetAlerts(); !d.OnAuthFailure || d.SilenceMinutes != 30 || d.Webhooks == nil {
+		t.Fatalf("defaults: %+v", d)
+	}
+	for _, bad := range []Webhook{{Type: "slack", URL: "https://x"}, {Type: "feishu", URL: "ftp://x"}} {
+		if err := st.UpdateAlerts(AlertConfig{Webhooks: []Webhook{bad}}); err == nil {
+			t.Errorf("accepted %+v", bad)
+		}
+	}
+	c := AlertConfig{OnAllFailed: true, Webhooks: []Webhook{
+		{Type: " Feishu ", URL: " https://open.feishu.cn/open-apis/bot/v2/hook/x ", Secret: "s", Enabled: true},
+		{Type: "wecom", URL: ""}, // empty rows are dropped
+	}}
+	mustNil(t, st.UpdateAlerts(c))
+	got := st.GetAlerts()
+	if len(got.Webhooks) != 1 || got.Webhooks[0].Type != "feishu" || got.Webhooks[0].URL != "https://open.feishu.cn/open-apis/bot/v2/hook/x" ||
+		got.OnAuthFailure || !got.OnAllFailed || got.LongCooldownMinutes != 10 {
+		t.Fatalf("saved: %+v", got)
+	}
+
+	e, _ := st.Export()
+	if e.Alerts == nil || len(e.Alerts.Webhooks) != 1 {
+		t.Fatalf("export: %+v", e.Alerts)
+	}
+	e.Alerts = nil // an export from before alerts existed
+	mustNil(t, st.Import(e))
+	if len(st.GetAlerts().Webhooks) != 1 {
+		t.Fatal("import without alerts dropped the current alert config")
+	}
+}

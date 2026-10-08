@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"ai-route/internal/alert"
 	"ai-route/internal/gateway"
 	"ai-route/internal/store"
 )
@@ -58,6 +59,9 @@ func (a *Admin) Register(mux *http.ServeMux) {
 
 	api.HandleFunc("GET /admin/api/settings", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, a.store.GetSettings()) })
 	api.HandleFunc("PUT /admin/api/settings", a.updateSettings)
+	api.HandleFunc("GET /admin/api/alerts", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, a.store.GetAlerts()) })
+	api.HandleFunc("PUT /admin/api/alerts", a.updateAlerts)
+	api.HandleFunc("POST /admin/api/alerts/test", a.testAlert)
 	api.HandleFunc("GET /admin/api/export", a.export)
 	api.HandleFunc("POST /admin/api/import", a.importConfig)
 
@@ -489,6 +493,43 @@ func (a *Admin) export(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(e)
+}
+
+func (a *Admin) updateAlerts(w http.ResponseWriter, r *http.Request) {
+	var c store.AlertConfig
+	if err := decode(r, &c); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if err := a.store.UpdateAlerts(c); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, a.store.GetAlerts())
+}
+
+// testAlert sends a test message to one webhook (not necessarily saved yet).
+func (a *Admin) testAlert(w http.ResponseWriter, r *http.Request) {
+	var h store.Webhook
+	if err := decode(r, &h); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	c := store.AlertConfig{Webhooks: []store.Webhook{h}}
+	if err := store.ValidateAlerts(&c); err != nil || len(c.Webhooks) == 0 {
+		if err == nil {
+			err = errors.New("webhook url is required")
+		}
+		writeErr(w, 400, err)
+		return
+	}
+	err := a.gw.Alerts.Send(r.Context(), c.Webhooks[0], alert.Alert{Event: alert.EventTest, Subject: "test",
+		Title: "测试消息", Text: "告警通知配置成功。上游鉴权失败、整条调度链全部失败、长时间冷却时会推送到这里。"})
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (a *Admin) importConfig(w http.ResponseWriter, r *http.Request) {

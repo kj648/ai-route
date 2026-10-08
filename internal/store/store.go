@@ -153,6 +153,7 @@ type Snapshot struct {
 	modelByName map[string]*Model
 	Keys        map[string]*APIKey // by key string
 	Settings    Settings
+	Alerts      AlertConfig
 }
 
 // ResolveModel finds a public model by exact name, exact alias, then glob alias.
@@ -415,7 +416,12 @@ func (s *Store) reloadLocked() error {
 	if err != nil {
 		return err
 	}
+	alerts, err := s.getAlerts()
+	if err != nil {
+		return err
+	}
 	snap := &Snapshot{
+		Alerts:      alerts,
 		Providers:   map[string]*Provider{},
 		Models:      models,
 		modelByName: map[string]*Model{},
@@ -1122,6 +1128,9 @@ type Export struct {
 	Models    []*Model    `json:"models"`
 	Keys      []*APIKey   `json:"api_keys"`
 	Settings  Settings    `json:"settings"`
+	// Alerts is nil in exports made before alerts existed; importing such a
+	// file keeps the current alert configuration.
+	Alerts *AlertConfig `json:"alerts,omitempty"`
 }
 
 func (s *Store) Export() (*Export, error) {
@@ -1137,7 +1146,8 @@ func (s *Store) Export() (*Export, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Export{Version: 1, Providers: p, Models: m, Keys: k, Settings: s.GetSettings()}, nil
+	alerts := s.GetAlerts()
+	return &Export{Version: 1, Providers: p, Models: m, Keys: k, Settings: s.GetSettings(), Alerts: &alerts}, nil
 }
 
 // Import replaces the whole configuration (providers, models, keys, settings).
@@ -1150,6 +1160,11 @@ func (s *Store) Import(e *Export) error {
 	for _, m := range e.Models {
 		if err := normalizeModel(m); err != nil {
 			return fmt.Errorf("model %q: %w", m.Name, err)
+		}
+	}
+	if e.Alerts != nil {
+		if err := normalizeAlerts(e.Alerts); err != nil {
+			return fmt.Errorf("alerts: %w", err)
 		}
 	}
 	s.mu.Lock()
@@ -1191,6 +1206,11 @@ func (s *Store) Import(e *Export) error {
 	}
 	if e.Settings != (Settings{}) {
 		if _, err := tx.Exec(`INSERT INTO settings (k, v) VALUES ('settings', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, mustJSON(normalizeSettings(e.Settings))); err != nil {
+			return err
+		}
+	}
+	if e.Alerts != nil {
+		if _, err := tx.Exec(`INSERT INTO settings (k, v) VALUES ('alerts', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, mustJSON(e.Alerts)); err != nil {
 			return err
 		}
 	}
