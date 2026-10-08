@@ -229,11 +229,26 @@ function targetHealth(t, idx, providers) {
   if (ts && ts.failures > 0) return { cls: '', tip: `连续失败 ${ts.failures} 次：${ts.last_error}` };
   return { cls: '', tip: '正常' };
 }
+// a target entry is "prefix/model" or a weighted same-priority group "a/x*3 | b/x"
+function parseEntry(entry) {
+  return entry.split('|').map((x) => x.trim()).filter(Boolean).map((part) => {
+    const m = part.match(/^(.*\S)\s*\*\s*(\d+)$/);
+    return m ? { t: m[1], w: Number(m[2]) } : { t: part, w: 1 };
+  });
+}
+const entryTargets = (entry) => parseEntry(entry).map((x) => x.t);
 function chainHTML(targets, idx, providers) {
   if (!targets.length) return '<span class="muted small">未配置</span>';
-  return `<div class="chain">${targets.map((t, i) => {
+  const one = (t, w, group) => {
     const h = targetHealth(t, idx, providers);
-    return `${i ? '<span class="arrow">→</span>' : ''}<span class="target ${h.cls}" title="${esc(h.tip)}"><span class="s"></span>${esc(t)}</span>`;
+    return `<span class="target ${h.cls}" title="${esc(h.tip)}"><span class="s"></span>${esc(t)}${group ? `<span class="weight">×${w}</span>` : ''}</span>`;
+  };
+  return `<div class="chain">${targets.map((entry, i) => {
+    const members = parseEntry(entry);
+    const inner = members.length > 1
+      ? `<span class="group" title="同级按权重分流，同一会话固定走同一个">${members.map((x) => one(x.t, x.w, true)).join('<span class="bar">|</span>')}</span>`
+      : one(members[0].t, 1, false);
+    return `${i ? '<span class="arrow">→</span>' : ''}${inner}`;
   }).join('')}</div>`;
 }
 
@@ -336,7 +351,7 @@ function parsePrices(text) {
 const toPriceLines = (prices) => Object.entries(prices || {})
   .map(([k, v]) => `${k} = ${v.input} / ${v.cache != null ? v.cache + ' / ' : ''}${v.output}`).join('\n');
 // request body rules: "model(*) [stream|nonstream, openai|anthropic|embeddings] = {json}"
-const RULE_TAGS = { stream: 'when', nonstream: 'when', openai: 'protocol', anthropic: 'protocol', embeddings: 'protocol' };
+const RULE_TAGS = { stream: 'when', nonstream: 'when', openai: 'protocol', anthropic: 'protocol', embeddings: 'protocol', rerank: 'protocol' };
 function parseRules(text) {
   const rules = [];
   for (const raw of text.split('\n')) {
@@ -346,7 +361,7 @@ function parseRules(text) {
     if (!m) throw new Error('参数规则格式不对：' + line);
     const rule = { model: m[1] };
     for (const tag of (m[2] || '').split(/[,\s]+/).filter(Boolean)) {
-      if (!RULE_TAGS[tag]) throw new Error(`参数规则的条件只能是 stream、nonstream、openai、anthropic、embeddings：${line}`);
+      if (!RULE_TAGS[tag]) throw new Error(`参数规则的条件只能是 stream、nonstream、openai、anthropic、embeddings、rerank：${line}`);
       rule[RULE_TAGS[tag]] = tag;
     }
     try { rule.set = JSON.parse(m[3]); } catch (e) { throw new Error('参数规则的 JSON 不对：' + line); }
@@ -359,7 +374,7 @@ const toRuleLines = (rules) => (rules || []).map((r) => {
   const tags = [r.when, r.protocol].filter(Boolean);
   return `${r.model}${tags.length ? ` [${tags.join(', ')}]` : ''} = ${JSON.stringify(r.set)}`;
 }).join('\n');
-const usesProvider = (m, prefix) => m.targets.some((t) => t.startsWith(prefix + '/'));
+const usesProvider = (m, prefix) => m.targets.some((e) => entryTargets(e).some((t) => t.startsWith(prefix + '/')));
 
 function compatOf(p) {
   if (p.openai_base_url && p.anthropic_base_url) return 'both';
@@ -596,7 +611,7 @@ function providerForm(p, models, providers) {
           </div>
           <div class="field"><label>请求参数规则</label>
             <textarea id="pf-rules" placeholder='qwen3-* [nonstream] = {"enable_thinking": false}'>${esc(toRuleLines(p.body_rules))}</textarea>
-            <div class="help">每行 <code>模型(可用*) [条件] = JSON</code>，把 JSON 合并进发给上游的请求体（协议转换之后），值为 <code>null</code> 表示删除该字段。条件可选：<code>stream</code> / <code>nonstream</code>，<code>openai</code> / <code>anthropic</code> / <code>embeddings</code>，多个用逗号分隔</div></div>
+            <div class="help">每行 <code>模型(可用*) [条件] = JSON</code>，把 JSON 合并进发给上游的请求体（协议转换之后），值为 <code>null</code> 表示删除该字段。条件可选：<code>stream</code> / <code>nonstream</code>，<code>openai</code> / <code>anthropic</code> / <code>embeddings</code> / <code>rerank</code>，多个用逗号分隔</div></div>
           <div class="field"><label>单价（每百万 tokens，用于成本核算）
               <select id="pf-currency" style="margin-left:8px">${['CNY', 'USD'].map((c) => `<option value="${c}" ${(p.currency || 'CNY') === c ? 'selected' : ''}>${c === 'CNY' ? '人民币 ¥' : '美元 $'}</option>`).join('')}</select></label>
             <textarea id="pf-prices" placeholder="glm-5.3 = 4 / 0.8 / 16&#10;deepseek-* = 2 / 8">${esc(toPriceLines(p.prices))}</textarea>
@@ -896,7 +911,17 @@ async function pageModels() {
 function modelForm(m, providers, models, idx, asNew = false) {
   const isNew = !m || asNew;
   m = m || { name: '', aliases: [], targets: [], enabled: true, description: '' };
-  const targets = [...m.targets];
+  // one row per target; tie = same priority as the row above (weighted group)
+  const rows = m.targets.flatMap((e) => parseEntry(e).map((x, k) => ({ t: x.t, w: x.w, tie: k > 0 })));
+  const rowIndex = (t) => rows.findIndex((r) => r.t === t);
+  const toEntries = () => {
+    const out = [];
+    rows.forEach((r, i) => {
+      const part = r.t + (r.w > 1 ? '*' + r.w : '');
+      if (r.tie && i > 0) out[out.length - 1] += ' | ' + part; else out.push(part);
+    });
+    return out;
+  };
   const tags = new Set(m.tags || []);
   let freshTags = new Set();
 
@@ -924,27 +949,43 @@ function modelForm(m, providers, models, idx, asNew = false) {
 
   const renderChain = (root) => {
     const box = $('#mf-chain', root);
-    box.innerHTML = targets.length ? targets.map((t, i) => {
-      const h = targetHealth(t, idx, providers);
-      return `<div class="chain-row">
-        <span class="idx">${i === 0 ? '首选' : '候补 ' + i}</span>
-        <span class="target ${h.cls}" title="${esc(h.tip)}"><span class="s"></span>${esc(t)}</span>
+    if (rows.length) rows[0].tie = false;
+    let level = -1;
+    box.innerHTML = rows.length ? rows.map((r, i) => {
+      const h = targetHealth(r.t, idx, providers);
+      if (!r.tie) level++;
+      const inGroup = r.tie || (rows[i + 1] && rows[i + 1].tie);
+      return `<div class="chain-row ${r.tie ? 'tied' : ''}">
+        <span class="idx">${r.tie ? '并列' : level === 0 ? '首选' : '候补 ' + level}</span>
+        <span class="target ${h.cls}" title="${esc(h.tip)}"><span class="s"></span>${esc(r.t)}</span>
         <span class="muted small">${h.cls === 'missing' ? esc(h.tip) : ''}</span>
         <div class="btns">
+          ${i > 0 ? `<label class="check small" title="和上一项同一优先级，按权重分流"><input type="checkbox" data-act="tie" ${r.tie ? 'checked' : ''}> 与上一项并列</label>` : ''}
+          ${inGroup ? `<label class="small">权重 <input type="number" data-act="w" min="1" max="1000" value="${r.w}" style="width:64px"></label>` : ''}
           <button type="button" class="btn sm" data-act="up" ${i === 0 ? 'disabled' : ''} title="上移">↑</button>
-          <button type="button" class="btn sm" data-act="down" ${i === targets.length - 1 ? 'disabled' : ''} title="下移">↓</button>
+          <button type="button" class="btn sm" data-act="down" ${i === rows.length - 1 ? 'disabled' : ''} title="下移">↓</button>
           <button type="button" class="btn sm danger" data-act="rm" title="移除">✕</button>
         </div>
       </div>`;
     }).join('') : '<div class="muted small" style="padding:6px 0">还没有选择模型，从下面点选或手动输入</div>';
     $$('.chain-row', box).forEach((row, i) => {
-      $$('[data-act]', row).forEach((b) => b.onclick = () => {
+      $$('[data-act]', row).forEach((b) => {
         const act = b.dataset.act;
-        if (act === 'rm') targets.splice(i, 1);
-        if (act === 'up' && i > 0) [targets[i - 1], targets[i]] = [targets[i], targets[i - 1]];
-        if (act === 'down' && i < targets.length - 1) [targets[i + 1], targets[i]] = [targets[i], targets[i + 1]];
-        renderChain(root);
-        renderPicker(root);
+        if (act === 'w') {
+          b.onchange = () => { rows[i].w = Math.min(1000, Math.max(1, Math.floor(Number(b.value) || 1))); renderChain(root); };
+          return;
+        }
+        if (act === 'tie') {
+          b.onchange = () => { rows[i].tie = b.checked; renderChain(root); };
+          return;
+        }
+        b.onclick = () => {
+          if (act === 'rm') rows.splice(i, 1);
+          if (act === 'up' && i > 0) [rows[i - 1], rows[i]] = [rows[i], rows[i - 1]];
+          if (act === 'down' && i < rows.length - 1) [rows[i + 1], rows[i]] = [rows[i], rows[i + 1]];
+          renderChain(root);
+          renderPicker(root);
+        };
       });
     });
   };
@@ -958,7 +999,7 @@ function modelForm(m, providers, models, idx, asNew = false) {
         <div class="pick-head"><code>${esc(p.prefix)}</code> ${esc(p.name || '')}${p.enabled ? '' : ' <span class="badge">停用</span>'}</div>
         <div class="chips">${items.map((x) => {
           const t = `${p.prefix}/${x}`;
-          const pos = targets.indexOf(t);
+          const pos = rowIndex(t);
           return `<button type="button" class="chip pick ${pos >= 0 ? 'on' : ''}" data-t="${esc(t)}">${pos >= 0 ? `<span class="order">${pos + 1}</span>` : ''}${esc(x)}</button>`;
         }).join('')}</div>
       </div>`;
@@ -968,8 +1009,8 @@ function modelForm(m, providers, models, idx, asNew = false) {
       + (empty.length && !q ? `<div class="muted small">${empty.map((x) => `<code>${esc(x)}</code>`).join(' ')} 还没有模型列表：可到“供应商套餐”同步或添加，或在上方手动输入 <code>前缀/模型名</code></div>` : '');
     $$('[data-t]', root).forEach((b) => b.onclick = () => {
       const t = b.dataset.t;
-      const pos = targets.indexOf(t);
-      if (pos >= 0) targets.splice(pos, 1); else targets.push(t);
+      const pos = rowIndex(t);
+      if (pos >= 0) rows.splice(pos, 1); else rows.push({ t, w: 1, tie: false });
       renderChain(root);
       renderPicker(root);
     });
@@ -994,7 +1035,7 @@ function modelForm(m, providers, models, idx, asNew = false) {
       </div>
       <div class="field"><label>调度顺序 *（从上到下依次尝试）</label>
         <div id="mf-chain" class="chain-list"></div>
-        <div class="help">短暂错误（断连、5xx、上游过载）会先在同一个模型上重试，仍失败才切到下一个；额度用尽、Key 失效、超时等直接切换。重试次数在“设置”里调整。</div>
+        <div class="help">短暂错误（断连、5xx、上游过载）会先在同一个模型上重试，仍失败才切到下一个；额度用尽、Key 失效、超时等直接切换。重试次数在“设置”里调整。<br>勾选“与上一项并列”把多个上游（比如同一家的多个 Key）放在同一优先级，按权重分流：同一个会话固定走同一个上游以保住提示词缓存，不同会话按权重分散；其中一个失败时先切到同级的其他上游。</div>
       </div>
       <div class="field"><label>选择映射的模型（点击按顺序加入，再点一次移除）</label>
         <div class="toolbar" style="margin-bottom:8px">
@@ -1019,8 +1060,8 @@ function modelForm(m, providers, models, idx, asNew = false) {
       });
       $('#mf-suggest', root).onclick = () => {
         const msg = $('#mf-suggest-msg', root);
-        if (!targets.length) { msg.textContent = '请先在下方选择映射的模型'; msg.className = 'help err-text'; return; }
-        const s = suggestTags(targets);
+        if (!rows.length) { msg.textContent = '请先在下方选择映射的模型'; msg.className = 'help err-text'; return; }
+        const s = suggestTags(rows.map((r) => r.t));
         freshTags = new Set(s.tags.filter((t) => !tags.has(t)));
         for (const t of s.tags) {
           const group = TAG_GROUPS.find((g) => g.id === tagInfo(t).group);
@@ -1039,7 +1080,7 @@ function modelForm(m, providers, models, idx, asNew = false) {
         const i = v.indexOf('/');
         if (i <= 0 || i === v.length - 1) return toast('请输入 前缀/模型名，例如 kimi/k3', 'err');
         if (!providers.some((p) => p.prefix === v.slice(0, i))) return toast(`前缀 ${v.slice(0, i)} 不存在，请先添加该套餐`, 'err');
-        if (!targets.includes(v)) targets.push(v);
+        if (rowIndex(v) < 0) rows.push({ t: v, w: 1, tie: false });
         $('#mf-filter', root).value = '';
         renderChain(root);
         renderPicker(root);
@@ -1053,7 +1094,7 @@ function modelForm(m, providers, models, idx, asNew = false) {
           description: $('#mf-desc', root).value.trim(),
           aliases: $('#mf-aliases', root).value.split(/[,，\n]/).map((s) => s.trim()).filter(Boolean),
           tags: sortTags([...tags]),
-          targets,
+          targets: toEntries(),
           enabled: $('#mf-enabled', root).checked,
         };
         if (!body.name) return toast('请填写对外模型名', 'err');
@@ -1302,35 +1343,19 @@ function logDetail(l) {
 
 // ---------------------------------------------------------------- settings
 async function pageSettings() {
-  const [st, models, alerts] = await Promise.all([api('GET', '/settings'), api('GET', '/models'), api('GET', '/alerts')]);
+  const [st, models, alerts, keys] = await Promise.all([api('GET', '/settings'), api('GET', '/models'), api('GET', '/alerts'), api('GET', '/keys')]);
   const origin = location.origin;
-  const sample = models.find((m) => m.enabled);
-  const mn = sample ? sample.name : '你的模型名';
   $('#page').innerHTML = `
     ${head('设置与接入', '')}
     <div class="card">
       <div class="card-head">客户端接入</div>
       <div class="card-body form">
         <div class="kv">
-          <div class="k">OpenAI 兼容</div><div><code class="copy" data-copy="${esc(origin)}/v1">${esc(origin)}/v1</code> <span class="muted small">（POST /v1/chat/completions、POST /v1/embeddings、GET /v1/models）</span></div>
+          <div class="k">OpenAI 兼容</div><div><code class="copy" data-copy="${esc(origin)}/v1">${esc(origin)}/v1</code> <span class="muted small">（POST /v1/chat/completions、POST /v1/embeddings、POST /v1/rerank、GET /v1/models）</span></div>
           <div class="k">Anthropic 兼容</div><div><code class="copy" data-copy="${esc(origin)}">${esc(origin)}</code> <span class="muted small">（POST /v1/messages，即 ANTHROPIC_BASE_URL）</span></div>
           <div class="k">鉴权</div><div><code>Authorization: Bearer sk-route-…</code> 或 <code>x-api-key: sk-route-…</code></div>
         </div>
-        <div>
-          <div class="muted small" style="margin-bottom:4px">Claude Code 示例</div>
-<pre class="box mono">export ANTHROPIC_BASE_URL=${esc(origin)}
-export ANTHROPIC_AUTH_TOKEN=sk-route-xxxx
-export ANTHROPIC_MODEL=${esc(mn)}
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=${esc(mn)}
-claude</pre>
-        </div>
-        <div>
-          <div class="muted small" style="margin-bottom:4px">curl 示例</div>
-<pre class="box mono">curl ${esc(origin)}/v1/chat/completions \\
-  -H "Authorization: Bearer sk-route-xxxx" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"${esc(mn)}","messages":[{"role":"user","content":"你好"}]}'</pre>
-        </div>
+        <div class="wizard" id="wz"></div>
       </div>
     </div>
     <div class="card">
@@ -1385,6 +1410,7 @@ claude</pre>
       </div>
     </div>`;
   $$('[data-copy]').forEach((el) => el.onclick = () => copyText(el.dataset.copy));
+  setupWizard($('#wz'), origin, keys, models);
   alertHooksEditor(alerts);
   $('#st-save').onclick = async () => {
     try {
@@ -1423,6 +1449,89 @@ claude</pre>
     } catch (err) { toast('导入失败：' + err.message, 'err'); }
     e.target.value = '';
   };
+}
+
+// ---------------------------------------------------------------- client setup wizard
+const CLIENTS = [
+  { id: 'claude-code', label: 'Claude Code', small: true },
+  { id: 'opencode', label: 'OpenCode' },
+  { id: 'cline', label: 'Cline / Roo Code / Kilo Code' },
+  { id: 'cherry', label: 'Cherry Studio' },
+  { id: 'openai-py', label: 'OpenAI SDK（Python）' },
+  { id: 'anthropic-py', label: 'Anthropic SDK（Python）' },
+  { id: 'curl', label: 'curl' },
+];
+
+function clientSnippets(client, o, key, model, small) {
+  const v1 = o + '/v1';
+  switch (client) {
+    case 'claude-code': return [
+      { title: '终端里临时使用（bash / zsh）', lang: 'bash', text: `export ANTHROPIC_BASE_URL=${o}\nexport ANTHROPIC_AUTH_TOKEN=${key}\nexport ANTHROPIC_MODEL=${model}\nexport ANTHROPIC_DEFAULT_HAIKU_MODEL=${small}\nclaude` },
+      { title: '长期使用：写进 ~/.claude/settings.json', lang: 'json', text: JSON.stringify({ env: { ANTHROPIC_BASE_URL: o, ANTHROPIC_AUTH_TOKEN: key, ANTHROPIC_MODEL: model, ANTHROPIC_DEFAULT_HAIKU_MODEL: small } }, null, 2) },
+    ];
+    case 'opencode': return [
+      { title: '写进项目根目录的 opencode.json（或 ~/.config/opencode/opencode.json），然后在 /models 里选 ai-route/' + model, lang: 'json', text: JSON.stringify({
+        $schema: 'https://opencode.ai/config.json',
+        provider: { 'ai-route': { npm: '@ai-sdk/openai-compatible', name: 'AI Route', options: { baseURL: v1, apiKey: key }, models: { [model]: { name: model } } } },
+      }, null, 2) },
+    ];
+    case 'cline': return [
+      { title: '在插件设置里选择 API Provider：OpenAI Compatible，然后填写', lang: 'text', text: `Base URL：${v1}\nAPI Key：${key}\nModel ID：${model}` },
+    ];
+    case 'cherry': return [
+      { title: '设置 → 模型服务 → 添加，提供商类型选 OpenAI，然后填写', lang: 'text', text: `API 地址：${o}\nAPI 密钥：${key}\n模型：点“管理”从列表里添加 ${model}（或手动添加）` },
+    ];
+    case 'openai-py': return [
+      { title: 'pip install openai', lang: 'python', text: `from openai import OpenAI\n\nclient = OpenAI(base_url="${v1}", api_key="${key}")\nresp = client.chat.completions.create(\n    model="${model}",\n    messages=[{"role": "user", "content": "你好"}],\n)\nprint(resp.choices[0].message.content)` },
+    ];
+    case 'anthropic-py': return [
+      { title: 'pip install anthropic', lang: 'python', text: `import anthropic\n\nclient = anthropic.Anthropic(base_url="${o}", api_key="${key}")\nmsg = client.messages.create(\n    model="${model}",\n    max_tokens=1024,\n    messages=[{"role": "user", "content": "你好"}],\n)\nprint(msg.content[0].text)` },
+    ];
+    default: return [
+      { title: 'OpenAI 格式', lang: 'bash', text: `curl ${v1}/chat/completions \\\n  -H "Authorization: Bearer ${key}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${model}","messages":[{"role":"user","content":"你好"}]}'` },
+      { title: 'Anthropic 格式', lang: 'bash', text: `curl ${o}/v1/messages \\\n  -H "x-api-key: ${key}" \\\n  -H "anthropic-version: 2023-06-01" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${model}","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'` },
+    ];
+  }
+}
+
+function setupWizard(box, origin, keys, models) {
+  const enabledKeys = keys.filter((k) => k.enabled && !(k.expires_at && k.expires_at < Date.now()));
+  const state = { client: 'claude-code', key: enabledKeys[0] ? enabledKeys[0].id : 0, model: '', small: '', reveal: false };
+  const allowed = () => {
+    const k = enabledKeys.find((x) => x.id == state.key);
+    return models.filter((m) => m.enabled && (!k || !k.allowed_models.length || k.allowed_models.includes(m.name)));
+  };
+  const render = () => {
+    const ms = allowed();
+    if (!ms.some((m) => m.name === state.model)) state.model = ms[0] ? ms[0].name : '';
+    if (!ms.some((m) => m.name === state.small)) state.small = (ms.find((m) => (m.tags || []).includes('fast')) || ms[0] || {}).name || '';
+    const client = CLIENTS.find((c) => c.id === state.client);
+    const k = enabledKeys.find((x) => x.id == state.key);
+    const keyValue = k ? k.key : 'sk-route-xxxx';
+    const shown = state.reveal || !k ? keyValue : maskApiKey(keyValue);
+    const snippets = clientSnippets(state.client, origin, keyValue, state.model || '模型名', state.small || state.model || '模型名');
+    box.innerHTML = `
+      <div class="muted small" style="margin-bottom:8px">选好客户端、Key 和模型，复制下面生成的配置即可。</div>
+      <div class="seg" id="wz-client">${CLIENTS.map((c) => `<button type="button" data-c="${c.id}" class="${c.id === state.client ? 'on' : ''}">${esc(c.label)}</button>`).join('')}</div>
+      <div class="row3" style="margin-top:10px">
+        <div class="field"><label>API Key</label><select id="wz-key">${enabledKeys.length ? enabledKeys.map((x) => `<option value="${x.id}" ${x.id == state.key ? 'selected' : ''}>${esc(x.name || maskApiKey(x.key))}</option>`).join('') : '<option value="0">还没有可用的 Key，先到 API Keys 创建</option>'}</select></div>
+        <div class="field"><label>模型</label><select id="wz-model">${ms.map((m) => `<option ${m.name === state.model ? 'selected' : ''}>${esc(m.name)}</option>`).join('') || '<option value="">没有可用模型</option>'}</select></div>
+        ${client.small ? `<div class="field"><label>后台小模型（Haiku 位）</label><select id="wz-small">${ms.map((m) => `<option ${m.name === state.small ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></div>` : '<div></div>'}
+      </div>
+      <label class="check small"><input type="checkbox" id="wz-reveal" ${state.reveal ? 'checked' : ''}> 预览里显示完整 Key（复制时总是完整的）</label>
+      ${snippets.map((sn, i) => `
+        <div class="snippet">
+          <div class="toolbar"><span class="muted small">${esc(sn.title)}</span><button type="button" class="btn sm" data-copy-i="${i}" style="margin-left:auto">复制</button></div>
+          <pre class="box mono">${esc(sn.text.split(keyValue).join(shown))}</pre>
+        </div>`).join('')}`;
+    $$('#wz-client button', box).forEach((b) => b.onclick = () => { state.client = b.dataset.c; render(); });
+    $('#wz-key', box).onchange = (e) => { state.key = e.target.value; render(); };
+    $('#wz-model', box).onchange = (e) => { state.model = e.target.value; render(); };
+    if ($('#wz-small', box)) $('#wz-small', box).onchange = (e) => { state.small = e.target.value; render(); };
+    $('#wz-reveal', box).onchange = (e) => { state.reveal = e.target.checked; render(); };
+    $$('[data-copy-i]', box).forEach((b) => b.onclick = () => copyText(snippets[Number(b.dataset.copyI)].text));
+  };
+  render();
 }
 
 const HOOK_TYPES = {

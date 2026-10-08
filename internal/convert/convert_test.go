@@ -380,3 +380,31 @@ func TestOpenAIToAnthropicNewerClaude(t *testing.T) {
 		}
 	}
 }
+
+func TestRerankUsageFormats(t *testing.T) {
+	for body, want := range map[string]int64{
+		`{"results":[],"usage":{"total_tokens":12}}`:                                 12, // Jina, vLLM
+		`{"results":[],"usage":{"prompt_tokens":9,"total_tokens":9}}`:                9,
+		`{"results":[],"meta":{"tokens":{"input_tokens":7,"output_tokens":0}}}`:      7, // SiliconFlow
+		`{"results":[],"meta":{"billed_units":{"search_units":1,"input_tokens":5}}}`: 5, // Cohere
+		`{"results":[]}`: 0,
+	} {
+		if got := ExtractUsage([]byte(body), ProtoRerank).Input; got != want {
+			t.Errorf("%s: %d", body, got)
+		}
+	}
+	if err := ValidateResponse([]byte(`{"data":[]}`), ProtoRerank); err == nil {
+		t.Error("rerank response without results accepted")
+	}
+}
+
+func TestConversationKey(t *testing.T) {
+	a := ConversationKey([]byte(`{"messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"},{"role":"assistant","content":"x"}]}`))
+	b := ConversationKey([]byte(`{"system":"other","messages":[{"role":"user","content":"hello"}]}`))
+	if a != `"hello"` || a != b {
+		t.Fatalf("%q %q", a, b)
+	}
+	if ConversationKey([]byte(`{"input":"x"}`)) != "" {
+		t.Fatal("no user message should give no key")
+	}
+}

@@ -626,3 +626,25 @@ func ParseRequestInfo(body []byte) (RequestInfo, error) {
 	err := json.Unmarshal(body, &ri)
 	return ri, err
 }
+
+// ConversationKey identifies a conversation for sticky routing: the first
+// user message stays the same while the conversation grows, so requests of
+// one conversation can keep hitting the same upstream (and its prompt
+// cache). It is "" when the body has no user message.
+func ConversationKey(body []byte) string {
+	var req struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return ""
+	}
+	for _, m := range req.Messages {
+		if m.Role == "user" {
+			return string(m.Content)
+		}
+	}
+	return ""
+}

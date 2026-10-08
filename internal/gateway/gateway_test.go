@@ -101,6 +101,15 @@ func (m *mockUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"insufficient balance"}}`, 402)
 		return
 	}
+	if strings.HasSuffix(r.URL.Path, "/rerank") {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model":   req.Model,
+			"results": []map[string]any{{"index": 1, "relevance_score": 0.9}, {"index": 0, "relevance_score": 0.1}},
+			"usage":   map[string]any{"total_tokens": 12},
+		})
+		return
+	}
 	if strings.HasSuffix(r.URL.Path, "/embeddings") {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{

@@ -224,3 +224,9 @@ pre.box { background: var(--code); border-radius: 8px; padding: 10px 12px; overf
 }
 
 .hook-row { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+.chain .group { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border: 1px dashed var(--border); border-radius: 8px; }
+.chain .group .bar { color: var(--muted, #888); }
+.target .weight { margin-left: 4px; font-size: 11px; opacity: .7; }
+.chain-row.tied { margin-left: 18px; }
+.snippet { margin-top: 10px; }
+.snippet pre { margin-top: 4px; }

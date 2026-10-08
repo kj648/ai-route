@@ -12,6 +12,8 @@ const (
 	ProtoAnthropic = "anthropic"
 	// ProtoEmbeddings is the OpenAI /embeddings endpoint (no conversion).
 	ProtoEmbeddings = "embeddings"
+	// ProtoRerank is the Jina / Cohere style /rerank endpoint (no conversion).
+	ProtoRerank = "rerank"
 )
 
 // Usage is normalized token usage. Input includes cached tokens.

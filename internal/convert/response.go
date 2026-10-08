@@ -16,6 +16,9 @@ func randID(prefix string) string {
 
 // ExtractUsage reads token usage from a non-stream response in its own protocol.
 func ExtractUsage(body []byte, proto string) Usage {
+	if proto == ProtoRerank {
+		return rerankUsage(body)
+	}
 	if proto == ProtoAnthropic {
 		var r struct {
 			Usage ANUsage `json:"usage"`
@@ -28,6 +31,38 @@ func ExtractUsage(body []byte, proto string) Usage {
 	}
 	_ = json.Unmarshal(body, &r)
 	return r.Usage.toUsage()
+}
+
+// rerankUsage reads the input tokens of a rerank response: usage.total_tokens
+// (Jina, vLLM), meta.tokens.input_tokens (SiliconFlow) or
+// meta.billed_units.input_tokens (Cohere).
+func rerankUsage(body []byte) Usage {
+	var r struct {
+		Usage *struct {
+			PromptTokens int64 `json:"prompt_tokens"`
+			TotalTokens  int64 `json:"total_tokens"`
+		} `json:"usage"`
+		Meta *struct {
+			Tokens *struct {
+				InputTokens int64 `json:"input_tokens"`
+			} `json:"tokens"`
+			BilledUnits *struct {
+				InputTokens int64 `json:"input_tokens"`
+			} `json:"billed_units"`
+		} `json:"meta"`
+	}
+	_ = json.Unmarshal(body, &r)
+	switch {
+	case r.Usage != nil && r.Usage.PromptTokens > 0:
+		return Usage{Input: r.Usage.PromptTokens}
+	case r.Usage != nil:
+		return Usage{Input: r.Usage.TotalTokens}
+	case r.Meta != nil && r.Meta.Tokens != nil:
+		return Usage{Input: r.Meta.Tokens.InputTokens}
+	case r.Meta != nil && r.Meta.BilledUnits != nil:
+		return Usage{Input: r.Meta.BilledUnits.InputTokens}
+	}
+	return Usage{}
 }
 
 // ValidateResponse checks that a 2xx non-stream body is a real completion and
@@ -46,6 +81,12 @@ func ValidateResponse(body []byte, proto string) error {
 		}
 		if _, ok := probe["content"]; !ok {
 			return fmt.Errorf("response has no content: %s", truncate(string(body), 300))
+		}
+		return nil
+	}
+	if proto == ProtoRerank {
+		if _, ok := probe["results"]; !ok {
+			return fmt.Errorf("response has no results: %s", truncate(string(body), 300))
 		}
 		return nil
 	}

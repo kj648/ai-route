@@ -85,6 +85,12 @@ func (g *Gateway) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /embeddings", func(w http.ResponseWriter, r *http.Request) {
 		g.handle(w, r, convert.ProtoEmbeddings)
 	})
+	mux.HandleFunc("POST /v1/rerank", func(w http.ResponseWriter, r *http.Request) {
+		g.handle(w, r, convert.ProtoRerank)
+	})
+	mux.HandleFunc("POST /rerank", func(w http.ResponseWriter, r *http.Request) {
+		g.handle(w, r, convert.ProtoRerank)
+	})
 	mux.HandleFunc("GET /v1/models", g.listModels)
 	mux.HandleFunc("GET /models", g.listModels)
 }
@@ -182,11 +188,11 @@ func splitTarget(t string) (string, string) {
 // chooseProtocol picks the upstream protocol; "" means the provider cannot
 // serve this kind of request (embeddings need an OpenAI endpoint).
 func chooseProtocol(p *store.Provider, model, inbound string) string {
-	if inbound == convert.ProtoEmbeddings {
+	if inbound == convert.ProtoEmbeddings || inbound == convert.ProtoRerank {
 		if p.OpenAIBaseURL == "" {
 			return ""
 		}
-		return convert.ProtoEmbeddings
+		return inbound
 	}
 	if f := p.ForcedProtocol(model); f != "" {
 		return f
@@ -201,10 +207,16 @@ func chooseProtocol(p *store.Provider, model, inbound string) string {
 }
 
 // plan orders the targets: healthy ones in configured order, then cooled-down
-// ones (soonest recovery first) as a last resort.
-func (g *Gateway) plan(snap *store.Snapshot, m *store.Model, inbound string) []candidate {
+// ones (soonest recovery first) as a last resort. Weighted groups are
+// ordered per request by orderGroup; affinity keeps a conversation on the
+// same member.
+func (g *Gateway) plan(snap *store.Snapshot, m *store.Model, inbound, affinity string) []candidate {
 	var healthy, cooling []candidate
-	for _, t := range m.Targets {
+	var targets []string
+	for _, entry := range m.Targets {
+		targets = append(targets, orderGroup(store.ParseTargetEntry(entry), affinity)...)
+	}
+	for _, t := range targets {
 		prefix, model := splitTarget(t)
 		p, ok := snap.Providers[prefix]
 		if !ok || !p.Enabled {
@@ -284,7 +296,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		writeError(w, inbound, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
-	if inbound == convert.ProtoEmbeddings {
+	if inbound == convert.ProtoEmbeddings || inbound == convert.ProtoRerank {
 		info.Stream = false
 	}
 	entry.RequestedModel, entry.Stream = info.Model, info.Stream
@@ -300,7 +312,11 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		writeError(w, inbound, http.StatusForbidden, fmt.Sprintf("this API key may not use model %q", m.Name))
 		return
 	}
-	cands := g.plan(snap, m, inbound)
+	affinity := ""
+	if conv := convert.ConversationKey(body); conv != "" {
+		affinity = strconv.FormatInt(key.ID, 10) + "\x00" + conv
+	}
+	cands := g.plan(snap, m, inbound, affinity)
 	if len(cands) == 0 {
 		entry.HTTPStatus, entry.Error = 503, "no enabled targets"
 		g.Alerts.Notify(alert.Alert{Event: alert.EventAllFailed, Subject: m.Name,
@@ -476,6 +492,13 @@ func openaiURL(base string) string {
 	return base + "/chat/completions"
 }
 
+func rerankURL(base string) string {
+	if strings.HasSuffix(base, "/rerank") {
+		return base
+	}
+	return strings.TrimSuffix(base, "/chat/completions") + "/rerank"
+}
+
 func embeddingsURL(base string) string {
 	if strings.HasSuffix(base, "/embeddings") {
 		return base
@@ -569,6 +592,8 @@ func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound st
 	switch c.proto {
 	case convert.ProtoEmbeddings:
 		url = embeddingsURL(c.provider.OpenAIBaseURL)
+	case convert.ProtoRerank:
+		url = rerankURL(c.provider.OpenAIBaseURL)
 	case convert.ProtoOpenAI:
 		url = openaiURL(c.provider.OpenAIBaseURL)
 	default:
@@ -939,7 +964,7 @@ func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	info, _ := convert.ParseRequestInfo(body)
 	if m := snap.ResolveModel(info.Model); m != nil && keyAllows(key, m.Name) {
-		for _, c := range g.plan(snap, m, convert.ProtoAnthropic) {
+		for _, c := range g.plan(snap, m, convert.ProtoAnthropic, "") {
 			if c.proto != convert.ProtoAnthropic || !c.openTill.IsZero() {
 				continue
 			}

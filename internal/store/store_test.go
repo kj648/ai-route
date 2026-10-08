@@ -481,3 +481,32 @@ func TestBodyRules(t *testing.T) {
 		t.Fatalf("no match: %v", names(r))
 	}
 }
+
+func TestTargetGroups(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, bad := range []string{"kimi", "kimi/k3*0 | glm/g", "kimi/k3*5000", " | "} {
+		if err := st.CreateModel(&Model{Name: "x", Targets: []string{bad}}); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+	mustNil(t, st.CreateProvider(&Provider{Prefix: "kimi", OpenAIBaseURL: "http://a/v1"}))
+	m := &Model{Name: "coder", Enabled: true, Targets: []string{" kimi/k3 *3|glm/g*1 | kimi/k3 ", "glm/g", "vertex/claude-opus-4-5@20251101"}}
+	mustNil(t, st.CreateModel(m))
+	if got := st.Snapshot().ResolveModel("coder").Targets; len(got) != 3 || got[0] != "kimi/k3*3 | glm/g" {
+		t.Fatalf("normalized: %q", got)
+	}
+	if ms := ParseTargetEntry("a/m*2 | b/n"); len(ms) != 2 || ms[0] != (TargetMember{"a/m", 2}) || ms[1] != (TargetMember{"b/n", 1}) {
+		t.Fatalf("parse: %+v", ms)
+	}
+	// renaming a prefix rewrites group members too
+	p := st.Snapshot().Providers["kimi"]
+	p.Prefix = "moon"
+	mustNil(t, st.UpdateProvider(p))
+	if got := st.Snapshot().ResolveModel("coder").Targets[0]; got != "moon/k3*3 | glm/g" {
+		t.Fatalf("after rename: %q", got)
+	}
+}

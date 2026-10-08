@@ -4,7 +4,7 @@
 
 - **两种协议都支持**：对外同时提供 OpenAI 兼容的 `/v1/chat/completions` 和 Anthropic 兼容的 `/v1/messages`（Claude Code 可以直接用）。上游有同协议端点就直通，没有就自动转换协议，流式和非流式都支持，包括工具调用和思考内容。
 - **供应商**：内置 40 个预设，覆盖编码套餐、各家官方按量 API、聚合平台，选中后自动填好地址、协议、常用模型和需要的请求头，也支持自定义；每个供应商可以单独设置 User-Agent 策略。填写 Key 后模型列表会自动从上游拉取，也可以手动增删。每个套餐有一个前缀，它的模型统一显示为 `前缀/模型名`，用来区分不同套餐。
-- **模型映射 + 调度顺序**：给模型起一个对外名字（如 `dess`），从全部 `前缀/模型名` 里点选要映射的模型并排好顺序，例如 `kimi/k3 → bailian/kimi-k3 → opencode/deepseek`。前一个不可用时自动切到下一个。
+- **模型映射 + 调度顺序**：给模型起一个对外名字（如 `dess`），从全部 `前缀/模型名` 里点选要映射的模型并排好顺序，例如 `kimi/k3 → bailian/kimi-k3 → opencode/deepseek`。前一个不可用时自动切到下一个。同一优先级可以放多个上游（比如同一家的多个 Key），按权重分流。
 - **先重试再切换**：遇到短暂错误（断连、5xx、上游过载、短时限流），先在同一个模型上按退避间隔重试，仍然失败才切换。这样网络抖动不会把会话切到别的套餐，避免提示词缓存失效和效果变差。
 - **熔断冷却**：套餐额度用尽或 Key 失效时，整个套餐冷却；模型在重试后仍连续失败时，这个模型冷却。冷却期间排到调度顺序最后兜底，冷却时长按指数退避。
 - **多个对外 Key**：可以给不同人、不同工具单独发 Key，单独停用，设置到期时间，限制可用模型，设置月预算和每分钟请求数 / tokens 上限。
@@ -119,6 +119,13 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 - **调度顺序**：在下方按套餐分组的模型里依次点选，点的先后就是调度顺序，之后可以用 ↑↓ 调整；再点一次就移除。不在列表里的模型，可以手动输入 `前缀/模型名`。
 - **别名**（可选）：支持 `*` 通配符。例如给 `fast` 加别名 `claude-*haiku*`，Claude Code 的后台小模型请求就会落到 `fast` 上。精确名称的优先级高于通配别名。
 
+#### 同级分流
+
+在调度顺序里勾选“与上一项并列”，可以把多个上游放在同一优先级，比如同一个套餐的两个 Key（各建一个供应商）。每个上游可以设置权重，存储为 `kimi/k3*3 | kimi-2/k3`。
+
+- **会话粘性**：按“API Key + 会话的第一条用户消息”做加权一致性哈希。同一个会话一直走同一个上游，保住提示词缓存；不同会话按权重分散到各个上游。没有用户消息的请求（向量、重排序）随机按权重分。
+- **同级兜底**：同级里的某个上游失败时，先切到同级的其他上游，再往下一个优先级走。
+
 示例：
 
 | 对外模型 | 调度顺序 |
@@ -126,6 +133,7 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 | `dess` | `kimi/k3` → `bailian/kimi-k3` → `opencode/deepseek` |
 | `coder` | `kimi/kimi-for-coding` → `glm/glm-5.3` → `bailian/qwen3.7-plus` → `volc/ark-code-latest` |
 | `fast` | `glm/glm-5.3-flash` → `volc/ark-code-latest` |
+| `kimi` | `kimi/k3*2 \| kimi-2/k3`（并列，2:1 分流）→ `bailian/kimi-k3` |
 
 #### 能力标签
 
@@ -162,10 +170,14 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 
 | 协议 | Base URL | 端点 |
 |---|---|---|
-| OpenAI 兼容 | `http://服务器:8080/v1` | `POST /v1/chat/completions`、`POST /v1/embeddings`、`GET /v1/models` |
+| OpenAI 兼容 | `http://服务器:8080/v1` | `POST /v1/chat/completions`、`POST /v1/embeddings`、`POST /v1/rerank`、`GET /v1/models` |
 | Anthropic 兼容 | `http://服务器:8080` | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
 
 鉴权方式：`Authorization: Bearer sk-route-…` 或 `x-api-key: sk-route-…` 都可以。
+
+“设置与接入”页面有**接入向导**：选好客户端（Claude Code、OpenCode、Cline / Roo Code / Kilo Code、Cherry Studio、OpenAI / Anthropic Python SDK、curl）、Key 和模型，就能生成可以直接复制的配置。
+
+`/v1/rerank` 和 `/v1/embeddings` 一样原样转发（只改写 `model`），发往上游的 `OpenAI 兼容地址 + /rerank`，兼容 Jina、Cohere、硅基流动、vLLM 的请求格式。用量按响应里的 `usage.total_tokens`、`meta.tokens.input_tokens` 或 `meta.billed_units.input_tokens` 记为输入 tokens。
 
 **Claude Code**
 
@@ -282,6 +294,7 @@ OpenAI 流式直通时，网关会自动向上游加上 `stream_options.include_
 | `internal/alert`、`internal/gateway/alerts_test.go` | 告警：飞书、钉钉的签名，企业微信、通用 JSON 的格式，机器人返回 200 但带错误码，静默去重；401/402、全部失败、无可用上游、长时间冷却四种触发 |
 | `internal/convert`（规则与 Claude 新模型）、`TestBodyRulesAppliedUpstream` | 请求参数规则的合并、删除、条件匹配；新版 Claude 的 adaptive thinking、effort 档位、去掉采样参数、强制工具改 auto |
 | `internal/gateway/selfhost_test.go` | 自建模型：并发满时溢出到下一个候补且不计失败、排队等待空位、不排队时返回 429、首包超时只作用于流式、健康检查连续失败移出调度并告警、恢复后加回 |
+| `internal/gateway/item7_test.go` 等 | 重排序转发与用量；同级分流的权重分布、会话粘性、同级兜底；目标分组的解析、校验和前缀改名 |
 | `internal/gateway/limits_test.go` | Key 限额：RPM、TPM、月预算的拦截与错误格式，被拒请求记日志且不发上游，重启后从日志恢复本月费用，切换统计货币，滑动窗口到期恢复 |
 | `internal/gateway/logs_test.go` | 请求日志：成功请求每个字段的取值（Key、请求模型与对外模型、实际上游、协议、用量、客户端 IP、耗时）；费用（单价、通配单价、缓存价、未配单价、OpenRouter 实际费用）；四种协议组合下流式的用量；各种失败（模型不存在、模型不允许、全部上游失败、流中断）；按条件筛选、分页和统计 |
 | `internal/admin/e2e_test.go` | 端到端：通过管理 API 创建供应商（自动前缀、重名去重、自动拉取模型）、模型映射和 Key（拒绝自定义值、重新生成），调用对外 API，再通过管理 API 查日志和统计 |
