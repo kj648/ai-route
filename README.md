@@ -6,9 +6,9 @@
 
 Kimi Code · GLM Coding Plan · 百炼 · 火山方舟 · OpenCode Go · OpenRouter · 自建 vLLM……一次接入，自动切换
 
-[![CI](https://github.com/OWNER/ai-route/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/ai-route/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/tag/OWNER/ai-route?label=release)](https://github.com/OWNER/ai-route/tags)
-[![Go](https://img.shields.io/github/go-mod/go-version/OWNER/ai-route)](go.mod)
+[![CI](https://github.com/kj648/ai-route/actions/workflows/ci.yml/badge.svg)](https://github.com/kj648/ai-route/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/tag/kj648/ai-route?label=release)](https://github.com/kj648/ai-route/tags)
+[![Go](https://img.shields.io/github/go-mod/go-version/kj648/ai-route)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -89,7 +89,7 @@ flowchart LR
 ### 方式一：Docker Compose（推荐）
 
 ```bash
-git clone https://github.com/OWNER/ai-route.git
+git clone https://github.com/kj648/ai-route.git
 cd ai-route
 cp .env.example .env        # 把 ADMIN_TOKEN 改成一串足够长的随机字符串
 docker compose up -d --build
