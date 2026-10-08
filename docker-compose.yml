@@ -2,9 +2,12 @@ services:
   ai-route:
     build:
       context: .
+      # 国内构建：在 .env 里设置这几项，见 .env.example
       args:
-        # 国内构建可改为 https://goproxy.cn,direct
-        GOPROXY: https://proxy.golang.org,direct
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        GO_IMAGE: ${GO_IMAGE:-golang:1.27-alpine}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-alpine:3.22}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-}
     image: ai-route:latest
     container_name: ai-route
     restart: unless-stopped

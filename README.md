@@ -25,7 +25,7 @@ cp .env.example .env        # 修改 ADMIN_TOKEN
 docker compose up -d --build
 ```
 
-在国内构建时，可以把 `docker-compose.yml` 里的 `GOPROXY` 改成 `https://goproxy.cn,direct`。
+在国内构建时，如果 Docker Hub、`proxy.golang.org` 或 Alpine 官方源访问不畅，可以把 `.env.example` 末尾那几行国内配置复制到 `.env` 里，取消注释：Go 模块走 `goproxy.cn`，基础镜像走 DaoCloud 镜像站（`m.daocloud.io/docker.io/library/…`），Alpine 软件源走阿里云。也可以先手动拉好基础镜像（`docker pull golang:1.27-alpine`、`docker pull alpine:3.22`），再构建。
 
 打开 `http://服务器:8080/admin/`，用 `ADMIN_TOKEN` 登录。数据保存在 `ai-route-data` 卷里。
 

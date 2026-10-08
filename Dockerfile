@@ -1,5 +1,10 @@
-# syntax=docker/dockerfile:1
-FROM golang:1.27-alpine AS build
+# Base images, the Go module proxy and the Alpine package mirror can be
+# overridden (see .env.example) when Docker Hub / proxy.golang.org are slow
+# or unreachable, e.g. in mainland China.
+ARG GO_IMAGE=golang:1.27-alpine
+ARG RUNTIME_IMAGE=alpine:3.22
+
+FROM ${GO_IMAGE} AS build
 ARG GOPROXY=https://proxy.golang.org,direct
 ENV GOPROXY=${GOPROXY} CGO_ENABLED=0
 WORKDIR /src
@@ -8,8 +13,10 @@ RUN go mod download
 COPY . .
 RUN go build -trimpath -ldflags="-s -w" -o /out/ai-route .
 
-FROM alpine:3.22
-RUN apk add --no-cache ca-certificates && adduser -D -u 10001 app && mkdir -p /data && chown app /data
+FROM ${RUNTIME_IMAGE}
+ARG ALPINE_MIRROR=
+RUN if [ -n "$ALPINE_MIRROR" ]; then sed -i "s#https\?://dl-cdn.alpinelinux.org#${ALPINE_MIRROR}#g" /etc/apk/repositories; fi \
+ && apk add --no-cache ca-certificates && adduser -D -u 10001 app && mkdir -p /data && chown app /data
 COPY --from=build /out/ai-route /usr/local/bin/ai-route
 USER app
 ENV LISTEN=:8080 DATA_DIR=/data
