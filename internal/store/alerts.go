@@ -43,6 +43,8 @@ type AlertConfig struct {
 	// SilenceMinutes: the same alert (same event and subject) is sent at
 	// most once per this many minutes.
 	SilenceMinutes int `json:"silence_minutes"`
+	// Language of the pushed messages: "zh" (default) or "en".
+	Language string `json:"language"`
 }
 
 func DefaultAlertConfig() AlertConfig {
@@ -54,6 +56,7 @@ func DefaultAlertConfig() AlertConfig {
 		LongCooldownMinutes: 10,
 		OnHealthCheck:       true,
 		SilenceMinutes:      30,
+		Language:            "zh",
 	}
 }
 
@@ -64,6 +67,13 @@ func normalizeAlerts(a *AlertConfig) error {
 	}
 	if a.SilenceMinutes <= 0 {
 		a.SilenceMinutes = d.SilenceMinutes
+	}
+	switch a.Language = strings.ToLower(strings.TrimSpace(a.Language)); a.Language {
+	case "zh", "en":
+	case "":
+		a.Language = d.Language
+	default:
+		return fmt.Errorf("language must be zh or en, got %q", a.Language)
 	}
 	hooks := []Webhook{}
 	for i, h := range a.Webhooks {

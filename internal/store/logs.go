@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Attempt records one upstream try within a request.
@@ -136,6 +137,11 @@ func (s *Store) insertLogs(batch []*RequestLog) error {
 	}
 	defer stmt.Close()
 	for _, l := range batch {
+		// client-supplied strings are capped so a request cannot bloat the log
+		l := *l
+		l.RequestedModel, l.PublicModel = clip(l.RequestedModel, 256), clip(l.PublicModel, 256)
+		l.KeyName, l.ClientIP, l.RequestID = clip(l.KeyName, 128), clip(l.ClientIP, 64), clip(l.RequestID, 64)
+		l.Provider, l.UpstreamModel, l.Error = clip(l.Provider, 128), clip(l.UpstreamModel, 256), clip(l.Error, 2000)
 		attempts := l.Attempts // never mutate: callers may still read the entry
 		if attempts == nil {
 			attempts = []Attempt{}
@@ -153,9 +159,27 @@ func (s *Store) cleanupLogs() {
 		return
 	}
 	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
-	if _, err := s.db.Exec(`DELETE FROM request_logs WHERE created_at < ?`, cutoff); err != nil {
+	res, err := s.db.Exec(`DELETE FROM request_logs WHERE created_at < ?`, cutoff)
+	if err != nil {
 		log.Printf("cleanup logs: %v", err)
+		return
 	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		// give the freed pages back to the file system
+		_, _ = s.db.Exec(`PRAGMA incremental_vacuum`)
+		_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	}
+}
+
+// clip shortens s to at most n bytes without splitting a UTF-8 character.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }
 
 type LogQuery struct {

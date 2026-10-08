@@ -168,3 +168,14 @@ func TestNotifySilenceAndSwitches(t *testing.T) {
 		t.Fatal("enabled without any webhook")
 	}
 }
+
+func TestSendEnglishTimeLabel(t *testing.T) {
+	s := newSink(t, `{"errcode":0}`)
+	n := notifier(store.AlertConfig{Language: "en"})
+	if err := n.Send(context.Background(), store.Webhook{Type: store.WebhookWeCom, URL: s.srv.URL}, Alert{Title: "T", Text: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if c := s.all()[0].body["text"].(map[string]any)["content"].(string); !strings.Contains(c, "\nTime: 2026-10-08 09:30:00") {
+		t.Fatalf("content: %q", c)
+	}
+}

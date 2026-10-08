@@ -40,6 +40,9 @@ func main() {
 	}
 
 	token := os.Getenv("ADMIN_TOKEN")
+	if token != "" && (len(token) < 16 || token == "change-me-to-a-long-random-string") {
+		log.Fatalf("ADMIN_TOKEN is too weak: use at least 16 random characters (e.g. `openssl rand -hex 24`), not the example value")
+	}
 	if token == "" {
 		if t, ok := st.GetKV("admin_token"); ok {
 			token = t

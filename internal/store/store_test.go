@@ -3,9 +3,11 @@ package store
 import (
 	"encoding/json"
 	"math"
+	"os"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestGlobMatch(t *testing.T) {
@@ -572,5 +574,30 @@ func TestProviderHeaderTemplates(t *testing.T) {
 	}
 	if p["mine"].Headers["x-opencode-session"] != "my-own" {
 		t.Fatalf("custom value changed: %v", p["mine"].Headers)
+	}
+}
+
+func TestLogFieldsClippedAndFilesPrivate(t *testing.T) {
+	dir := t.TempDir() + "/data"
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	st.insertLogs([]*RequestLog{{CreatedAt: time.Now().UnixMilli(), RequestedModel: strings.Repeat("模", 1000), Error: strings.Repeat("e", 10000)}})
+	logs, _, _ := st.QueryLogs(LogQuery{})
+	if len(logs[0].RequestedModel) > 260 || !utf8.ValidString(logs[0].RequestedModel) || len(logs[0].Error) > 2010 {
+		t.Fatalf("not clipped: %d %d", len(logs[0].RequestedModel), len(logs[0].Error))
+	}
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("data dir mode %v", fi.Mode().Perm())
+	}
+	if fi, _ := os.Stat(dir + "/ai-route.db"); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("db mode %v", fi.Mode().Perm())
+	}
+	var mode int
+	_ = st.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode)
+	if mode != 2 {
+		t.Fatalf("auto_vacuum = %d, want incremental", mode)
 	}
 }

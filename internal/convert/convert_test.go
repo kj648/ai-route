@@ -417,3 +417,21 @@ func TestConversationKey(t *testing.T) {
 		t.Fatalf("responses: %q %q", r1, r2)
 	}
 }
+
+func TestSSEReaderRejectsHugeEvents(t *testing.T) {
+	huge := "data: " + strings.Repeat("x", MaxEventBytes+10) + "\n\n"
+	if _, err := NewSSEReader(strings.NewReader(huge)).Next(); err != ErrEventTooLarge {
+		t.Fatalf("one huge line: %v", err)
+	}
+	var sb strings.Builder
+	for n := 0; n <= MaxEventBytes; n += 1 << 16 {
+		sb.WriteString("data: " + strings.Repeat("y", 1<<16) + "\n")
+	}
+	if _, err := NewSSEReader(strings.NewReader(sb.String() + "\n")).Next(); err != ErrEventTooLarge {
+		t.Fatalf("many data lines: %v", err)
+	}
+	ev, err := NewSSEReader(strings.NewReader("event: a\ndata: ok\n\n")).Next()
+	if err != nil || ev.Data != "ok" || ev.Event != "a" {
+		t.Fatalf("normal event: %+v %v", ev, err)
+	}
+}

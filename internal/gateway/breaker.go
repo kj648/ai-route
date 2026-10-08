@@ -19,6 +19,25 @@ const (
 	failProviderHard                 // cool down the whole provider (quota / auth problems)
 )
 
+// classifyResponse refines classifyStatus with the response: a 429 or 404
+// caused by the request itself (too large, context too long) must not let
+// one client cool down a provider everybody uses, and a short 429 is a
+// passing rate limit rather than an exhausted plan.
+func classifyResponse(status int, retryAfter time.Duration, body []byte) failKind {
+	if status == 429 || status == 404 || status == 413 {
+		lower := strings.ToLower(string(body))
+		for _, hint := range []string{"too large", "too long", "context_length", "context length", "maximum context", "max_tokens", "reduce the length"} {
+			if strings.Contains(lower, hint) {
+				return failIgnore
+			}
+		}
+	}
+	if status == 429 && retryAfter <= maxRetryAfter {
+		return failSoft
+	}
+	return classifyStatus(status)
+}
+
 func classifyStatus(status int) failKind {
 	switch {
 	case status == 401 || status == 402 || status == 429:

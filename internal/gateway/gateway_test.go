@@ -95,6 +95,26 @@ func (m *mockUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		if req.Stream {
 			time.Sleep(1500 * time.Millisecond)
 		}
+	case "fail429short": // rate limited, no Retry-After
+		http.Error(w, `{"error":{"message":"slow down"}}`, 429)
+		return
+	case "fail429big": // the request itself is too large for the plan's TPM
+		http.Error(w, `{"error":{"message":"Request too large for model: tokens per min limit 30000, requested 90000"}}`, 429)
+		return
+	case "slowstream": // a stream long enough for a client to leave halfway
+		if req.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			for i := 0; i < 20; i++ {
+				fmt.Fprintf(w, "data: %s\n\n", `{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`)
+				w.(http.Flusher).Flush()
+				time.Sleep(30 * time.Millisecond)
+			}
+			fmt.Fprintf(w, "data: %s\n\n", `{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
+			fmt.Fprintf(w, "data: %s\n\n", `{"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":77,"completion_tokens":20,"total_tokens":97}}`)
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
 	case "fail401":
 		http.Error(w, `{"error":{"message":"invalid api key"}}`, 401)
 		return

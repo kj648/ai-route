@@ -2,6 +2,10 @@
 
 // Provider preset catalog for the "add provider" dialog.
 //
+// Displayed text (name, note, ua.note, category and tag labels) is the Chinese
+// source string; the console translates it with t() when rendering, so every
+// such string needs an entry in I18N_EN (web/i18n.js).
+//
 // Fields:
 //   id         stable identifier, saved as provider.vendor
 //   category   coding (subscription coding plans) | official (pay-as-you-go
@@ -370,7 +374,8 @@ const TAG_INDEX = {};
 for (const g of TAG_GROUPS) for (const [id, label, desc] of g.items) TAG_INDEX[id] = { id, label, desc, group: g.id };
 const TAG_ORDER = TAG_GROUPS.flatMap((g) => g.items.map(([id]) => id));
 
-function tagInfo(t) { return TAG_INDEX[t] || { id: t, label: t, desc: '自定义标签', group: 'custom' }; }
+// labels and descriptions are the Chinese source text: translate with t() on display
+function tagInfo(tag) { return TAG_INDEX[tag] || { id: tag, label: tag, desc: t('自定义标签'), group: 'custom' }; }
 function sortTags(tags) {
   return [...tags].sort((a, b) => {
     const ia = TAG_ORDER.indexOf(a), ib = TAG_ORDER.indexOf(b);

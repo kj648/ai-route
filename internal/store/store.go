@@ -162,8 +162,12 @@ type APIKey struct {
 	MonthlyBudget float64 `json:"monthly_budget"`
 	RPM           int     `json:"rpm"`
 	TPM           int     `json:"tpm"`
-	CreatedAt     int64   `json:"created_at"`
-	LastUsedAt    int64   `json:"last_used_at"`
+	// MaxConcurrency caps the key's in-flight requests (0 = unlimited). With
+	// a budget or TPM it also bounds how far concurrent requests can
+	// overshoot, since those are only checked when a request starts.
+	MaxConcurrency int   `json:"max_concurrency"`
+	CreatedAt      int64 `json:"created_at"`
+	LastUsedAt     int64 `json:"last_used_at"`
 }
 
 // Settings are global tunables.
@@ -259,9 +263,11 @@ type Store struct {
 }
 
 func Open(dataDir string) (*Store, error) {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	// the database holds upstream keys: keep it private to this user
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
 	}
+	_ = os.Chmod(dataDir, 0o700)
 	dsn := "file:" + filepath.Join(dataDir, "ai-route.db") +
 		"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)"
 	db, err := sql.Open("sqlite", dsn)
@@ -274,12 +280,36 @@ func Open(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	if err := s.enableIncrementalVacuum(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("vacuum: %w", err)
+	}
+	for _, f := range []string{"ai-route.db", "ai-route.db-wal", "ai-route.db-shm"} {
+		_ = os.Chmod(filepath.Join(dataDir, f), 0o600)
+	}
 	if err := s.Reload(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	go s.logWriter()
 	return s, nil
+}
+
+// enableIncrementalVacuum lets log cleanup shrink the file. Switching an
+// existing database needs one full VACUUM, done once.
+func (s *Store) enableIncrementalVacuum() error {
+	var mode int
+	if err := s.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		return err
+	}
+	if mode == 2 { // incremental
+		return nil
+	}
+	if _, err := s.db.Exec(`PRAGMA auto_vacuum = INCREMENTAL`); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`VACUUM`)
+	return err
 }
 
 func (s *Store) Close() error {
@@ -344,6 +374,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
 	monthly_budget REAL NOT NULL DEFAULT 0,
 	rpm INTEGER NOT NULL DEFAULT 0,
 	tpm INTEGER NOT NULL DEFAULT 0,
+	max_concurrency INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL,
 	last_used_at INTEGER NOT NULL DEFAULT 0
 );
@@ -418,6 +449,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_a
 		{"monthly_budget", `REAL NOT NULL DEFAULT 0`},
 		{"rpm", `INTEGER NOT NULL DEFAULT 0`},
 		{"tpm", `INTEGER NOT NULL DEFAULT 0`},
+		{"max_concurrency", `INTEGER NOT NULL DEFAULT 0`},
 	} {
 		if err := s.ensureColumn("api_keys", c[0], c[1]); err != nil {
 			return err
@@ -1093,13 +1125,13 @@ func (s *Store) DeleteModel(id int64) error {
 
 // ---------- api keys ----------
 
-const keyCols = `id, name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, created_at, last_used_at`
+const keyCols = `id, name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at, last_used_at`
 
 func scanKey(sc interface{ Scan(...any) error }) (*APIKey, error) {
 	k := &APIKey{}
 	var allowed string
 	var enabled int
-	if err := sc.Scan(&k.ID, &k.Name, &k.Key, &enabled, &allowed, &k.ExpiresAt, &k.MonthlyBudget, &k.RPM, &k.TPM, &k.CreatedAt, &k.LastUsedAt); err != nil {
+	if err := sc.Scan(&k.ID, &k.Name, &k.Key, &enabled, &allowed, &k.ExpiresAt, &k.MonthlyBudget, &k.RPM, &k.TPM, &k.MaxConcurrency, &k.CreatedAt, &k.LastUsedAt); err != nil {
 		return nil, err
 	}
 	k.Enabled = enabled == 1
@@ -1142,8 +1174,8 @@ func NewAPIKeyValue() string { return RandomToken("sk-route-", 24) }
 func normalizeKey(k *APIKey) error {
 	k.Name = strings.TrimSpace(k.Name)
 	k.AllowedModels = cleanList(k.AllowedModels)
-	if k.MonthlyBudget < 0 || k.RPM < 0 || k.TPM < 0 {
-		return errors.New("monthly_budget, rpm and tpm must not be negative")
+	if k.MonthlyBudget < 0 || k.RPM < 0 || k.TPM < 0 || k.MaxConcurrency < 0 {
+		return errors.New("monthly_budget, rpm, tpm and max_concurrency must not be negative")
 	}
 	return nil
 }
@@ -1156,8 +1188,8 @@ func (s *Store) CreateKey(k *APIKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := now()
-	res, err := s.db.Exec(`INSERT INTO api_keys (name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
-		k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, t)
+	res, err := s.db.Exec(`INSERT INTO api_keys (name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.MaxConcurrency, t)
 	if err != nil {
 		return friendlyErr(err)
 	}
@@ -1174,8 +1206,8 @@ func (s *Store) UpdateKey(k *APIKey) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`UPDATE api_keys SET name=?, enabled=?, allowed_models=?, expires_at=?, monthly_budget=?, rpm=?, tpm=? WHERE id=?`,
-		k.Name, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.ID)
+	res, err := s.db.Exec(`UPDATE api_keys SET name=?, enabled=?, allowed_models=?, expires_at=?, monthly_budget=?, rpm=?, tpm=?, max_concurrency=? WHERE id=?`,
+		k.Name, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.MaxConcurrency, k.ID)
 	if err != nil {
 		return friendlyErr(err)
 	}
@@ -1382,8 +1414,8 @@ func (s *Store) Import(e *Export) error {
 		if k.ID > 0 {
 			id = k.ID
 		}
-		if _, err := tx.Exec(`INSERT INTO api_keys (id, name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-			id, k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, t); err != nil {
+		if _, err := tx.Exec(`INSERT INTO api_keys (id, name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			id, k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.MaxConcurrency, t); err != nil {
 			return friendlyErr(err)
 		}
 	}

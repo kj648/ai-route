@@ -45,7 +45,8 @@ func TestKeyRPMLimit(t *testing.T) {
 		t.Fatalf("rejected request reached the upstream: %d hits", hits)
 	}
 	l := h.logs()[0]
-	if l.HTTPStatus != 429 || l.KeyName != "limited" || l.RequestedModel != "coder" || l.Inbound != "anthropic" || l.Provider != "" {
+	// rejected before the body is read: no model recorded, nothing sent upstream
+	if l.HTTPStatus != 429 || l.KeyName != "limited" || l.RequestedModel != "" || l.Inbound != "anthropic" || l.Provider != "" {
 		t.Fatalf("rejection log: %+v", l)
 	}
 	// other keys are not affected

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"time"
@@ -27,13 +28,41 @@ func NewSSEReader(r io.Reader) *SSEReader {
 	return &SSEReader{r: bufio.NewReaderSize(r, 64*1024)}
 }
 
+// MaxEventBytes caps a single SSE line and a single event, so a broken or
+// hostile upstream cannot make the gateway buffer unbounded memory.
+const MaxEventBytes = 8 << 20
+
+// ErrEventTooLarge is returned when an event exceeds MaxEventBytes.
+var ErrEventTooLarge = errors.New("upstream stream event too large")
+
+// readLine reads one line without its terminator, refusing lines longer
+// than MaxEventBytes.
+func (s *SSEReader) readLine() (string, error) {
+	var buf []byte
+	for {
+		chunk, err := s.r.ReadSlice('\n')
+		if len(buf)+len(chunk) > MaxEventBytes {
+			return "", ErrEventTooLarge
+		}
+		buf = append(buf, chunk...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return string(buf), err
+	}
+}
+
 // Next returns the next event, or io.EOF when the stream ends.
 func (s *SSEReader) Next() (SSEEvent, error) {
 	var ev SSEEvent
 	var data []string
+	size := 0
 	hasData := false
 	for {
-		line, err := s.r.ReadString('\n')
+		line, err := s.readLine()
+		if err == ErrEventTooLarge {
+			return SSEEvent{}, err
+		}
 		if len(line) > 0 {
 			line = strings.TrimRight(line, "\r\n")
 			switch {
@@ -46,7 +75,11 @@ func (s *SSEReader) Next() (SSEEvent, error) {
 			case strings.HasPrefix(line, ":"):
 				// comment / keep-alive
 			case strings.HasPrefix(line, "data:"):
-				data = append(data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+				d := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
+				if size += len(d); size > MaxEventBytes {
+					return SSEEvent{}, ErrEventTooLarge
+				}
+				data = append(data, d)
 				hasData = true
 			case strings.HasPrefix(line, "event:"):
 				ev.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))

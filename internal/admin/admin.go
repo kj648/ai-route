@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ai-route/internal/alert"
@@ -23,6 +25,60 @@ type Admin struct {
 	gw    *gateway.Gateway
 	token string
 	web   fs.FS
+
+	failMu sync.Mutex
+	fails  map[string]*authFailures // by client IP
+}
+
+// authFailures counts wrong admin tokens from one IP within a window.
+type authFailures struct {
+	count int
+	since time.Time
+}
+
+const (
+	maxAuthFailures   = 10
+	authFailureWindow = time.Minute
+)
+
+// tooManyFailures reports whether ip is locked out and for how long.
+func (a *Admin) tooManyFailures(ip string) (bool, time.Duration) {
+	a.failMu.Lock()
+	defer a.failMu.Unlock()
+	f, ok := a.fails[ip]
+	if !ok {
+		return false, 0
+	}
+	left := authFailureWindow - time.Since(f.since)
+	if left <= 0 {
+		delete(a.fails, ip)
+		return false, 0
+	}
+	return f.count >= maxAuthFailures, left
+}
+
+func (a *Admin) recordFailure(ip string) {
+	a.failMu.Lock()
+	defer a.failMu.Unlock()
+	if a.fails == nil || len(a.fails) > 10000 {
+		a.fails = map[string]*authFailures{} // bounded: forget everything rather than grow
+	}
+	f, ok := a.fails[ip]
+	if !ok || time.Since(f.since) > authFailureWindow {
+		f = &authFailures{since: time.Now()}
+		a.fails[ip] = f
+	}
+	f.count++
+}
+
+// remoteIP is the TCP peer: X-Forwarded-For could be forged to dodge the
+// lockout.
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func New(s *store.Store, gw *gateway.Gateway, token string, web fs.FS) *Admin {
@@ -77,7 +133,13 @@ func (a *Admin) Register(mux *http.ServeMux) {
 	// no-cache: embedded files carry no modification time, so without it
 	// browsers keep serving the old console after an upgrade
 	mux.Handle("/admin/", http.StripPrefix("/admin/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
+		h := w.Header()
+		h.Set("Cache-Control", "no-cache")
+		// the console only loads its own files; no framing (clickjacking)
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
 		static.ServeHTTP(w, r)
 	})))
 	mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
@@ -90,8 +152,15 @@ func (a *Admin) Register(mux *http.ServeMux) {
 
 func (a *Admin) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := remoteIP(r)
+		if locked, left := a.tooManyFailures(ip); locked {
+			w.Header().Set("Retry-After", strconv.Itoa(int(left.Seconds())+1))
+			writeErr(w, http.StatusTooManyRequests, errors.New("too many failed logins, try again later"))
+			return
+		}
 		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if subtle.ConstantTimeCompare([]byte(tok), []byte(a.token)) != 1 {
+			a.recordFailure(ip)
 			writeErr(w, http.StatusUnauthorized, errors.New("unauthorized"))
 			return
 		}
@@ -530,7 +599,9 @@ func (a *Admin) testAlert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := a.gw.Alerts.Send(r.Context(), c.Webhooks[0], alert.Alert{Event: alert.EventTest, Subject: "test",
-		Title: "测试消息", Text: "告警通知配置成功。上游鉴权失败、整条调度链全部失败、长时间冷却时会推送到这里。"})
+		Title: a.gw.Alerts.Pick("测试消息", "Test message"),
+		Text: a.gw.Alerts.Pick("告警通知配置成功。上游鉴权失败、整条调度链全部失败、长时间冷却时会推送到这里。",
+			"Alerts are set up. Upstream authentication failures, exhausted routing chains and long cooldowns will be posted here.")})
 	if err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 		return

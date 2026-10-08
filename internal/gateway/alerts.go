@@ -15,22 +15,26 @@ func (g *Gateway) failure(c candidate, kind failKind, retryAfter time.Duration, 
 	opened, cooldown := g.Breaker.Failure(c.prefix, c.target, kind, retryAfter, msg)
 	switch {
 	case status == 401 || status == 402:
-		what := "鉴权失败（Key 无效或已被吊销）"
+		n := g.Alerts
+		what := n.Pick("鉴权失败（Key 无效或已被吊销）", "authentication failed (key invalid or revoked)")
 		if status == 402 {
-			what = "欠费或额度不足"
+			what = n.Pick("欠费或额度不足", "out of credit or quota")
 		}
-		g.Alerts.Notify(alert.Alert{Event: alert.EventAuthFailure, Subject: c.prefix,
-			Title: fmt.Sprintf("供应商 %s %s", c.prefix, what),
-			Text: fmt.Sprintf("上游 %s 返回 HTTP %d：%s\n整个套餐已冷却 %s，期间请求会切到其他候补。请检查 Key 或账户余额。",
-				c.target, status, truncate(msg, 300), fmtDuration(cooldown))})
+		dur := fmtDuration(cooldown, n.English())
+		n.Notify(alert.Alert{Event: alert.EventAuthFailure, Subject: c.prefix,
+			Title: fmt.Sprintf(n.Pick("供应商 %s %s", "Provider %s: %s"), c.prefix, what),
+			Text: fmt.Sprintf(n.Pick("上游 %s 返回 HTTP %d：%s\n整个套餐已冷却 %s，期间请求会切到其他候补。请检查 Key 或账户余额。",
+				"Upstream %s returned HTTP %d: %s\nThe whole provider is cooling down for %s; requests go to fallbacks meanwhile. Check the key or the account balance."),
+				c.target, status, truncate(msg, 300), dur)})
 	case opened != "" && cooldown >= g.Alerts.LongCooldown():
-		name, scope := strings.TrimPrefix(opened, "t:"), "模型"
+		n := g.Alerts
+		name, scope := strings.TrimPrefix(opened, "t:"), n.Pick("模型", "Model")
 		if strings.HasPrefix(opened, "p:") {
-			name, scope = strings.TrimPrefix(opened, "p:"), "整个套餐"
+			name, scope = strings.TrimPrefix(opened, "p:"), n.Pick("整个套餐", "Provider")
 		}
-		g.Alerts.Notify(alert.Alert{Event: alert.EventLongCooldown, Subject: opened,
-			Title: fmt.Sprintf("%s %s 冷却 %s", scope, name, fmtDuration(cooldown)),
-			Text:  fmt.Sprintf("最近一次失败（%s，HTTP %d）：%s", c.target, status, truncate(msg, 300))})
+		n.Notify(alert.Alert{Event: alert.EventLongCooldown, Subject: opened,
+			Title: fmt.Sprintf(n.Pick("%s %s 冷却 %s", "%s %s cooling down for %s"), scope, name, fmtDuration(cooldown, n.English())),
+			Text:  fmt.Sprintf(n.Pick("最近一次失败（%s，HTTP %d）：%s", "Last failure (%s, HTTP %d): %s"), c.target, status, truncate(msg, 300))})
 	}
 }
 
@@ -41,19 +45,26 @@ func (g *Gateway) alertAllFailed(model string, attempts []store.Attempt) {
 		if a.HTTPStatus > 0 {
 			status = fmt.Sprintf("HTTP %d", a.HTTPStatus)
 		}
-		lines = append(lines, fmt.Sprintf("· %s %s：%s", a.Target, status, truncate(a.Error, 150)))
+		lines = append(lines, fmt.Sprintf("· %s %s: %s", a.Target, status, truncate(a.Error, 150)))
 	}
-	g.Alerts.Notify(alert.Alert{Event: alert.EventAllFailed, Subject: model,
-		Title: fmt.Sprintf("模型 %s 的全部上游都失败了", model),
-		Text:  "客户端收到了错误。各次尝试：\n" + strings.Join(lines, "\n")})
+	n := g.Alerts
+	n.Notify(alert.Alert{Event: alert.EventAllFailed, Subject: model,
+		Title: fmt.Sprintf(n.Pick("模型 %s 的全部上游都失败了", "All upstreams of model %s failed"), model),
+		Text:  n.Pick("客户端收到了错误。各次尝试：\n", "The client got an error. Attempts:\n") + strings.Join(lines, "\n")})
 }
 
-func fmtDuration(d time.Duration) string {
+func fmtDuration(d time.Duration, en bool) string {
 	switch {
+	case d >= time.Hour && en:
+		return fmt.Sprintf("%.1f h", d.Hours())
 	case d >= time.Hour:
 		return fmt.Sprintf("%.1f 小时", d.Hours())
+	case d >= time.Minute && en:
+		return fmt.Sprintf("%d min", int(d.Minutes()+0.5))
 	case d >= time.Minute:
 		return fmt.Sprintf("%d 分钟", int(d.Minutes()+0.5))
+	case en:
+		return fmt.Sprintf("%d s", int(d.Seconds()))
 	default:
 		return fmt.Sprintf("%d 秒", int(d.Seconds()))
 	}

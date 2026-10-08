@@ -1,0 +1,490 @@
+<div align="center">
+
+# AI Route
+
+**Turn your pile of LLM subscriptions and API keys into one reliable, well-managed endpoint**
+
+Kimi Code · GLM Coding Plan · Alibaba Bailian · Volcengine Ark · OpenCode Go · OpenRouter · OpenAI · Anthropic · your own vLLM … connect once, fail over automatically
+
+[![CI](https://github.com/kj648/ai-route/actions/workflows/ci.yml/badge.svg)](https://github.com/kj648/ai-route/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/tag/kj648/ai-route?label=release)](https://github.com/kj648/ai-route/tags)
+[![Go](https://img.shields.io/github/go-mod/go-version/kj648/ai-route)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+[简体中文](README.md) | English
+
+</div>
+
+![Console overview](docs/images/en/dashboard.png)
+
+AI Route is a self-hosted LLM API gateway. You add the endpoints and keys of your providers, give a model a public name, put upstreams in the order you want them tried, and hand out gateway keys to yourself and your team. Claude Code, Codex, Cline-style IDE extensions, Cherry Studio and any OpenAI or Anthropic SDK only talk to this one address; the gateway picks the upstream, converts the protocol, retries and fails over, enforces limits, tracks cost and alerts you when something breaks.
+
+It is a single Go binary with an embedded SQLite database and web console, no external dependencies. `docker compose up -d` and you are running. The console speaks English and Chinese.
+
+## Why
+
+If you use several coding plans or pay-as-you-go APIs at once, you have probably hit these:
+
+- **Every client is configured separately**: Claude Code one way, Codex another, Cherry Studio a third; switching a provider means editing all of them.
+- **Quota runs out or a key dies mid-task**: you get a 429 halfway through and have to stop and reconfigure.
+- **Protocols don't match**: Claude Code only speaks the Anthropic protocol, Codex only the OpenAI Responses API, while your providers may offer only an OpenAI endpoint or only an Anthropic one.
+- **Shared use is a black box**: who used how much, what it cost, and who may use which model is unclear.
+
+AI Route was written to solve exactly that.
+
+## Features
+
+**One endpoint, three protocols**
+- OpenAI `/v1/chat/completions` and `/v1/responses`, Anthropic `/v1/messages`, plus `/v1/embeddings`, `/v1/rerank` and `/v1/models`.
+- Same-protocol upstreams are passed through; otherwise requests are converted on the fly, streaming and non-streaming, including tool calls, reasoning, images and prompt-cache markers.
+- 40 built-in provider presets (coding plans, official APIs, aggregators) that fill in endpoints, protocol rules and required headers.
+
+**Smart routing**
+- Give a model a public name (e.g. `coder`) and map it to an ordered list of upstreams; when one is unavailable the next one takes over.
+- Retry before failing over: network blips, 5xx and short rate limits are retried on the same upstream first, so a conversation is not moved elsewhere and its prompt cache survives.
+- Circuit breaker: when quota runs out or a key is invalid, the whole provider cools down and is only used as a last resort; cooldowns back off exponentially.
+- Weighted groups: put several upstreams (e.g. two keys of the same plan) on the same priority with weights; one conversation always sticks to the same member.
+
+**Management and cost**
+- Multiple client keys with allowed models, expiry, monthly budget, requests per minute and tokens per minute.
+- Request logs show which upstream actually answered, how many fallbacks happened, latency, time to first token, usage and cost.
+- Cost tracking: set unit prices for pay-as-you-go models, OpenRouter's actual charge is used directly; the overview breaks cost down by model, upstream, provider and key.
+- Alerts to Feishu/Lark, DingTalk, WeCom or any webhook, in English or Chinese.
+
+**Self-hosting and extensibility**
+- Self-hosted models (vLLM, SGLang, Ollama …): concurrency cap with overflow, active health checks and a separate first-token timeout.
+- Header templates: forward the caller's headers or generate values such as a per-conversation session id.
+- Request body rules: inject or remove parameters per model, e.g. turn off thinking for Bailian Qwen3 non-stream calls.
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph C[Clients]
+        CC[Claude Code<br/>Anthropic protocol]
+        CX[Codex CLI<br/>Responses API]
+        OT[Cherry Studio / SDKs / IDE extensions<br/>OpenAI protocol]
+    end
+    subgraph G[AI Route]
+        AUTH[Auth · rate limits · budget]
+        MAP[Model mapping<br/>coder → routing order]
+        CONV[Protocol conversion]
+        RETRY[Retry · fail over · circuit breaker]
+    end
+    subgraph U[Upstreams]
+        K[Kimi Code]
+        GL[GLM Coding Plan]
+        O[OpenCode Go]
+        V[Self-hosted vLLM]
+    end
+    CC & CX & OT --> AUTH --> MAP --> CONV --> RETRY
+    RETRY -->|primary| K
+    RETRY -.->|on failure| GL
+    RETRY -.-> O
+    RETRY -.-> V
+```
+
+For every request: check the gateway key and its limits → find the mapping for the requested `model` → pick upstreams in routing order (cooling ones last) → convert to the upstream's protocol → send it, retrying transient errors before moving to the next upstream → convert the response back to the client's protocol → record the log and cost.
+
+## Quick start
+
+### Docker Compose (recommended)
+
+```bash
+git clone https://github.com/kj648/ai-route.git
+cd ai-route
+cp .env.example .env        # set ADMIN_TOKEN to a long random string
+docker compose up -d --build
+```
+
+Open `http://your-server:8080/admin/` and log in with `ADMIN_TOKEN`. Data lives in the Docker volume `ai-route-data` and survives container rebuilds. The console follows your browser language; switch between English and 中文 at the bottom of the sidebar.
+
+> Building in mainland China: if Docker Hub, `proxy.golang.org` or the Alpine mirrors are slow or unreachable, copy the commented block at the end of `.env.example` into `.env` (goproxy.cn, the DaoCloud image mirror and the Aliyun Alpine mirror).
+
+### Run the binary
+
+Requires Go 1.27 or newer:
+
+```bash
+go build -o bin/ai-route .
+ADMIN_TOKEN=your-token ./bin/ai-route                 # listens on :8080, data in ./data
+./bin/ai-route -listen :9000 -data /var/lib/ai-route  # flags work too
+```
+
+Without `ADMIN_TOKEN`, the first start generates an `admin-xxxx` token, prints it to the log and stores it in the database.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LISTEN` | `:8080` | Listen address |
+| `DATA_DIR` | `./data` | SQLite data directory |
+| `ADMIN_TOKEN` | generated | Admin console token |
+| `HTTPS_PROXY` / `HTTP_PROXY` | – | Proxy used to reach upstreams |
+
+### Five minutes to first request
+
+1. **Add a provider**: on *Providers*, click *Add provider*, pick a preset (e.g. OpenRouter or Kimi Code) and enter the key. The model list is fetched from the upstream; if that is not supported, type the model names.
+2. **Create a model mapping**: on *Model mappings*, add a public model such as `coder` and click the upstream models to use; the click order is the routing order.
+3. **Issue a key**: on *API keys*, create a key and copy it.
+4. **Connect a client**: the *Setup wizard* under *Settings* generates the configuration for your client, key and model.
+
+Check it with curl:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-route-your-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"coder","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+The response header `X-Route-Target` tells you which upstream answered.
+
+## Screenshots
+
+| Providers | Model mapping: routing order and weighted groups |
+|---|---|
+| ![Providers](docs/images/en/providers.png) | ![Model mapping](docs/images/en/model-editor.png) |
+| **Request logs** | **Request detail: every attempt and fallback** |
+| ![Request logs](docs/images/en/logs.png) | ![Request detail](docs/images/en/log-detail.png) |
+| **API keys: budgets and rate limits** | **Setup wizard** |
+| ![API keys](docs/images/en/keys.png) | ![Setup wizard](docs/images/en/setup-wizard.png) |
+
+## Connecting clients
+
+| Protocol | Base URL | Endpoints |
+|---|---|---|
+| OpenAI compatible | `http://your-server:8080/v1` | `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings`, `POST /v1/rerank`, `GET /v1/models` |
+| Anthropic compatible | `http://your-server:8080` | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
+
+Authenticate with `Authorization: Bearer sk-route-…` or `x-api-key: sk-route-…`. The console's *Setup wizard* generates all of the following.
+
+<details open>
+<summary><b>Claude Code</b></summary>
+
+```bash
+export ANTHROPIC_BASE_URL=http://your-server:8080
+export ANTHROPIC_AUTH_TOKEN=sk-route-xxxx
+export ANTHROPIC_MODEL=coder
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=fast
+claude
+```
+
+For permanent use put these into the `env` field of `~/.claude/settings.json`. Give `fast` the alias `claude-*haiku*` and Claude Code's background requests land on it automatically.
+</details>
+
+<details>
+<summary><b>Codex CLI</b></summary>
+
+Codex only speaks the Responses API; the gateway converts it for whatever upstream you map. In `~/.codex/config.toml`:
+
+```toml
+model = "coder"
+model_provider = "ai-route"
+
+[model_providers.ai-route]
+name = "AI Route"
+base_url = "http://your-server:8080/v1"
+env_key = "AI_ROUTE_API_KEY"
+wire_api = "responses"
+```
+
+Then `export AI_ROUTE_API_KEY=sk-route-xxxx` and run `codex`.
+</details>
+
+<details>
+<summary><b>OpenCode</b></summary>
+
+Add a provider to `opencode.json` in your project (or `~/.config/opencode/opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ai-route": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "AI Route",
+      "options": { "baseURL": "http://your-server:8080/v1", "apiKey": "sk-route-xxxx" },
+      "models": { "coder": { "name": "coder" } }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Cline / Roo Code / Kilo Code, Cherry Studio, SDKs</b></summary>
+
+- **Cline / Roo Code / Kilo Code**: API provider *OpenAI Compatible*, base URL `http://your-server:8080/v1`, model ID = the public model name.
+- **Cherry Studio**: Settings → Model providers → Add, type OpenAI, API host `http://your-server:8080`.
+- **OpenAI SDK**: `OpenAI(base_url="http://your-server:8080/v1", api_key="sk-route-xxxx")`
+- **Anthropic SDK**: `Anthropic(base_url="http://your-server:8080", api_key="sk-route-xxxx")`
+</details>
+
+## Configuration
+
+### Providers
+
+Added on the *Providers* page. A vendor's **coding plan** and its **pay-as-you-go API** are separate presets because their endpoints and keys are not interchangeable (e.g. Kimi Code vs. the Moonshot platform).
+
+| Category | Presets |
+|---|---|
+| Coding plans | Kimi Code (CN / global), Zhipu GLM Coding Plan, Z.ai Coding Plan, Alibaba Bailian Coding Plan, QwenCloud Coding, Qwen Token Plan, Volcengine Ark Coding Plan / Agent Plan, BytePlus Coding Plan, MiniMax Token Plan (CN / global), OpenCode Go, StepFun Step Plan, Tencent Cloud Token Plan, Baidu Qianfan Token Plan, KAT-Coder |
+| Official APIs (pay-as-you-go) | Moonshot (CN / global), Zhipu, Z.ai, Alibaba Bailian, Volcengine Ark, DeepSeek, MiniMax, StepFun, Tencent Hunyuan, Xiaomi MiMo, Meituan LongCat, OpenAI, Anthropic, Google Gemini, xAI |
+| Aggregators | OpenCode Zen, OpenRouter, SiliconFlow, ModelScope, Novita, AiHubMix, PackyCode |
+
+> Presets live in [web/presets.js](web/presets.js) and were compiled from the vendors' documentation (2026-10). Plans change often, **the vendor console is authoritative**; click *Test* after adding one.
+
+- **Prefix**: each provider has a prefix, and its models are referenced as `prefix/model`. Prefixes are generated: the preset's prefix, or one derived from the host (`api.deepseek.com` → `deepseek`), with a numeric suffix on collisions (`kimi`, `kimi-2`). They never change after creation.
+- **Endpoints**: fill in the OpenAI-compatible endpoint, the Anthropic-compatible one, or both. A request uses the endpoint of its own protocol when available and is converted otherwise.
+- **Model protocol rules**: when some models are only served on one endpoint, one line per rule: `model(* allowed) = openai|anthropic|responses`. E.g. OpenCode Go serves MiniMax only on `/messages` and GPT Luna only on `/responses`; the preset has these rules.
+- **Responses API switch**: with *OpenAI endpoint also serves the Responses API* checked, Codex and other Responses clients are passed through; otherwise they are converted to Chat Completions. The OpenAI preset has it on; most OpenAI-compatible vendors (Kimi, GLM, DeepSeek …) have no `/responses`, so leave it off for them.
+- **Unit prices**: see [Cost tracking](#cost-tracking).
+
+#### User-Agent policy
+
+Some coding plans identify clients by User-Agent, so each provider has its own policy:
+
+| Policy | Behavior | Use for |
+|---|---|---|
+| Forward client UA (default) | Sends the caller's UA (e.g. Claude Code's `claude-cli/…`); falls back to the provider's value, then to `ai-route/<version>` | Almost everything; **Kimi Code requires this** |
+| Gateway fingerprint | Always `ai-route/<version>` | Self-hosted models, relays that want to know the source |
+| Fixed UA | Always the configured value | Only when a vendor asks for a specific UA |
+
+Kimi Code's membership terms treat tampering with the client identifier (User-Agent) as a violation; OpenCode Go asks clients to use their own UA. The console's *Test* button sends `ai-route-admin-test`, which plans that restrict clients may reject with 403 — test through the gateway with a real client instead.
+
+#### Headers
+
+The caller's request headers are **forwarded by default**, except credentials (`Authorization`, `x-api-key`, `Cookie`), `Accept-Encoding`, hop-by-hop headers, identity-revealing ones (`X-Forwarded-*`, `Origin`, `Referer`, `Sec-*`, `CF-*`) and headers of the other protocol. Turn forwarding off in *Advanced* for upstreams that dislike extra headers.
+
+*Custom headers* take one `Header: value` per line, override the caller's header of the same name, and an empty value removes it. Values may be templates:
+
+| Value | Meaning |
+|---|---|
+| `X-Foo: abc` | Fixed value |
+| `X-Foo: {{header.X-Bar}}` | The caller's `X-Bar`, **required**: missing on the primary upstream → 400 right away; missing on a fallback → not sent |
+| `X-Foo: {{header.X-Bar?}}` | The caller's value, optional |
+| `X-Foo: {{header.X-Bar ?? $conversation}}` | The caller's value, else generated by the gateway; `?? "default"` works too |
+| `X-Trace: ai-route-{{$requestId}}` | Built-in variables, can be mixed with text |
+
+Built-in variables: `$conversation` (`ses_…`, stable within a conversation), `$uuid` (new per request), `$requestId` (also in the `X-Route-Request-Id` response header), `$timestamp`, `$keyName`, `$keyId`, `$model`. Misspelled variables and references to credential headers are rejected on save.
+
+The OpenCode Go preset, for example, uses:
+
+```
+x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}
+```
+
+i.e. the caller's own session id → Claude Code's `x-claude-code-session-id` → Codex's `session-id` → one generated per conversation. *Settings → Request headers* in the console lists all rules and the sources of each vendor requirement.
+
+#### Request body rules
+
+For models that need extra parameters, one line per rule: `model(* allowed) [conditions] = JSON`. The JSON is deep-merged into the upstream request body (after protocol conversion); `null` removes a field. Optional conditions: `stream` / `nonstream`, `openai` / `anthropic` / `responses` / `embeddings` / `rerank`. Bailian's Qwen3 open-weight models think by default and reject non-stream calls unless thinking is off; the *Alibaba Bailian (pay-as-you-go)* preset ships:
+
+```
+qwen3-* [nonstream, openai] = {"enable_thinking": false}
+```
+
+#### Self-hosted models
+
+Add models you serve yourself (vLLM, SGLang, Ollama, LM Studio …) as a custom provider with `http://host:port/v1`. Under *Advanced → Self-hosted models*:
+
+| Setting | Effect |
+|---|---|
+| Max concurrency | Caps in-flight requests. Excess requests overflow to the next fallback without counting as failures; when every other fallback failed and only full self-hosted targets remain, requests queue for a free slot (30 s by default) and then get 429 |
+| First-token timeout | How long a stream may wait for its first event before failing over — hand over quickly while the GPU is queueing |
+| Health check | Periodically `GET`s the models endpoint (or a custom URL); two failures in a row take the provider out of rotation, a passing check brings it back, both raise alerts |
+
+### Model mappings
+
+- **Public model name**: what clients put in `model`, e.g. `coder`, `fast`.
+- **Routing order**: click upstream models from the grouped list below; reorder with ↑↓.
+- **Weighted groups**: check *same priority as previous* to put several upstreams on one level with weights (stored as `kimi/k3*2 | kimi-2/k3`). Weighted consistent hashing on *API key + first user message* keeps a conversation on the same member (its prompt cache survives) while spreading conversations by weight; if a member fails, the others in its group are tried first.
+- **Aliases**: `*` wildcards supported, e.g. give `fast` the alias `claude-*haiku*`. Exact names win over wildcard aliases.
+- **Capability tags**: type, capabilities, context length, fast/cheap …, shown in the list and as extension fields in `/v1/models`. They can be suggested from the mapped models; only capabilities every fallback has are suggested.
+
+| Public model | Example routing order |
+|---|---|
+| `coder` | `kimi/kimi-for-coding*2 \| kimi-2/kimi-for-coding` → `glm/glm-5.3` → `bailian/qwen3.7-plus` |
+| `fast` | `glm/glm-5.3-flash` → `deepseek/deepseek-chat` |
+| `gpt` | `opencode/gpt-5.6-luna` → `openrouter/openai/gpt-5.6-sol` |
+
+### API keys
+
+Keys are generated by the gateway (`sk-route-` + 48 hex characters); *Regenerate* invalidates a leaked key immediately. Each key can be limited to certain models, given an expiry, and:
+
+| Limit | When exceeded | Notes |
+|---|---|---|
+| Monthly budget | 402 (`insufficient_quota` in OpenAI format, `billing_error` in Anthropic format), resets on the 1st | Accumulates the tracked cost in the reporting currency |
+| RPM | 429 with `Retry-After` | 60-second sliding window |
+| TPM | 429 with `Retry-After` | Input + output tokens of requests finished in the last 60 seconds |
+| Max concurrency | 429 with `Retry-After` | Requests in flight at the same time |
+
+- Rejected requests are logged and never reach an upstream; `/v1/messages/count_tokens` counts toward the limits too.
+- The monthly budget and TPM are checked when a request starts and requests already running finish normally, so high concurrency can overshoot them. Give budgeted keys a concurrency cap as well.
+- When a client disconnects in the middle of a stream, the gateway keeps reading the upstream (up to 30 seconds) to bill the real usage; if it still gets none, it bills an estimate based on the request size and marks the log entry as estimated.
+
+### Cost tracking
+
+- **Unit prices**: in a provider's *Advanced* section, one line per rule: `model(* allowed) = input / cache hit / output`, per million tokens, in CNY or USD. The cache price is optional and defaults to the input price.
+- **OpenRouter**: the actual charge in the response (`usage.cost`) is used.
+- **Subscription plans**: `* = 0 / 0` marks them as free; requests without any price are flagged as "not counted" on the overview so you notice missing prices.
+- **Currencies**: logs keep the original currency; the overview converts everything to the reporting currency chosen in *Settings*.
+- **Formula**: (input − cache hits) × input price + cache hits × cache price + output × output price. Anthropic cache writes are counted at the input price (the actual price is 1.25×); reasoning tokens are part of the output.
+
+### Alerts
+
+Add webhooks under *Settings → Alerts*; each one has a *Send test* button:
+
+| Type | Notes |
+|---|---|
+| Feishu / Lark | Signature verification supported |
+| DingTalk | Signed requests supported (secret starting with `SEC`) |
+| WeCom | Just the bot URL |
+| Generic JSON | Receives `POST {event, subject, title, text, time}` |
+
+Triggers: an upstream answers 401/402 (invalid key, out of credit), every upstream of a model failed, a provider or model is cooled down for longer than a threshold (10 minutes by default), a self-hosted model fails or recovers its health check. The same alert is sent at most once per silence window (30 minutes by default). Messages start with `[AI Route]` — use that as the keyword if your bot filters by keyword — and can be sent in English or Chinese.
+
+## Routing, retries and circuit breaking
+
+On each upstream the gateway **first decides whether to retry, then whether to fail over**:
+
+| Error | Handling | Why |
+|---|---|---|
+| Connection reset, 5xx / 408 / 529, 200 with an error body, error as first stream event | Retry on the same upstream (2 times by default, 1 s then 2 s), then fail over | Typical transient blips; retrying keeps the prompt cache |
+| 429 with `Retry-After` ≤ 10 s (or none) | Wait and retry; if it keeps failing it counts as an ordinary failure | Short rate limit |
+| 429 with a long wait, 401, 402 | Fail over immediately and cool down the **whole provider** | Quota exhausted, invalid key, out of credit |
+| 404 | Fail over and cool down **that model** | Model does not exist |
+| Timeout | Fail over | The full timeout already passed |
+| 400 / 403 / 413 …, and 429 / 404 saying the request is too large or the context too long | Fail over, no cooldown | A problem with that request — one client must not cool down a provider everybody shares |
+
+- Once a stream has started sending data to the client it can no longer be retried or moved; if it breaks, the client gets an error event.
+- Two failed requests in a row (after retries) cool an upstream down, starting at 60 seconds and doubling each time up to 30 minutes. Cooling upstreams go last and get a single try; one success resets the count.
+- All of these are adjustable under *Settings*.
+
+## Protocol conversion
+
+| Client → upstream | Handling |
+|---|---|
+| Same protocol | Passed through; only `model` is rewritten |
+| OpenAI ⇄ Anthropic | System messages, tool calls and results, images, reasoning and `cache_control` are mapped; stream events are converted one by one |
+| Responses ⇄ Chat | `instructions` / `developer` → `system`, `function_call` ⇄ `tool_calls`; Codex's freeform tools (e.g. `apply_patch`) become a function with one string parameter and are turned back afterwards; OpenAI built-in tools (`web_search` …) have no equivalent and are dropped |
+| Responses ⇄ Anthropic | Through Chat Completions |
+
+- **`reasoning_effort`**: for Claude Opus / Sonnet 4.6+ and Fable it becomes `thinking: {type: "adaptive"}` plus `output_config.effort`, and parameters those models reject are removed; other models get `budget_tokens`.
+- **`response_format`**: a strict JSON schema becomes native structured output on the official Anthropic API; otherwise a "reply with JSON only" instruction is appended to the system prompt.
+- **Responses API limits**: the gateway is stateless, so `previous_response_id` and `conversation` are not supported when the upstream is not a Responses API (400). Codex sends the full history by default and is not affected.
+
+## Deployment and security
+
+- **HTTPS**: put a reverse proxy in front when exposing it to the internet, with buffering off for streams (the gateway already sends `X-Accel-Buffering: no`):
+
+  ```nginx
+  location / {
+      proxy_pass http://127.0.0.1:8080;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_buffering off;
+      proxy_read_timeout 600s;
+  }
+  ```
+
+  With Caddy: `reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`.
+- **Admin token**: `ADMIN_TOKEN` must be at least 16 characters and not the example value (the gateway refuses to start otherwise); `openssl rand -hex 24` makes a good one. Ten wrong tokens from one IP within a minute lock that IP out for a minute.
+- **Secrets**: upstream keys are stored in plain text in SQLite; the data directory is created `0700` and the database files `0600`. Protect the data directory and the admin token. The client IP in logs comes from `X-Forwarded-For`, which can be forged when the gateway is exposed directly.
+- **Error messages**: clients only see each upstream's status and the request id; raw upstream errors and URLs stay in the request log, so internal hosts and account details do not leak.
+- **Headers**: when forwarding caller headers, credentials, browser headers and account-selecting ones such as `OpenAI-Organization` / `OpenAI-Project` are dropped. `anthropic-beta` is forwarded (Claude Code depends on it), so clients can enable upstream beta features, some of which change pricing. Health checks carry the provider's key — point them at the provider's own service.
+- **Console**: served with a Content-Security-Policy, `X-Frame-Options: DENY` and related headers; it only loads its own scripts and styles.
+- **Resource protection**: request bodies up to 64 MB and 2 minutes to send them; upstream stream events up to 8 MB; writes to a client that stops reading time out after 60 seconds; client-supplied log fields are length-capped, and space is reclaimed after old logs are deleted.
+- **Backup and migration**: *Settings* can export and import the whole configuration (JSON, including upstream keys — keep it safe).
+- **Single instance**: circuit-breaker state, rate-limit counters and concurrency slots live in memory, so run one instance; after a restart breakers start fresh and the month's spend is recomputed from the logs.
+
+## FAQ
+
+<details>
+<summary><b>curl against localhost prints nothing</b></summary>
+
+Most likely your shell has `http_proxy` set and the request went to the proxy. Try `--noproxy '*'`; if that helps, add `127.0.0.1,localhost` to `no_proxy` or make your proxy client connect to local addresses directly.
+</details>
+
+<details>
+<summary><b>Kimi Code returns 403</b></summary>
+
+Kimi Code only accepts coding agents. Keep the provider's User-Agent policy on *Forward client UA* and call it through the gateway with a real client such as Claude Code; the console's *Test* button is expected to be rejected.
+</details>
+
+<details>
+<summary><b>The model list cannot be fetched</b></summary>
+
+Many coding plans do not expose `/models`. Type the model names in the provider form and press Enter.
+</details>
+
+<details>
+<summary><b>Forgot the admin token</b></summary>
+
+Set the `ADMIN_TOKEN` environment variable and restart; it takes precedence.
+</details>
+
+<details>
+<summary><b>Codex says previous_response_id is not supported</b></summary>
+
+This only happens when the upstream is not a Responses API. Codex uses `store: false` and sends the full history by default; if your client relies on server-side state, map the model to an upstream that serves the Responses API.
+</details>
+
+## Admin API
+
+Everything the console does is available under `/admin/api/*` (`Authorization: Bearer <ADMIN_TOKEN>`):
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:8080/admin/api/providers
+curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8080/admin/api/stats?range=24h"
+```
+
+Main endpoints: `providers`, `models`, `keys`, `logs`, `stats`, `status`, `settings`, `alerts`, `export`, `import`.
+
+## Development
+
+```bash
+go test -race ./...      # all tests run against mock upstreams, no real keys needed
+go build -o bin/ai-route .
+```
+
+```
+main.go               entry point: flags, embedded assets, HTTP server
+internal/gateway      public API, routing and failover, breakers, limits, concurrency and health checks, headers
+internal/convert      request / response / stream conversion between Chat, Responses and Anthropic
+internal/store        SQLite storage, config snapshots, request logs and stats
+internal/admin        admin API
+internal/alert        alert delivery (Feishu, DingTalk, WeCom, webhook)
+internal/hdrtpl       header templates
+web/                  console (plain JS, no build step; i18n.js holds the English strings)
+```
+
+Tests cover protocol conversion (including stream event order), retries and breakers, mappings and weighted groups, limits and budgets, cost, alert signatures, header templates, and self-hosted concurrency and health checks, all against mock upstreams. `scripts/check-i18n.mjs` makes sure every console string has an English translation.
+
+## Roadmap
+
+- [x] English README and console language switch
+- [ ] Prebuilt binaries and Docker images
+- [ ] Multiple admin accounts and an audit log
+- [ ] Multi-instance deployments (shared breaker and rate-limit state)
+
+Requests are welcome in Issues.
+
+## Contributing
+
+Issues and pull requests are welcome. Before submitting:
+
+- `gofmt -l .` prints nothing, and `go vet ./...` and `go test -race ./...` pass;
+- new features come with tests (see the mock upstream in `internal/gateway/*_test.go`);
+- new console text goes through `t()` with an English entry in `web/i18n.js` (`node scripts/check-i18n.mjs` checks it);
+- new or changed provider presets link to the vendor's documentation in the PR.
+
+## Disclaimer
+
+- Some coding plans only allow use in officially supported coding tools, or forbid "self-built backends / proxying / automated calls" (Bailian Coding Plan, GLM Coding Plan and Kimi Code have such terms, for example). **Whether relaying through this project complies is your responsibility; read and follow each vendor's terms of service. You bear the consequences such as suspended accounts or charges.**
+- This project is not affiliated with any vendor mentioned. Preset information is for reference only; the vendors' official documentation is authoritative.
+
+## License
+
+[MIT](LICENSE)

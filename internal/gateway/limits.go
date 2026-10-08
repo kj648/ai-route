@@ -26,6 +26,8 @@ type keyUsage struct {
 	spend       float64 // month-to-date cost in the display currency
 	spendMonth  int64   // MonthStart the spend belongs to
 	spendLoaded time.Time
+
+	inflight int // requests in progress (counted only for keys with MaxConcurrency)
 }
 
 // Limiter enforces per-key RPM / TPM / monthly budget. State is in memory;
@@ -110,6 +112,35 @@ func (l *Limiter) Admit(k *store.APIKey) *rejection {
 		u.reqs = append(u.reqs, now)
 	}
 	return nil
+}
+
+// Enter takes an in-flight slot for keys with MaxConcurrency; every nil
+// return must be paired with Leave.
+func (l *Limiter) Enter(k *store.APIKey) *rejection {
+	if k.MaxConcurrency <= 0 {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	u := l.usage(k.ID)
+	if u.inflight >= k.MaxConcurrency {
+		return &rejection{status: http.StatusTooManyRequests, retryAfter: time.Second,
+			msg: fmt.Sprintf("too many concurrent requests for this API key: limit %d", k.MaxConcurrency)}
+	}
+	u.inflight++
+	return nil
+}
+
+// Leave releases a slot taken by Enter.
+func (l *Limiter) Leave(k *store.APIKey) {
+	if k.MaxConcurrency <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if u := l.usage(k.ID); u.inflight > 0 {
+		u.inflight--
+	}
 }
 
 // Record adds a finished request's tokens and cost.

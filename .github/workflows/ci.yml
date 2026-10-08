@@ -23,6 +23,8 @@ jobs:
       - name: go test
         run: go test -race ./...
       - name: Console scripts parse
-        run: node --check web/app.js && node --check web/presets.js
+        run: node --check web/i18n.js && node --check web/app.js && node --check web/presets.js
+      - name: Console i18n complete
+        run: node scripts/check-i18n.mjs
       - name: Docker image builds
         run: docker build -t ai-route:ci .

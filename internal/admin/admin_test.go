@@ -46,3 +46,36 @@ func TestRoutesAndAuth(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminLockoutAndConsoleHeaders(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	gw := gateway.New(st)
+	mux := http.NewServeMux()
+	New(st, gw, "the-right-token-123", fstest.MapFS{"index.html": {Data: []byte("<html>console</html>")}}).Register(mux)
+	call := func(tok string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "/admin/api/providers", nil)
+		r.RemoteAddr = "203.0.113.7:5555"
+		r.Header.Set("Authorization", "Bearer "+tok)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		return w
+	}
+	for i := 0; i < 10; i++ {
+		if c := call("wrong").Code; c != 401 {
+			t.Fatalf("attempt %d: %d", i, c)
+		}
+	}
+	if w := call("the-right-token-123"); w.Code != 429 || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("locked out IP should get 429 even with the right token, got %d", w.Code)
+	}
+	r := httptest.NewRequest("GET", "/admin/", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") || w.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("console headers: %v", w.Header())
+	}
+}

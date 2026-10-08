@@ -226,7 +226,7 @@ func (g *Gateway) fetchModels(ctx context.Context, p *store.Provider, url string
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&out); err != nil {
 		return nil, fmt.Errorf("GET %s: %w", url, err)
 	}
 	ids := make([]string, 0, len(out.Data))

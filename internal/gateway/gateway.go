@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ai-route/internal/alert"
@@ -26,6 +27,14 @@ import (
 )
 
 const maxBodyBytes = 64 << 20
+
+// bodyReadTimeout bounds how long a client may take to send its request
+// body; streamWriteTimeout bounds each write to a client that stops reading.
+const (
+	bodyReadTimeout    = 2 * time.Minute
+	streamWriteTimeout = time.Minute
+	maxModelNameLen    = 256
+)
 
 type Gateway struct {
 	store   *store.Store
@@ -261,29 +270,46 @@ func (g *Gateway) handle(w http.ResponseWriter, r *http.Request, inbound string)
 		writeError(w, inbound, status, msg)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
-	if err != nil {
-		writeError(w, inbound, http.StatusBadRequest, "failed to read body: "+err.Error())
-		return
-	}
-	if len(body) > maxBodyBytes {
-		writeError(w, inbound, http.StatusRequestEntityTooLarge, "request body too large")
-		return
-	}
+	// limits first: a rejected request costs neither a body read nor a
+	// large log row
 	if rej := g.Limiter.Admit(key); rej != nil {
-		g.reject(w, r, inbound, body, key, rej)
+		g.reject(w, r, inbound, key, rej)
+		return
+	}
+	if rej := g.Limiter.Enter(key); rej != nil {
+		g.reject(w, r, inbound, key, rej)
+		return
+	}
+	defer g.Limiter.Leave(key)
+	body, ok := readBody(w, r, inbound)
+	if !ok {
 		return
 	}
 	g.route(w, r, inbound, body, key)
 }
 
+// readBody reads the request body with a size cap and a deadline.
+func readBody(w http.ResponseWriter, r *http.Request, inbound string) ([]byte, bool) {
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(bodyReadTimeout))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	_ = rc.SetReadDeadline(time.Time{})
+	if err != nil {
+		writeError(w, inbound, http.StatusBadRequest, "failed to read body: "+err.Error())
+		return nil, false
+	}
+	if len(body) > maxBodyBytes {
+		writeError(w, inbound, http.StatusRequestEntityTooLarge, "request body too large")
+		return nil, false
+	}
+	return body, true
+}
+
 // reject answers a request refused by the key's limits and logs it.
-func (g *Gateway) reject(w http.ResponseWriter, r *http.Request, inbound string, body []byte, key *store.APIKey, rej *rejection) {
-	info, _ := convert.ParseRequestInfo(body)
+func (g *Gateway) reject(w http.ResponseWriter, r *http.Request, inbound string, key *store.APIKey, rej *rejection) {
 	g.store.AddLog(&store.RequestLog{
 		CreatedAt: time.Now().UnixMilli(), KeyID: key.ID, KeyName: key.Name,
-		RequestedModel: info.Model, Inbound: inbound, Stream: info.Stream,
-		HTTPStatus: rej.status, Error: rej.msg, ClientIP: clientIP(r),
+		Inbound: inbound, HTTPStatus: rej.status, Error: rej.msg, ClientIP: clientIP(r),
 	})
 	if rej.retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(rej.retryAfter.Seconds())+1))
@@ -322,6 +348,11 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 	if inbound == convert.ProtoEmbeddings || inbound == convert.ProtoRerank {
 		info.Stream = false
 	}
+	if len(info.Model) > maxModelNameLen {
+		entry.HTTPStatus, entry.Error = 400, "model name too long"
+		writeError(w, inbound, http.StatusBadRequest, "model name too long")
+		return
+	}
 	entry.RequestedModel, entry.Stream = info.Model, info.Stream
 	m := snap.ResolveModel(info.Model)
 	if m == nil {
@@ -350,8 +381,8 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 	if len(cands) == 0 {
 		entry.HTTPStatus, entry.Error = 503, "no enabled targets"
 		g.Alerts.Notify(alert.Alert{Event: alert.EventAllFailed, Subject: m.Name,
-			Title: fmt.Sprintf("模型 %s 没有可用的上游", m.Name),
-			Text:  "调度顺序里的供应商都已停用，或都不支持这类请求。"})
+			Title: fmt.Sprintf(g.Alerts.Pick("模型 %s 没有可用的上游", "Model %s has no available upstream"), m.Name),
+			Text:  g.Alerts.Pick("调度顺序里的供应商都已停用，或都不支持这类请求。", "Every provider in its routing order is disabled or cannot serve this kind of request.")})
 		writeError(w, inbound, http.StatusServiceUnavailable, fmt.Sprintf("model %q has no enabled upstream targets", m.Name))
 		return
 	}
@@ -404,6 +435,9 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 			entry.Error = res.streamErr
 			if res.aborted && entry.Error == "" {
 				entry.Error = "client disconnected mid-stream"
+				if res.usageEstimated {
+					entry.Error += " (usage estimated)"
+				}
 			}
 			entry.TTFBMs = res.ttfb
 			entry.InputTokens, entry.OutputTokens, entry.CachedTokens = res.usage.Input, res.usage.Output, res.usage.Cached
@@ -462,12 +496,25 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 	}
 	var parts []string
 	for _, a := range entry.Attempts {
-		parts = append(parts, fmt.Sprintf("%s: %s", a.Target, truncate(a.Error, 300)))
+		st := "error"
+		if strings.HasPrefix(a.Error, "build request: ") {
+			st = strings.TrimPrefix(a.Error, "build request: ") // the gateway's own message, safe to show
+		} else if a.HTTPStatus > 0 {
+			st = fmt.Sprintf("HTTP %d", a.HTTPStatus)
+		} else if strings.Contains(a.Error, "at capacity") {
+			st = "at capacity"
+		} else if strings.Contains(a.Error, "timeout") {
+			st = "timeout"
+		}
+		parts = append(parts, a.Target+" "+st)
 	}
 	entry.HTTPStatus = lastStatus
 	entry.Error = lastMsg
 	g.alertAllFailed(m.Name, entry.Attempts)
-	writeError(w, inbound, lastStatus, "all upstream targets failed: "+strings.Join(parts, " | "))
+	// upstream error texts can carry internal hosts or account details:
+	// clients get the statuses, the request log keeps the full story
+	writeError(w, inbound, lastStatus, fmt.Sprintf("all upstream targets failed (%s); see request %s in the gateway log",
+		strings.Join(parts, ", "), entry.RequestID))
 	return entry
 }
 
@@ -514,8 +561,11 @@ type tryResult struct {
 	kind       failKind
 	retryAfter time.Duration
 	usage      convert.Usage
-	ttfb       int64
-	streamErr  string // error after the stream was committed
+	// usageEstimated: the client left before the usage event and it could
+	// not be drained; usage is an estimate
+	usageEstimated bool
+	ttfb           int64
+	streamErr      string // error after the stream was committed
 }
 
 func openaiURL(base string) string {
@@ -738,8 +788,20 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 	res.attempt = store.Attempt{Target: c.target, Protocol: c.proto}
 	defer func() { res.attempt.LatencyMs = time.Since(start).Milliseconds() }()
 
-	ctx, cancel := context.WithCancel(parent)
+	// The upstream call outlives a client that disconnects mid-stream (for
+	// up to drainTimeout) so the final usage event can still be read and the
+	// request billed; before anything is committed a disconnect cancels it.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	defer cancel()
+	var committed atomic.Bool
+	stopWatch := context.AfterFunc(parent, func() {
+		if committed.Load() {
+			time.AfterFunc(drainTimeout, cancel)
+		} else {
+			cancel()
+		}
+	})
+	defer stopWatch()
 	timeout := time.Duration(c.provider.TimeoutSeconds) * time.Second
 	// a stream may have a shorter deadline for its first event (a queued
 	// self-hosted server should hand over to the next target quickly)
@@ -796,9 +858,9 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 		msg := fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(upstreamErrorMessage(b), 1000))
 		if resp.StatusCode == 404 || resp.StatusCode == 405 {
 			// usually a wrong base URL (e.g. missing /v1): show what we called
-			msg += " (POST " + req.URL.String() + ")"
+			msg += " (POST " + req.URL.Redacted() + ")"
 		}
-		return fail(resp.StatusCode, classifyStatus(resp.StatusCode), msg)
+		return fail(resp.StatusCode, classifyResponse(resp.StatusCode, res.retryAfter, b), msg)
 	}
 	res.attempt.HTTPStatus = resp.StatusCode
 
@@ -853,27 +915,38 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	h.Set("X-Route-Target", c.target)
+	committed.Store(true)
 	w.WriteHeader(http.StatusOK)
 	res.committed = true
 	res.ttfb = time.Since(start).Milliseconds()
 	rc := http.NewResponseController(w)
 
+	emitted := 0
 	emit := func(evs []convert.SSEEvent) bool {
+		if len(evs) == 0 {
+			return true
+		}
+		// a client that stops reading must not hold the stream forever
+		_ = rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
 		for _, e := range evs {
 			if err := convert.WriteSSE(w, e); err != nil {
 				return false
 			}
+			emitted++
 		}
-		if len(evs) > 0 {
-			_ = rc.Flush()
-		}
-		return true
+		return rc.Flush() == nil
 	}
 
 	ev := first
 	for {
 		if !emit(conv.Process(ev)) {
 			res.aborted = true
+			drainForUsage(reader, conv, cancel)
+			if u := conv.Usage(); u.Input == 0 && u.Output == 0 {
+				// the usage event never came: estimate rather than bill nothing
+				res.usage = convert.Usage{Input: req.ContentLength / 4, Output: int64(emitted)}
+				res.usageEstimated = true
+			}
 			break
 		}
 		timer.Reset(timeout) // idle timeout while waiting for the upstream
@@ -899,11 +972,35 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 			break
 		}
 	}
-	res.usage = conv.Usage()
+	if !res.usageEstimated {
+		res.usage = conv.Usage()
+	}
 	if res.streamErr == "" && conv.Err() != "" {
 		res.streamErr = "upstream stream error: " + conv.Err()
 	}
 	return res
+}
+
+// drainTimeout is how long an upstream stream is still read after the
+// client went away, to collect the usage reported at its end.
+const drainTimeout = 30 * time.Second
+
+// drainForUsage reads the rest of an upstream stream without forwarding it,
+// so the converter sees the final usage event.
+func drainForUsage(reader *convert.SSEReader, conv convert.StreamConverter, cancel context.CancelFunc) {
+	stop := time.AfterFunc(drainTimeout, cancel)
+	defer stop.Stop()
+	for {
+		// OpenAI sends usage after finish_reason: completion alone is not enough
+		if u := conv.Usage(); conv.Complete() && (u.Input > 0 || u.Output > 0) {
+			return
+		}
+		ev, err := reader.Next()
+		if err != nil {
+			return
+		}
+		conv.Process(ev)
+	}
 }
 
 func streamErrorEvents(proto, msg string) []convert.SSEEvent {
@@ -976,12 +1073,20 @@ func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, convert.ProtoAnthropic, status, msg)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
-	if err != nil {
-		writeError(w, convert.ProtoAnthropic, 400, err.Error())
+	// count_tokens uses the operator's upstream quota too: same limits
+	if rej := g.Limiter.Admit(key); rej != nil {
+		g.reject(w, r, "count_tokens", key, rej)
+		return
+	}
+	body, ok := readBody(w, r, convert.ProtoAnthropic)
+	if !ok {
 		return
 	}
 	info, _ := convert.ParseRequestInfo(body)
+	g.store.AddLog(&store.RequestLog{
+		CreatedAt: time.Now().UnixMilli(), KeyID: key.ID, KeyName: key.Name, RequestedModel: info.Model,
+		Inbound: "count_tokens", Success: true, HTTPStatus: 200, ClientIP: clientIP(r), RequestID: newRequestID(),
+	})
 	if m := snap.ResolveModel(info.Model); m != nil && keyAllows(key, m.Name) {
 		for _, c := range g.plan(snap, m, convert.ProtoAnthropic, "") {
 			if c.proto != convert.ProtoAnthropic || !c.openTill.IsZero() {

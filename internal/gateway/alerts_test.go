@@ -106,3 +106,18 @@ func TestAlertOnLongCooldown(t *testing.T) {
 		t.Fatalf("alerts: %v", got)
 	}
 }
+
+func TestAlertsInEnglish(t *testing.T) {
+	h := newHarness(t)
+	sink := h.alertSink(func(c *store.AlertConfig) { c.Language = "en" })
+	h.model("coder", "oa/fail402", "an/ok")
+	h.post("/v1/chat/completions", oaReq("coder", false))
+	got := sink.get(h)
+	if len(got) != 1 || got[0]["title"] != "Provider oa: out of credit or quota" ||
+		!strings.Contains(got[0]["text"].(string), "cooling down for 1 min") {
+		t.Fatalf("english alert: %v", got)
+	}
+	if err := h.st.UpdateAlerts(store.AlertConfig{Language: "fr"}); err == nil {
+		t.Fatal("unknown language accepted")
+	}
+}

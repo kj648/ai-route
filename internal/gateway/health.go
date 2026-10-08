@@ -165,15 +165,17 @@ func (h *HealthChecker) record(p *store.Provider, problem string) {
 		if alerted {
 			h.setAlerted(p.Prefix, false)
 			_ = h.g.Alerts.Notify(alert.Alert{Event: alert.EventHealthRecovered, Subject: p.Prefix,
-				Title: fmt.Sprintf("供应商 %s 已恢复", p.Prefix), Text: "健康检查通过，已重新加入调度。"})
+				Title: fmt.Sprintf(h.g.Alerts.Pick("供应商 %s 已恢复", "Provider %s recovered"), p.Prefix),
+				Text:  h.g.Alerts.Pick("健康检查通过，已重新加入调度。", "Health check passed; it is back in rotation.")})
 		}
 	case failures >= healthFailures:
 		if h.g.Breaker.SetDown(p.Prefix, true, "health check: "+problem) {
 			log.Printf("health check: %s is down: %s", p.Prefix, problem)
 		}
 		if !alerted && h.g.Alerts.Notify(alert.Alert{Event: alert.EventHealthDown, Subject: p.Prefix,
-			Title: fmt.Sprintf("供应商 %s 健康检查失败", p.Prefix),
-			Text:  fmt.Sprintf("连续 %d 次检查失败，已移出调度（只在其他候补都不可用时兜底）：%s", failures, problem)}) {
+			Title: fmt.Sprintf(h.g.Alerts.Pick("供应商 %s 健康检查失败", "Provider %s failed its health check"), p.Prefix),
+			Text: fmt.Sprintf(h.g.Alerts.Pick("连续 %d 次检查失败，已移出调度（只在其他候补都不可用时兜底）：%s",
+				"%d checks failed in a row; it is out of rotation (tried only when every other fallback is unavailable): %s"), failures, problem)}) {
 			h.setAlerted(p.Prefix, true)
 		}
 	}

@@ -87,6 +87,17 @@ func hasEnabledHook(c store.AlertConfig) bool {
 	return false
 }
 
+// English reports whether alerts are pushed in English.
+func (n *Notifier) English() bool { return n.config().Language == "en" }
+
+// Pick returns the text for the configured alert language.
+func (n *Notifier) Pick(zh, en string) string {
+	if n.English() {
+		return en
+	}
+	return zh
+}
+
 // LongCooldown is the cooldown length that triggers EventLongCooldown.
 func (n *Notifier) LongCooldown() time.Duration {
 	return time.Duration(n.config().LongCooldownMinutes) * time.Minute
@@ -138,7 +149,7 @@ func (n *Notifier) Wait() { n.wg.Wait() }
 
 // Send delivers one alert to one webhook synchronously.
 func (n *Notifier) Send(ctx context.Context, h store.Webhook, a Alert) error {
-	text := "[AI Route] " + a.Title + "\n" + a.Text + "\n时间：" + n.now().Format("2006-01-02 15:04:05")
+	text := "[AI Route] " + a.Title + "\n" + a.Text + "\n" + n.Pick("时间：", "Time: ") + n.now().Format("2006-01-02 15:04:05")
 	target := h.URL
 	var body any
 	switch h.Type {

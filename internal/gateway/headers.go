@@ -64,6 +64,8 @@ var dropHeaders = map[string]bool{
 	"Trailer": true, "Transfer-Encoding": true, "Upgrade": true, "Http2-Settings": true, "Expect": true,
 	"Forwarded": true, "X-Real-Ip": true, "True-Client-Ip": true, "Via": true,
 	"Origin": true, "Referer": true,
+	// would select another org / project / key on the operator's account
+	"Openai-Organization": true, "Openai-Project": true, "Api-Key": true, "X-Goog-Api-Key": true,
 }
 
 var dropPrefixes = []string{"X-Forwarded-", "Cf-", "Sec-", "Proxy-"}
