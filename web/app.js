@@ -279,10 +279,11 @@ function chainHTML(targets, idx, providers) {
 
 // ---------------------------------------------------------------- dashboard
 let dashRange = '24h';
+let dashLoading = false; // a slow stats query must not pile up refreshes
 async function pageDashboard() {
-  const [stats, status, models, providers] = await Promise.all([
+  const [stats, status, models, providers] = await (async () => { dashLoading = true; try { return await Promise.all([
     api('GET', '/stats?range=' + dashRange), api('GET', '/status'), api('GET', '/models'), api('GET', '/providers'),
-  ]);
+  ]); } finally { dashLoading = false; } })();
   const tot = stats.total;
   const idx = healthIndex(status);
   const cooling = status.filter((s) => s.open);
@@ -339,7 +340,8 @@ async function pageDashboard() {
   $('#dash-refresh').onclick = route;
   $('#reset-all').onclick = async () => { await api('POST', '/status/reset', { key: '' }); toast(t('已重置全部熔断状态'), 'ok'); route(); };
   $$('[data-reset]').forEach((b) => b.onclick = async () => { await api('POST', '/status/reset', { key: b.dataset.reset }); toast(t('已恢复'), 'ok'); route(); });
-  refreshTimer = setInterval(() => { if (!$('.modal-bg') && location.hash.startsWith('#/dashboard')) route(); }, 30000);
+  // skip a tick while the previous refresh is still loading
+  refreshTimer = setInterval(() => { if (!$('.modal-bg') && location.hash.startsWith('#/dashboard') && !dashLoading) route(); }, 30000);
 }
 
 // ---------------------------------------------------------------- providers

@@ -174,7 +174,7 @@ func (l *Limiter) monthSpend(id int64, now time.Time) float64 {
 	}
 	l.mu.Unlock()
 
-	l.store.FlushLogs() // so the query sees every finished request
+	l.store.FlushLogsTimeout(2 * time.Second) // so the query sees every finished request
 	spend, err := l.store.KeySpend(month)
 	if err != nil {
 		log.Printf("load key spend: %v", err)

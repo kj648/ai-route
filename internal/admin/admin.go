@@ -28,6 +28,46 @@ type Admin struct {
 
 	failMu sync.Mutex
 	fails  map[string]*authFailures // by client IP
+
+	statsMu    sync.Mutex
+	statsCache map[string]*statsEntry // by range
+}
+
+// statsEntry is a cached stats result; concurrent requests for the same
+// range wait for one query instead of each scanning the logs.
+type statsEntry struct {
+	at    time.Time
+	ready chan struct{}
+	stats *store.Stats
+	err   error
+}
+
+const statsTTL = 10 * time.Second
+
+func (a *Admin) cachedStats(rng string, since, bucket int64) (*store.Stats, error) {
+	a.statsMu.Lock()
+	if a.statsCache == nil {
+		a.statsCache = map[string]*statsEntry{}
+	}
+	e, ok := a.statsCache[rng]
+	if !ok || time.Since(e.at) > statsTTL {
+		e = &statsEntry{at: time.Now(), ready: make(chan struct{})}
+		a.statsCache[rng] = e
+		a.statsMu.Unlock()
+		e.stats, e.err = a.store.GetStats(since, bucket)
+		close(e.ready)
+	} else {
+		a.statsMu.Unlock()
+		<-e.ready
+	}
+	return e.stats, e.err
+}
+
+// clearStats drops cached stats (settings such as the currency changed).
+func (a *Admin) clearStats() {
+	a.statsMu.Lock()
+	a.statsCache = nil
+	a.statsMu.Unlock()
 }
 
 // authFailures counts wrong admin tokens from one IP within a window.
@@ -533,7 +573,7 @@ func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
 	default:
 		d, bucket = 24*time.Hour, time.Hour
 	}
-	st, err := a.store.GetStats(time.Now().Add(-d).UnixMilli(), bucket.Milliseconds())
+	st, err := a.cachedStats(r.URL.Query().Get("range"), time.Now().Add(-d).UnixMilli(), bucket.Milliseconds())
 	if err != nil {
 		writeErr(w, 500, err)
 		return
@@ -554,6 +594,7 @@ func (a *Admin) updateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.gw.Limiter.Forget() // budgets are in the display currency
+	a.clearStats()
 	writeJSON(w, a.store.GetSettings())
 }
 

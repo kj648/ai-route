@@ -2,9 +2,8 @@ package store
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
-	"strconv"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -67,7 +66,43 @@ func (s *Store) AddLog(l *RequestLog) {
 	select {
 	case s.logCh <- l:
 	default:
-		log.Printf("request log queue full, dropping entry")
+		s.reportDropped()
+	}
+}
+
+// reportDropped logs dropped entries at most once every 10 seconds.
+func (s *Store) reportDropped() {
+	n := s.dropped.Add(1)
+	now := time.Now().UnixMilli()
+	last := s.droppedLog.Load()
+	if now-last >= 10_000 && s.droppedLog.CompareAndSwap(last, now) {
+		log.Printf("request log queue full: %d entries dropped so far", n)
+	}
+}
+
+// FlushLogsTimeout is FlushLogs that gives up after d (used on the request
+// path, which must not hang on a stalled writer).
+func (s *Store) FlushLogsTimeout(d time.Duration) bool {
+	done := make(chan struct{})
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	s.logMu.RLock()
+	if s.logClosed {
+		s.logMu.RUnlock()
+		return false
+	}
+	select {
+	case s.logCh <- &RequestLog{flushed: done}:
+	case <-timer.C:
+		s.logMu.RUnlock()
+		return false
+	}
+	s.logMu.RUnlock()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -159,12 +194,21 @@ func (s *Store) cleanupLogs() {
 		return
 	}
 	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
-	res, err := s.db.Exec(`DELETE FROM request_logs WHERE created_at < ?`, cutoff)
-	if err != nil {
-		log.Printf("cleanup logs: %v", err)
-		return
+	// small batches: one huge DELETE would hold the write lock for seconds
+	var n int64
+	for {
+		res, err := s.db.Exec(`DELETE FROM request_logs WHERE id IN (SELECT id FROM request_logs WHERE created_at < ? LIMIT 5000)`, cutoff)
+		if err != nil {
+			log.Printf("cleanup logs: %v", err)
+			return
+		}
+		k, _ := res.RowsAffected()
+		n += k
+		if k < 5000 {
+			break
+		}
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
+	if n > 0 {
 		// give the freed pages back to the file system
 		_, _ = s.db.Exec(`PRAGMA incremental_vacuum`)
 		_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
@@ -281,9 +325,6 @@ type Stats struct {
 	Timeline   []StatRow `json:"timeline"`
 }
 
-const statCols = `COUNT(*), SUM(success), SUM(1-success), SUM(fallback), SUM(input_tokens), SUM(output_tokens), SUM(cached_tokens), AVG(latency_ms), AVG(CASE WHEN ttfb_ms > 0 THEN ttfb_ms END), ` +
-	`SUM(cost * CASE currency WHEN 'USD' THEN ? WHEN 'CNY' THEN ? ELSE 0 END), SUM(cost_source = '' AND input_tokens + output_tokens > 0)`
-
 // CurrencyFactors returns what one USD and one CNY are worth in the
 // display currency.
 func (st Settings) CurrencyFactors() (usd, cny float64) {
@@ -305,91 +346,134 @@ func (st Settings) ToDisplayCurrency(amount float64, currency string) float64 {
 	return 0
 }
 
-// statGroup aggregates logs grouped by expr; costs are converted to the
-// settings' display currency.
-func (s *Store) statGroup(expr string, since int64, order string) ([]StatRow, error) {
-	usd, cny := s.GetSettings().CurrencyFactors()
-	rows, err := s.db.Query(`SELECT `+expr+` AS k, `+statCols+` FROM request_logs WHERE created_at >= ? GROUP BY k ORDER BY `+order, usd, cny, since)
+// statAcc accumulates one group of the stats.
+type statAcc struct {
+	row            StatRow
+	latency        int64
+	ttfbSum, ttfbN int64
+}
+
+func (a *statAcc) result(key string) StatRow {
+	r := a.row
+	r.Key = key
+	if r.Requests > 0 {
+		r.AvgLatencyMs = float64(a.latency) / float64(r.Requests)
+	}
+	if a.ttfbN > 0 {
+		r.AvgTTFBMs = float64(a.ttfbSum) / float64(a.ttfbN)
+	}
+	return r
+}
+
+// sortedRows orders groups by request count (then key), like the console expects.
+func sortedRows(m map[string]*statAcc) []StatRow {
+	out := make([]StatRow, 0, len(m))
+	for k, a := range m {
+		out = append(out, a.result(k))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Requests != out[j].Requests {
+			return out[i].Requests > out[j].Requests
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out
+}
+
+// GetStats aggregates logs since the given unix ms in a single scan; the
+// timeline uses fixed buckets of bucketMs (gaps filled with zero rows, keys
+// in local time). Costs are converted to the display currency.
+func (s *Store) GetStats(since int64, bucketMs int64) (*Stats, error) {
+	settings := s.GetSettings()
+	usd, cny := settings.CurrencyFactors()
+	st := &Stats{Since: since, BucketMs: bucketMs, Currency: settings.Currency}
+	rows, err := s.db.Query(`SELECT created_at, public_model, provider, upstream_model, key_name, success, fallback,
+		input_tokens, output_tokens, cached_tokens, latency_ms, ttfb_ms, cost, currency, cost_source
+		FROM request_logs WHERE created_at >= ?`, since)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []StatRow{}
+	var total statAcc
+	byModel, byProvider, byTarget, byKey := map[string]*statAcc{}, map[string]*statAcc{}, map[string]*statAcc{}, map[string]*statAcc{}
+	byBucket := map[int64]*statAcc{}
+	off := tzOffsetMs()
+	group := func(m map[string]*statAcc, k string) *statAcc {
+		a, ok := m[k]
+		if !ok {
+			a = &statAcc{}
+			m[k] = a
+		}
+		return a
+	}
 	for rows.Next() {
-		var r StatRow
-		var avgTTFB *float64
-		var avgLat *float64
-		var succ, fail, fb, in, outT, cached, unpriced *int64
-		var cost *float64
-		if err := rows.Scan(&r.Key, &r.Requests, &succ, &fail, &fb, &in, &outT, &cached, &avgLat, &avgTTFB, &cost, &unpriced); err != nil {
+		var created, in, out, cached, latency, ttfb int64
+		var model, provider, upModel, keyName, currency, source string
+		var success, fallback int
+		var cost float64
+		if err := rows.Scan(&created, &model, &provider, &upModel, &keyName, &success, &fallback,
+			&in, &out, &cached, &latency, &ttfb, &cost, &currency, &source); err != nil {
 			return nil, err
 		}
-		r.Unpriced = deref(unpriced)
-		if cost != nil {
-			r.Cost = *cost
+		switch currency {
+		case CurrencyUSD:
+			cost *= usd
+		case CurrencyCNY:
+			cost *= cny
+		default:
+			cost = 0
 		}
-		r.Success, r.Failed, r.Fallback = deref(succ), deref(fail), deref(fb)
-		r.InputTokens, r.OutputTokens, r.CachedTokens = deref(in), deref(outT), deref(cached)
-		if avgLat != nil {
-			r.AvgLatencyMs = *avgLat
+		target := "(none)"
+		if provider != "" {
+			target = provider + "/" + upModel
+		} else {
+			provider = "(none)"
 		}
-		if avgTTFB != nil {
-			r.AvgTTFBMs = *avgTTFB
+		bucket := (created + off) / bucketMs
+		b, ok := byBucket[bucket]
+		if !ok {
+			b = &statAcc{}
+			byBucket[bucket] = b
 		}
-		out = append(out, r)
+		for _, a := range []*statAcc{&total, group(byModel, model), group(byProvider, provider), group(byTarget, target), group(byKey, keyName), b} {
+			r := &a.row
+			r.Requests++
+			if success == 1 {
+				r.Success++
+			} else {
+				r.Failed++
+			}
+			r.Fallback += int64(fallback)
+			r.InputTokens += in
+			r.OutputTokens += out
+			r.CachedTokens += cached
+			r.Cost += cost
+			if source == "" && in+out > 0 {
+				r.Unpriced++
+			}
+			a.latency += latency
+			if ttfb > 0 {
+				a.ttfbSum += ttfb
+				a.ttfbN++
+			}
+		}
 	}
-	return out, rows.Err()
-}
-
-func deref(p *int64) int64 {
-	if p == nil {
-		return 0
-	}
-	return *p
-}
-
-// GetStats aggregates logs since the given unix ms; the timeline uses
-// fixed buckets of bucketMs (gaps filled with zero rows, keys in local time).
-func (s *Store) GetStats(since int64, bucketMs int64) (*Stats, error) {
-	st := &Stats{Since: since, BucketMs: bucketMs, Currency: s.GetSettings().Currency}
-	tot, err := s.statGroup(`'total'`, since, "k")
-	if err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if len(tot) > 0 {
-		st.Total = tot[0]
-	}
-	st.Total.Key = "total"
-	if st.ByModel, err = s.statGroup(`public_model`, since, "COUNT(*) DESC"); err != nil {
-		return nil, err
-	}
-	if st.ByProvider, err = s.statGroup(`CASE WHEN provider = '' THEN '(none)' ELSE provider END`, since, "COUNT(*) DESC"); err != nil {
-		return nil, err
-	}
-	if st.ByTarget, err = s.statGroup(`CASE WHEN provider = '' THEN '(none)' ELSE provider || '/' || upstream_model END`, since, "COUNT(*) DESC"); err != nil {
-		return nil, err
-	}
-	if st.ByKey, err = s.statGroup(`key_name`, since, "COUNT(*) DESC"); err != nil {
-		return nil, err
-	}
-	rows, err := s.statGroup(fmt.Sprintf(`CAST((created_at + %d) / %d AS TEXT)`, tzOffsetMs(), bucketMs), since, "k")
-	if err != nil {
-		return nil, err
-	}
-	byBucket := map[int64]StatRow{}
-	for _, r := range rows {
-		n, _ := strconv.ParseInt(r.Key, 10, 64)
-		byBucket[n] = r
-	}
-	off := tzOffsetMs()
+	st.Total = total.result("total")
+	st.ByModel, st.ByProvider, st.ByTarget, st.ByKey = sortedRows(byModel), sortedRows(byProvider), sortedRows(byTarget), sortedRows(byKey)
 	first, last := (since+off)/bucketMs, (time.Now().UnixMilli()+off)/bucketMs
 	layout := "01-02 15:04"
 	if bucketMs >= 24*3600*1000 {
 		layout = "2006-01-02"
 	}
-	for b := first; b <= last; b++ {
-		r := byBucket[b]
-		r.Key = time.UnixMilli(b*bucketMs - off).Format(layout)
+	for k := first; k <= last; k++ {
+		var r StatRow
+		if a, ok := byBucket[k]; ok {
+			r = a.result("")
+		}
+		r.Key = time.UnixMilli(k*bucketMs - off).Format(layout)
 		st.Timeline = append(st.Timeline, r)
 	}
 	return st, nil

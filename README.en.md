@@ -399,6 +399,32 @@ On each upstream the gateway **first decides whether to retry, then whether to f
 - **Backup and migration**: *Settings* can export and import the whole configuration (JSON, including upstream keys — keep it safe).
 - **Single instance**: circuit-breaker state, rate-limit counters and concurrency slots live in memory, so run one instance; after a restart breakers start fresh and the month's spend is recomputed from the logs.
 
+## Resource usage and sizing
+
+Measured on a local load test (Apple Silicon, loopback, mock upstream sending 50 events per second per stream) — use it as a starting point for capacity planning:
+
+| Scenario | Result |
+|---|---|
+| Gateway overhead (non-streaming, small request) | about 0.05 ms per request |
+| Idle memory | about 20 MB |
+| 1000 concurrent streams (small prompts) | about 155 MB resident, about 1.4 CPU cores, time to first byte p99 < 1 ms |
+| 500 concurrent streams (200 KB prompt each) | about 500 MB resident (about 1 MB per stream, mostly the request body itself) |
+| Request log | about 270 bytes per row, about 2.7 MB per 10,000 requests |
+| Dashboard stats (4.3 million log rows) | about 4 s, cached for 10 s |
+
+Memory grows with **requests in flight × request body size**; CPU grows with the number of streamed events. The gateway adds almost no latency — the upstream is usually the bottleneck.
+
+| Size | CPU | Memory | Disk | Notes |
+|---|---|---|---|---|
+| Personal / small team (≤ 10 people) | 1 core | 512 MB | 2–5 GB | defaults are fine |
+| Team (≤ 50 people) | 2 cores | 1–2 GB | 10 GB SSD | 30-day log retention |
+| Department (200–500 people) | 4 cores | 2–4 GB | 20–50 GB SSD | keep logs 7–14 days |
+
+- When the container has a memory limit, also set `GOMEMLIMIT` to about 80% of it (e.g. `GOMEMLIMIT=1600MiB`) so Go collects more aggressively before hitting the limit.
+- Use the API key *Max concurrency* and the provider *Max concurrency* to cap peak memory, so a few clients cannot take everything.
+- Logs live in SQLite and the gateway runs as a single instance (see above); stats take longer as the log grows, so shorten retention for very busy gateways.
+- On Linux, raise `net.core.somaxconn` if many clients connect at the same moment.
+
 ## FAQ
 
 <details>

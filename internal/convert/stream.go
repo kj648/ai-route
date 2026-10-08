@@ -25,7 +25,9 @@ type SSEReader struct {
 }
 
 func NewSSEReader(r io.Reader) *SSEReader {
-	return &SSEReader{r: bufio.NewReaderSize(r, 64*1024)}
+	// small buffer: it is held for the whole life of every stream; longer
+	// lines are assembled by readLine
+	return &SSEReader{r: bufio.NewReaderSize(r, 8*1024)}
 }
 
 // MaxEventBytes caps a single SSE line and a single event, so a broken or

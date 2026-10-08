@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -51,11 +52,13 @@ type Gateway struct {
 
 func New(s *store.Store) *Gateway {
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   50,
+		Proxy:             http.ProxyFromEnvironment,
+		DialContext:       (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2: true,
+		// keep enough idle connections that busy upstreams reuse TLS sessions
+		// instead of handshaking per request
+		MaxIdleConns:          4096,
+		MaxIdleConnsPerHost:   1024,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: time.Second,
@@ -684,7 +687,7 @@ func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound st
 			url = strings.TrimSuffix(url, "/messages") + path
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(upBody)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(upBody))
 	if err != nil {
 		return nil, false, nil, err
 	}

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -258,8 +259,12 @@ type Store struct {
 
 	logMu     sync.RWMutex
 	logClosed bool
-	logCh     chan *RequestLog
-	logDone   chan struct{}
+	// dropped counts log entries lost to a full queue; droppedLog is when
+	// that was last reported (unix ms)
+	dropped    atomic.Int64
+	droppedLog atomic.Int64
+	logCh      chan *RequestLog
+	logDone    chan struct{}
 }
 
 func Open(dataDir string) (*Store, error) {
@@ -269,12 +274,14 @@ func Open(dataDir string) (*Store, error) {
 	}
 	_ = os.Chmod(dataDir, 0o700)
 	dsn := "file:" + filepath.Join(dataDir, "ai-route.db") +
-		"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)"
+		"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)" +
+		"&_pragma=journal_size_limit(67108864)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(4)
+	// readers (console, stats) must not starve the log writer
+	db.SetMaxOpenConns(16)
 	s := &Store{db: db, logCh: make(chan *RequestLog, 4096), logDone: make(chan struct{})}
 	if err := s.migrate(); err != nil {
 		db.Close()
@@ -305,6 +312,7 @@ func (s *Store) enableIncrementalVacuum() error {
 	if mode == 2 { // incremental
 		return nil
 	}
+	log.Printf("store: enabling incremental vacuum (one-time VACUUM, may take a while on a large database)")
 	if _, err := s.db.Exec(`PRAGMA auto_vacuum = INCREMENTAL`); err != nil {
 		return err
 	}
