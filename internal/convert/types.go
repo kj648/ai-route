@@ -24,20 +24,31 @@ type Usage struct {
 // ---------- OpenAI request ----------
 
 type OAChatRequest struct {
-	Model               string           `json:"model"`
-	Messages            []OAMessage      `json:"messages"`
-	MaxTokens           *int             `json:"max_tokens,omitempty"`
-	MaxCompletionTokens *int             `json:"max_completion_tokens,omitempty"`
-	Temperature         *float64         `json:"temperature,omitempty"`
-	TopP                *float64         `json:"top_p,omitempty"`
-	Stop                json.RawMessage  `json:"stop,omitempty"`
-	Stream              bool             `json:"stream,omitempty"`
-	StreamOptions       *OAStreamOptions `json:"stream_options,omitempty"`
-	Tools               []OATool         `json:"tools,omitempty"`
-	ToolChoice          json.RawMessage  `json:"tool_choice,omitempty"`
-	ParallelToolCalls   *bool            `json:"parallel_tool_calls,omitempty"`
-	ReasoningEffort     string           `json:"reasoning_effort,omitempty"`
-	User                string           `json:"user,omitempty"`
+	Model               string            `json:"model"`
+	Messages            []OAMessage       `json:"messages"`
+	MaxTokens           *int              `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int              `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64          `json:"temperature,omitempty"`
+	TopP                *float64          `json:"top_p,omitempty"`
+	Stop                json.RawMessage   `json:"stop,omitempty"`
+	Stream              bool              `json:"stream,omitempty"`
+	StreamOptions       *OAStreamOptions  `json:"stream_options,omitempty"`
+	Tools               []OATool          `json:"tools,omitempty"`
+	ToolChoice          json.RawMessage   `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool             `json:"parallel_tool_calls,omitempty"`
+	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
+	ResponseFormat      *OAResponseFormat `json:"response_format,omitempty"`
+	User                string            `json:"user,omitempty"`
+}
+
+type OAResponseFormat struct {
+	Type       string `json:"type"` // text | json_object | json_schema
+	JSONSchema *struct {
+		Name        string          `json:"name,omitempty"`
+		Description string          `json:"description,omitempty"`
+		Schema      json.RawMessage `json:"schema,omitempty"`
+		Strict      bool            `json:"strict,omitempty"`
+	} `json:"json_schema,omitempty"`
 }
 
 type OAStreamOptions struct {
@@ -52,6 +63,9 @@ type OAMessage struct {
 	ToolCallID       string          `json:"tool_call_id,omitempty"`
 	ReasoningContent string          `json:"reasoning_content,omitempty"`
 	Reasoning        string          `json:"reasoning,omitempty"`
+	// CacheControl is the message-level Anthropic cache breakpoint some
+	// OpenAI-format clients send; it applies to the message's last block.
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 type OAContentPart struct {
@@ -61,6 +75,7 @@ type OAContentPart struct {
 		URL    string `json:"url"`
 		Detail string `json:"detail,omitempty"`
 	} `json:"image_url,omitempty"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 type OAToolCall struct {
@@ -80,6 +95,7 @@ type OATool struct {
 		Description string          `json:"description,omitempty"`
 		Parameters  json.RawMessage `json:"parameters,omitempty"`
 	} `json:"function"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 // ---------- OpenAI response ----------

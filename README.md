@@ -182,8 +182,10 @@ curl http://服务器:8080/v1/chat/completions \
 | 客户端 → 上游 | 处理方式 |
 |---|---|
 | OpenAI → OpenAI、Anthropic → Anthropic | 直通，只改写 `model` 字段，其他字段原样转发 |
-| OpenAI → Anthropic | `system`/`developer` 消息 → `system`；`tool_calls`/`tool` 消息 → `tool_use`/`tool_result`；图片 → image block；`reasoning_effort` → `thinking` 预算；流式事件转换成 chunk，包括 `reasoning_content` |
+| OpenAI → Anthropic | `system`/`developer` 消息 → `system`；`tool_calls`/`tool` 消息 → `tool_use`/`tool_result`；图片 → image block；`reasoning_effort` → `thinking` 预算；`cache_control` 原样保留（写在内容块、消息或工具上都行，写在消息上时加到该消息的最后一个块）；`response_format` 见下文；流式事件转换成 chunk，包括 `reasoning_content` |
 | Anthropic → OpenAI | `tool_use`/`tool_result` → `tool_calls`/`tool` 消息；`thinking` → `reasoning_content`；服务端工具（如 `web_search`）没有对应物，会被丢弃；流式 chunk 会还原成完整的 Anthropic 事件序列 |
+
+`response_format` 的处理：上游是 Anthropic 官方（`api.anthropic.com`）且为 `json_schema` + `strict: true` 时，转成原生结构化输出 `output_config.format`；其他情况（`json_object`、非 strict 的 schema、其他厂商的 Anthropic 兼容端点）在 `system` 末尾追加一段“只输出 JSON（并符合该 schema）”的要求。兼容端点不一定认识 `output_config`，贸然发送可能被 400 拒绝。
 
 OpenAI 流式直通时，网关会自动向上游加上 `stream_options.include_usage` 来统计用量。如果客户端自己没有请求用量，这个仅含用量的 chunk 会被过滤掉，不会转发给客户端。
 

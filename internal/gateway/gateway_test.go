@@ -805,3 +805,46 @@ func TestUserAgentPolicy(t *testing.T) {
 		t.Fatal("override without user_agent accepted")
 	}
 }
+
+func TestOpenAIClientAnthropicUpstreamKeepsCacheAndFormat(t *testing.T) {
+	h := newHarness(t)
+	h.model("coder", "an/ok")
+	req := oaReq("coder", false)
+	req["messages"] = []map[string]any{
+		{"role": "system", "content": []map[string]any{{"type": "text", "text": "sys", "cache_control": map[string]any{"type": "ephemeral"}}}},
+		{"role": "user", "content": "hi", "cache_control": map[string]any{"type": "ephemeral"}},
+	}
+	req["response_format"] = map[string]any{"type": "json_object"}
+	resp, body := h.post("/v1/chat/completions", req)
+	if resp.StatusCode != 200 {
+		t.Fatal(body)
+	}
+	up := h.mock.Body("ok")
+	sys := up["system"].([]any)
+	if len(sys) != 2 || sys[0].(map[string]any)["cache_control"] == nil ||
+		!strings.Contains(sys[1].(map[string]any)["text"].(string), "valid JSON") {
+		t.Fatalf("upstream system: %v", sys)
+	}
+	user := up["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if user["cache_control"] == nil {
+		t.Fatalf("upstream user: %v", user)
+	}
+	// the mock is not api.anthropic.com, so no native structured output
+	if _, ok := up["output_config"]; ok {
+		t.Fatalf("output_config sent to a compatible upstream: %v", up)
+	}
+}
+
+func TestIsOfficialAnthropic(t *testing.T) {
+	for base, want := range map[string]bool{
+		"https://api.anthropic.com":              true,
+		"https://API.anthropic.com/v1":           true,
+		"https://open.bigmodel.cn/api/anthropic": false,
+		"https://api.anthropic.com.evil.test":    false,
+		"":                                       false,
+	} {
+		if got := isOfficialAnthropic(base); got != want {
+			t.Errorf("%q: got %v", base, got)
+		}
+	}
+}

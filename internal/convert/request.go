@@ -88,8 +88,10 @@ func stripConvertedThinking(raw json.RawMessage) (json.RawMessage, bool) {
 // ===================== OpenAI -> Anthropic =====================
 
 // OpenAIToAnthropicRequest converts a chat completions request into a
-// messages request for the given upstream model.
-func OpenAIToAnthropicRequest(body []byte, model string, defaultMaxTokens int) ([]byte, error) {
+// messages request for the given upstream model. nativeStructured reports
+// whether the upstream accepts output_config.format (structured outputs);
+// when it does not, response_format is enforced through the system prompt.
+func OpenAIToAnthropicRequest(body []byte, model string, defaultMaxTokens int, nativeStructured bool) ([]byte, error) {
 	var req OAChatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid chat completions request: %w", err)
@@ -119,28 +121,34 @@ func OpenAIToAnthropicRequest(body []byte, model string, defaultMaxTokens int) (
 	for _, m := range req.Messages {
 		switch m.Role {
 		case "system", "developer":
-			if t := oaContentText(m.Content); t != "" {
-				system = append(system, map[string]any{"type": "text", "text": t})
+			var blocks []map[string]any
+			for _, p := range oaContentParts(m.Content) {
+				if p.Type == "text" && p.Text != "" {
+					blocks = append(blocks, withCacheControl(map[string]any{"type": "text", "text": p.Text}, p.CacheControl))
+				}
 			}
+			system = append(system, withMessageCacheControl(blocks, m.CacheControl)...)
 		case "user":
 			var blocks []map[string]any
 			for _, p := range oaContentParts(m.Content) {
 				switch p.Type {
 				case "text":
 					if p.Text != "" {
-						blocks = append(blocks, map[string]any{"type": "text", "text": p.Text})
+						blocks = append(blocks, withCacheControl(map[string]any{"type": "text", "text": p.Text}, p.CacheControl))
 					}
 				case "image_url":
 					if p.ImageURL != nil {
-						blocks = append(blocks, imageURLToBlock(p.ImageURL.URL))
+						blocks = append(blocks, withCacheControl(imageURLToBlock(p.ImageURL.URL), p.CacheControl))
 					}
 				}
 			}
-			appendMsg("user", blocks)
+			appendMsg("user", withMessageCacheControl(blocks, m.CacheControl))
 		case "assistant":
 			var blocks []map[string]any
-			if t := oaContentText(m.Content); t != "" {
-				blocks = append(blocks, map[string]any{"type": "text", "text": t})
+			for _, p := range oaContentParts(m.Content) {
+				if p.Type == "text" && p.Text != "" {
+					blocks = append(blocks, withCacheControl(map[string]any{"type": "text", "text": p.Text}, p.CacheControl))
+				}
 			}
 			for _, tc := range m.ToolCalls {
 				blocks = append(blocks, map[string]any{
@@ -150,14 +158,25 @@ func OpenAIToAnthropicRequest(body []byte, model string, defaultMaxTokens int) (
 					"input": parseArgs(tc.Function.Arguments),
 				})
 			}
-			appendMsg("assistant", blocks)
+			appendMsg("assistant", withMessageCacheControl(blocks, m.CacheControl))
 		case "tool", "function":
-			appendMsg("user", []map[string]any{{
+			// tool_result carries text only, so a breakpoint on any of the
+			// message's parts moves onto the tool_result block itself.
+			cc := m.CacheControl
+			for _, p := range oaContentParts(m.Content) {
+				if !isNullOrEmpty(p.CacheControl) {
+					cc = p.CacheControl
+				}
+			}
+			appendMsg("user", []map[string]any{withCacheControl(map[string]any{
 				"type":        "tool_result",
 				"tool_use_id": m.ToolCallID,
 				"content":     oaContentText(m.Content),
-			}})
+			}, cc)})
 		}
+	}
+	if t := responseFormatInstruction(req.ResponseFormat, nativeStructured); t != "" {
+		system = append(system, map[string]any{"type": "text", "text": t})
 	}
 	if len(msgs) > 0 && msgs[0]["role"] != "user" {
 		msgs = append([]map[string]any{{"role": "user", "content": []map[string]any{{"type": "text", "text": "(continue)"}}}}, msgs...)
@@ -199,7 +218,7 @@ func OpenAIToAnthropicRequest(body []byte, model string, defaultMaxTokens int) (
 			if t.Function.Description != "" {
 				tool["description"] = t.Function.Description
 			}
-			tools = append(tools, tool)
+			tools = append(tools, withCacheControl(tool, t.CacheControl))
 		}
 		if len(tools) > 0 {
 			out["tools"] = tools
@@ -220,7 +239,71 @@ func OpenAIToAnthropicRequest(body []byte, model string, defaultMaxTokens int) (
 	if req.User != "" {
 		out["metadata"] = map[string]any{"user_id": req.User}
 	}
+	if schema := nativeOutputSchema(req.ResponseFormat, nativeStructured); schema != nil {
+		out["output_config"] = map[string]any{"format": map[string]any{"type": "json_schema", "schema": schema}}
+	}
 	return json.Marshal(out)
+}
+
+// withCacheControl copies an Anthropic cache breakpoint onto block.
+func withCacheControl(block map[string]any, cc json.RawMessage) map[string]any {
+	if !isNullOrEmpty(cc) {
+		block["cache_control"] = cc
+	}
+	return block
+}
+
+// withMessageCacheControl applies a message-level breakpoint to the last
+// block, unless that block already carries its own.
+func withMessageCacheControl(blocks []map[string]any, cc json.RawMessage) []map[string]any {
+	if n := len(blocks); n > 0 {
+		if _, ok := blocks[n-1]["cache_control"]; !ok {
+			withCacheControl(blocks[n-1], cc)
+		}
+	}
+	return blocks
+}
+
+// nativeOutputSchema returns the schema to send as output_config.format.
+// Only strict json_schema is mapped: Anthropic requires the same schema
+// restrictions (additionalProperties: false etc.) that OpenAI strict mode
+// does, while a non-strict schema may be rejected.
+func nativeOutputSchema(rf *OAResponseFormat, native bool) json.RawMessage {
+	if !native || rf == nil || rf.Type != "json_schema" || rf.JSONSchema == nil ||
+		!rf.JSONSchema.Strict || isNullOrEmpty(rf.JSONSchema.Schema) {
+		return nil
+	}
+	return rf.JSONSchema.Schema
+}
+
+// responseFormatInstruction is the system prompt text that enforces
+// response_format when the upstream cannot do it natively.
+func responseFormatInstruction(rf *OAResponseFormat, native bool) string {
+	if rf == nil || nativeOutputSchema(rf, native) != nil {
+		return ""
+	}
+	const plain = "Respond with valid JSON only: no Markdown code fences and no text before or after the JSON."
+	switch rf.Type {
+	case "json_object":
+		return plain
+	case "json_schema":
+		if rf.JSONSchema == nil || isNullOrEmpty(rf.JSONSchema.Schema) {
+			return plain
+		}
+		var sb strings.Builder
+		sb.WriteString(plain)
+		sb.WriteString(" The JSON must conform to this JSON Schema")
+		if rf.JSONSchema.Name != "" {
+			sb.WriteString(" (" + rf.JSONSchema.Name + ")")
+		}
+		sb.WriteString(":\n")
+		sb.Write(rf.JSONSchema.Schema)
+		if rf.JSONSchema.Description != "" {
+			sb.WriteString("\nSchema description: " + rf.JSONSchema.Description)
+		}
+		return sb.String()
+	}
+	return ""
 }
 
 func effortBudget(effort string) int {

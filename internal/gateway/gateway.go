@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -415,6 +416,14 @@ func anthropicURL(base string) string {
 	}
 }
 
+// isOfficialAnthropic reports whether base points at the Anthropic API itself.
+// Compatible endpoints of other vendors may reject newer request fields such
+// as output_config, so those are only sent here.
+func isOfficialAnthropic(base string) bool {
+	u, err := url.Parse(base)
+	return err == nil && strings.EqualFold(u.Hostname(), "api.anthropic.com")
+}
+
 // buildUpstream converts the client body for the candidate and creates the request.
 func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound string, body []byte, st store.Settings, path string) (*http.Request, bool, error) {
 	var upBody []byte
@@ -424,7 +433,7 @@ func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound st
 	case c.proto == inbound:
 		upBody, clientUsage, err = convert.RewriteModel(body, c.model, c.proto)
 	case inbound == convert.ProtoOpenAI:
-		upBody, err = convert.OpenAIToAnthropicRequest(body, c.model, st.DefaultMaxTokens)
+		upBody, err = convert.OpenAIToAnthropicRequest(body, c.model, st.DefaultMaxTokens, isOfficialAnthropic(c.provider.AnthropicBaseURL))
 		clientUsage = convert.ClientWantsUsage(body)
 	default:
 		upBody, err = convert.AnthropicToOpenAIRequest(body, c.model)
