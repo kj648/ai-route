@@ -18,6 +18,8 @@ type Attempt struct {
 	LatencyMs  int64  `json:"latency_ms"`
 	Error      string `json:"error,omitempty"`
 	Cooling    bool   `json:"cooling,omitempty"` // tried as last resort while cooling down
+	// Headers are the resolved values of dynamic provider headers.
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 type RequestLog struct {
@@ -43,6 +45,7 @@ type RequestLog struct {
 	Attempts         []Attempt `json:"attempts"`
 	Error            string    `json:"error"`
 	ClientIP         string    `json:"client_ip"`
+	RequestID        string    `json:"request_id"`
 	// Cost is in Currency; CostSource is "upstream" (reported by the
 	// upstream, e.g. OpenRouter), "price" (from the provider's unit prices)
 	// or "" (not costed).
@@ -127,7 +130,7 @@ func (s *Store) insertLogs(batch []*RequestLog) error {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.Prepare(`INSERT INTO request_logs (created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	stmt, err := tx.Prepare(`INSERT INTO request_logs (created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source, request_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -137,7 +140,7 @@ func (s *Store) insertLogs(batch []*RequestLog) error {
 		if attempts == nil {
 			attempts = []Attempt{}
 		}
-		if _, err := stmt.Exec(l.CreatedAt, l.KeyID, l.KeyName, l.RequestedModel, l.PublicModel, l.Inbound, b2i(l.Stream), l.Provider, l.UpstreamModel, l.UpstreamProtocol, b2i(l.Success), l.HTTPStatus, l.LatencyMs, l.TTFBMs, l.InputTokens, l.OutputTokens, l.CachedTokens, b2i(l.Fallback), mustJSON(attempts), l.Error, l.ClientIP, l.Cost, l.Currency, l.CostSource); err != nil {
+		if _, err := stmt.Exec(l.CreatedAt, l.KeyID, l.KeyName, l.RequestedModel, l.PublicModel, l.Inbound, b2i(l.Stream), l.Provider, l.UpstreamModel, l.UpstreamProtocol, b2i(l.Success), l.HTTPStatus, l.LatencyMs, l.TTFBMs, l.InputTokens, l.OutputTokens, l.CachedTokens, b2i(l.Fallback), mustJSON(attempts), l.Error, l.ClientIP, l.Cost, l.Currency, l.CostSource, l.RequestID); err != nil {
 			return err
 		}
 	}
@@ -204,7 +207,7 @@ func (s *Store) QueryLogs(q LogQuery) ([]*RequestLog, int64, error) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM request_logs`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.Query(`SELECT id, created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source FROM request_logs`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`,
+	rows, err := s.db.Query(`SELECT id, created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source, request_id FROM request_logs`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`,
 		append(args, q.Limit, q.Offset)...)
 	if err != nil {
 		return nil, 0, err
@@ -215,7 +218,7 @@ func (s *Store) QueryLogs(q LogQuery) ([]*RequestLog, int64, error) {
 		l := &RequestLog{}
 		var stream, success, fallback int
 		var attempts string
-		if err := rows.Scan(&l.ID, &l.CreatedAt, &l.KeyID, &l.KeyName, &l.RequestedModel, &l.PublicModel, &l.Inbound, &stream, &l.Provider, &l.UpstreamModel, &l.UpstreamProtocol, &success, &l.HTTPStatus, &l.LatencyMs, &l.TTFBMs, &l.InputTokens, &l.OutputTokens, &l.CachedTokens, &fallback, &attempts, &l.Error, &l.ClientIP, &l.Cost, &l.Currency, &l.CostSource); err != nil {
+		if err := rows.Scan(&l.ID, &l.CreatedAt, &l.KeyID, &l.KeyName, &l.RequestedModel, &l.PublicModel, &l.Inbound, &stream, &l.Provider, &l.UpstreamModel, &l.UpstreamProtocol, &success, &l.HTTPStatus, &l.LatencyMs, &l.TTFBMs, &l.InputTokens, &l.OutputTokens, &l.CachedTokens, &fallback, &attempts, &l.Error, &l.ClientIP, &l.Cost, &l.Currency, &l.CostSource, &l.RequestID); err != nil {
 			return nil, 0, err
 		}
 		l.Stream, l.Success, l.Fallback = stream == 1, success == 1, fallback == 1

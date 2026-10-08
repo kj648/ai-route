@@ -531,3 +531,37 @@ func TestImportKeepsKeyIDs(t *testing.T) {
 		t.Fatalf("spend lost: %v", spend)
 	}
 }
+
+func TestProviderHeaderTemplates(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []map[string]string{{"X-A": "{{$typo}}"}, {"X-A": "{{header.Authorization}}"}, {"Bad Name": "x"}} {
+		if err := st.CreateProvider(&Provider{Prefix: "x", OpenAIBaseURL: "http://a/v1", Headers: h}); err == nil {
+			t.Errorf("accepted %v", h)
+		}
+	}
+	if err := st.CreateProvider(&Provider{Prefix: "x", OpenAIBaseURL: "http://a/v1", UAMode: "platform"}); err != nil {
+		t.Fatal(err)
+	}
+	// an OpenCode Go provider saved by an older version: one fixed session for everything
+	mustNil(t, st.CreateProvider(&Provider{Prefix: "opencode", Vendor: "opencode-go", OpenAIBaseURL: "https://opencode.ai/zen/go/v1",
+		Headers: map[string]string{"x-opencode-session": "ai-route", "X-Other": "keep"}}))
+	mustNil(t, st.CreateProvider(&Provider{Prefix: "mine", Vendor: "opencode-go", OpenAIBaseURL: "https://opencode.ai/zen/go/v1",
+		Headers: map[string]string{"x-opencode-session": "my-own"}}))
+	st.Close()
+	st, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	p := st.Snapshot().Providers
+	if p["opencode"].Headers["x-opencode-session"] != OpenCodeSessionHeader || p["opencode"].Headers["X-Other"] != "keep" {
+		t.Fatalf("not migrated: %v", p["opencode"].Headers)
+	}
+	if p["mine"].Headers["x-opencode-session"] != "my-own" {
+		t.Fatalf("custom value changed: %v", p["mine"].Headers)
+	}
+}

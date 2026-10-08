@@ -174,11 +174,18 @@ function renderLogin(msg) {
   $('#login-token').focus();
 }
 
+// the gateway's own User-Agent fingerprint (ai-route/<version>)
+let PLATFORM_UA = 'ai-route';
+
 function renderShell() {
+  api('GET', '/ping').then((r) => {
+    if (r.user_agent) PLATFORM_UA = r.user_agent;
+    if (r.version && $('#brand-ver')) $('#brand-ver').textContent = 'v' + r.version;
+  }).catch(() => {});
   $('#app').innerHTML = `
     <div class="layout">
       <aside class="sidebar">
-        <div class="brand"><span class="dot"></span>AI Route</div>
+        <div class="brand"><span class="dot"></span>AI Route <span class="muted small" id="brand-ver"></span></div>
         <nav class="nav">${PAGES.map(([id, name]) => `<a href="#/${id}" data-page="${id}">${name}</a>`).join('')}</nav>
         <div class="foot"><button class="btn sm" id="logout">退出登录</button></div>
       </aside>
@@ -238,6 +245,18 @@ function parseEntry(entry) {
   });
 }
 const entryTargets = (entry) => parseEntry(entry).map((x) => x.t);
+// caller headers a provider requires: {{header.X}} with no "?" and no fallback
+function requiredHeaders(p) {
+  const out = [];
+  for (const v of Object.values((p && p.headers) || {})) {
+    for (const m of v.matchAll(/\{\{([^}]*)\}\}/g)) {
+      const parts = m[1].split('??').map((x) => x.trim());
+      const last = parts[parts.length - 1];
+      if (last.startsWith('header.') && !last.endsWith('?')) out.push(last.slice(7));
+    }
+  }
+  return out;
+}
 function chainHTML(targets, idx, providers) {
   if (!targets.length) return '<span class="muted small">未配置</span>';
   const one = (t, w, group) => {
@@ -479,7 +498,7 @@ function addModels(state, text) {
   return n;
 }
 
-const UA_LABEL = { passthrough: '透传客户端', override: '固定 UA' };
+const UA_LABEL = { passthrough: '透传客户端', platform: '平台标识', override: '固定 UA' };
 
 // Prefix rules (mirrors store.DerivePrefix): preset prefix, else the API
 // host (api.deepseek.com -> deepseek), else the name, else "provider";
@@ -586,7 +605,7 @@ function providerForm(p, models, providers) {
       </div>
       <div class="field"><label>User-Agent</label>
         <div class="toolbar">
-          <div class="seg" id="pf-ua">${['passthrough', 'override'].map((c) => `<button type="button" data-u="${c}">${UA_LABEL[c]}</button>`).join('')}</div>
+          <div class="seg" id="pf-ua">${['passthrough', 'platform', 'override'].map((c) => `<button type="button" data-u="${c}">${UA_LABEL[c]}</button>`).join('')}</div>
           <input type="text" id="pf-ua-value" value="${esc(p.user_agent)}" style="flex:1;min-width:200px">
         </div>
         <div class="help" id="pf-ua-help"></div>
@@ -600,8 +619,13 @@ function providerForm(p, models, providers) {
           </div>
           <div class="row2">
             <div class="field"><label>模型协议规则</label><textarea id="pf-protos" placeholder="minimax-* = anthropic&#10;glm-* = openai">${esc(toLines(p.model_protocols, ' ='))}</textarea><div class="help">每行 <code>模型(可用*) = openai|anthropic</code>，某些模型只在一种端点提供时使用</div></div>
-            <div class="field"><label>自定义请求头</label><textarea id="pf-headers" placeholder="X-Custom: value">${esc(toLines(p.headers, ':'))}</textarea><div class="help">每行 <code>Header: 值</code>，值留空表示删除该头</div></div>
+            <div class="field"><label>自定义请求头</label><textarea id="pf-headers" placeholder="X-Custom: value&#10;x-opencode-session: {{header.x-opencode-session ?? $conversation}}">${esc(toLines(p.headers, ':'))}</textarea>
+              <div class="help">每行 <code>Header: 值</code>，覆盖调用方的同名头；值留空表示删除该头。值里可以写：
+                <code>{{header.X-Foo}}</code> 取调用方的头，<b>必传</b>（首选上游缺了直接报 400，候补上缺了就不发）；
+                <code>{{header.X-Foo?}}</code> 可选；<code>{{header.X-Foo ?? $conversation}}</code> 没传就用平台生成的；
+                内置变量 <code>$conversation</code>（同一会话稳定的 ses_…）、<code>$uuid</code>（每次请求新的）、<code>$requestId</code>、<code>$timestamp</code>、<code>$keyName</code>、<code>$keyId</code>、<code>$model</code></div></div>
           </div>
+          <label class="check"><input type="checkbox" id="pf-pass-headers" ${p.drop_client_headers ? '' : 'checked'}> 透传调用方的请求头 <span class="muted small">（不会转发 Authorization、x-api-key、Cookie、Accept-Encoding、X-Forwarded-*、Origin 等凭证、逐跳和隐私相关的头）</span></label>
           <div class="field"><label>自建模型（vLLM、SGLang、Ollama 等）</label>
             <div class="row3">
               <div><input type="number" id="pf-maxc" min="0" value="${p.max_concurrency || ''}" placeholder="最大并发：不限"><div class="help">同时在途的请求数上限，满了就溢出到下一个候补；都满时排队（见设置）</div></div>
@@ -633,11 +657,14 @@ function providerForm(p, models, providers) {
         state.ua = u;
         $$('#pf-ua button', m).forEach((b) => b.classList.toggle('on', b.dataset.u === u));
         const input = $('#pf-ua-value', m);
-        input.placeholder = u === 'override' ? '必填，所有请求都使用这个 UA' : '可选，客户端没带 UA 时使用';
+        input.style.display = u === 'platform' ? 'none' : '';
+        input.placeholder = u === 'override' ? '必填，所有请求都使用这个 UA' : `可选，客户端没带 UA 时使用；不填则用平台标识 ${PLATFORM_UA}`;
         const ps = presetById(state.vendor);
         $('#pf-ua-help', m).innerHTML = (u === 'override'
           ? '所有发往该供应商的请求都改用这里填写的 User-Agent。'
-          : '默认把调用方（Claude Code、Cursor 等）的真实 User-Agent 原样转发。限制客户端类型的套餐（如 Kimi Code）需要保持这个选项。')
+          : u === 'platform'
+            ? `所有请求都使用本网关的标识 <code>${PLATFORM_UA}</code>，适合自建模型、中转平台等需要识别来源的上游。限制客户端类型的套餐（如 Kimi Code）不能用这个。`
+            : '默认把调用方（Claude Code、Cursor 等）的真实 User-Agent 原样转发。限制客户端类型的套餐（如 Kimi Code）需要保持这个选项。')
           + (ps && ps.ua && ps.ua.note ? ` <b>${esc(ps.ua.note)}</b>` : '');
       };
       const setKeyLink = () => {
@@ -725,6 +752,7 @@ function providerForm(p, models, providers) {
         anthropic_base_url: state.compat === 'openai' ? '' : $('#pf-anthropic', m).value.trim(),
         api_key: $('#pf-key', m).value.trim(),
         headers: parseLines($('#pf-headers', m).value, ':'),
+        drop_client_headers: !$('#pf-pass-headers', m).checked,
         ua_mode: state.ua,
         user_agent: $('#pf-ua-value', m).value.trim(),
       });
@@ -805,7 +833,7 @@ function providerForm(p, models, providers) {
 }
 
 function testResultHTML(r) {
-  const atts = (r.attempts || []).map((a) => `<tr><td class="mono small">${esc(a.target)}${a.retry ? ` <span class="badge">重试 ${a.retry}</span>` : ''}</td><td>${esc(a.protocol)}</td><td>${a.http_status || '-'}</td><td>${fmtMs(a.latency_ms)}</td><td class="small ${a.error ? 'err-text' : 'ok-text'}">${a.error ? esc(a.error) : '成功'}${a.cooling ? ' <span class="badge warn">冷却中兜底</span>' : ''}</td></tr>`).join('');
+  const atts = (r.attempts || []).map((a) => `<tr><td class="mono small">${esc(a.target)}${a.retry ? ` <span class="badge">重试 ${a.retry}</span>` : ''}</td><td>${esc(a.protocol)}</td><td>${a.http_status || '-'}</td><td>${fmtMs(a.latency_ms)}</td><td class="small ${a.error ? 'err-text' : 'ok-text'}">${a.error ? esc(a.error) : '成功'}${a.cooling ? ' <span class="badge warn">冷却中兜底</span>' : ''}${a.headers ? `<div class="muted mono">${Object.entries(a.headers).map(([k, v]) => `${esc(k)}: ${esc(v)}`).join('<br>')}</div>` : ''}</td></tr>`).join('');
   return `<div class="form">
     <div class="kv">
       <div class="k">结果</div><div>${r.ok ? '<span class="badge ok">成功</span>' : '<span class="badge err">失败</span>'} HTTP ${r.http_status}，耗时 ${fmtMs(r.latency_ms)}</div>
@@ -959,7 +987,13 @@ function modelForm(m, providers, models, idx, asNew = false) {
       return `<div class="chain-row ${r.tie ? 'tied' : ''}">
         <span class="idx">${r.tie ? '并列' : level === 0 ? '首选' : '候补 ' + level}</span>
         <span class="target ${h.cls}" title="${esc(h.tip)}"><span class="s"></span>${esc(r.t)}</span>
-        <span class="muted small">${h.cls === 'missing' ? esc(h.tip) : ''}</span>
+        <span class="muted small">${h.cls === 'missing' ? esc(h.tip) : ''}${(() => {
+          const req = requiredHeaders(providers.find((p) => p.prefix === r.t.split('/')[0]));
+          if (!req.length) return '';
+          return level === 0
+            ? `必传请求头：${esc(req.join('、'))}，调用方没带会直接返回 400`
+            : `必传请求头 ${esc(req.join('、'))} 只在首选生效，作为候补时缺了就不发`;
+        })()}</span>
         <div class="btns">
           ${i > 0 ? `<label class="check small" title="和上一项同一优先级，按权重分流"><input type="checkbox" data-act="tie" ${r.tie ? 'checked' : ''}> 与上一项并列</label>` : ''}
           ${inGroup ? `<label class="small">权重 <input type="number" data-act="w" min="1" max="1000" value="${r.w}" style="width:64px"></label>` : ''}
@@ -1319,13 +1353,14 @@ async function pageLogs() {
 }
 
 function logDetail(l) {
-  const atts = (l.attempts || []).map((a, i) => `<tr><td>${i + 1}</td><td class="mono small">${esc(a.target)}${a.retry ? ` <span class="badge">重试 ${a.retry}</span>` : ''}</td><td>${esc(a.protocol)}</td><td>${a.http_status || '-'}</td><td>${fmtMs(a.latency_ms)}</td><td class="small ${a.error ? 'err-text' : 'ok-text'}">${a.error ? esc(a.error) : '成功'}${a.cooling ? ' <span class="badge warn">冷却中兜底</span>' : ''}</td></tr>`).join('');
+  const atts = (l.attempts || []).map((a, i) => `<tr><td>${i + 1}</td><td class="mono small">${esc(a.target)}${a.retry ? ` <span class="badge">重试 ${a.retry}</span>` : ''}</td><td>${esc(a.protocol)}</td><td>${a.http_status || '-'}</td><td>${fmtMs(a.latency_ms)}</td><td class="small ${a.error ? 'err-text' : 'ok-text'}">${a.error ? esc(a.error) : '成功'}${a.cooling ? ' <span class="badge warn">冷却中兜底</span>' : ''}${a.headers ? `<div class="muted mono">${Object.entries(a.headers).map(([k, v]) => `${esc(k)}: ${esc(v)}`).join('<br>')}</div>` : ''}</td></tr>`).join('');
   openModal({
     title: '请求详情 #' + l.id,
     wide: true,
     body: `<div class="form">
       <div class="kv">
         <div class="k">时间</div><div>${fmtTime(l.created_at)}</div>
+        ${l.request_id ? `<div class="k">请求 ID</div><div class="mono small">${esc(l.request_id)} <span class="muted">（响应头 X-Route-Request-Id）</span></div>` : ''}
         <div class="k">API Key</div><div>${esc(l.key_name || '-')}</div>
         <div class="k">客户端 IP</div><div>${esc(l.client_ip || '-')}</div>
         <div class="k">请求模型</div><div>${esc(l.requested_model)}${l.public_model ? ' → ' + esc(l.public_model) : ''}</div>

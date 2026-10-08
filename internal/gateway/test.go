@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ai-route/internal/convert"
+	"ai-route/internal/hdrtpl"
 	"ai-route/internal/store"
 )
 
@@ -111,6 +112,16 @@ func (g *Gateway) TestModel(ctx context.Context, model, proto string, stream boo
 	body := testBody(model, stream, prompt)
 	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("")).WithContext(ctx)
 	r.Header.Set("User-Agent", "ai-route-admin-test")
+	// headers the providers require from callers get a test value
+	for _, p := range g.store.Snapshot().Providers {
+		for _, v := range p.Headers {
+			if t, err := hdrtpl.Parse(v); err == nil {
+				for _, name := range t.Required() {
+					r.Header.Set(name, "ai-route-admin-test")
+				}
+			}
+		}
+	}
 	rec := httptest.NewRecorder()
 	start := time.Now()
 	key := &store.APIKey{Name: "(admin test)", Enabled: true}
@@ -196,11 +207,7 @@ func (g *Gateway) fetchModels(ctx context.Context, p *store.Provider, url string
 	req.Header.Set("x-api-key", p.APIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("User-Agent", upstreamUA(p, ""))
-	for k, v := range p.Headers {
-		if v != "" {
-			req.Header.Set(k, v)
-		}
-	}
+	applyProviderHeaders(req.Header, p, "", nil)
 	resp, err := g.client.Do(req)
 	if err != nil {
 		return nil, err

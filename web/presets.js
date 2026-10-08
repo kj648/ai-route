@@ -123,10 +123,11 @@ const PRESETS = [
       'glm-*': 'openai', 'kimi-*': 'openai', 'deepseek-*': 'openai', 'mimo-*': 'openai', 'longcat-*': 'openai', 'hy3': 'openai',
       'minimax-*': 'anthropic', 'qwen*': 'anthropic',
     },
-    headers: { 'x-opencode-session': 'ai-route' },
+    // the caller's own session id, else a stable id per conversation
+    headers: { 'x-opencode-session': '{{header.x-opencode-session ?? $conversation}}' },
     docs: 'https://opencode.ai/docs/go/', keyUrl: 'https://opencode.ai/go',
-    note: '月订阅。MiniMax / Qwen 只走 /messages，GLM / Kimi / DeepSeek / MiMo 走 chat，已预填“模型协议规则”；官方要求带稳定的 x-opencode-session 头，已预填。',
-    ua: { mode: 'passthrough', value: 'ai-route/1.0', note: '官方要求客户端用自己的 UA（如 my-agent/1.0），不要用 SDK / HTTP 库的默认 UA。透传客户端即可；客户端没带 UA 时使用 ai-route/1.0。' },
+    note: '月订阅。MiniMax / Qwen 只走 /messages，GLM / Kimi / DeepSeek / MiMo 走 chat，已预填“模型协议规则”；官方要求每个会话带稳定的 x-opencode-session 头：已预填为调用方传了就透传，没传由网关按会话生成。',
+    ua: { mode: 'passthrough', note: '官方要求客户端用自己的 UA（如 my-agent/1.0），不要用 SDK / HTTP 库的默认 UA。透传客户端即可；客户端没带 UA 时使用平台标识 ai-route/版本号。' },
   },
   {
     id: 'stepfun-plan', name: '阶跃 Step Plan', category: 'coding', prefix: 'step', keywords: 'stepfun 阶跃星辰',

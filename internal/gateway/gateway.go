@@ -22,6 +22,7 @@ import (
 	"ai-route/internal/alert"
 	"ai-route/internal/convert"
 	"ai-route/internal/store"
+	"ai-route/internal/version"
 )
 
 const maxBodyBytes = 64 << 20
@@ -284,7 +285,9 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		KeyName:   key.Name,
 		Inbound:   inbound,
 		ClientIP:  clientIP(r),
+		RequestID: newRequestID(),
 	}
+	w.Header().Set("X-Route-Request-Id", entry.RequestID)
 	defer func() {
 		entry.LatencyMs = time.Since(start).Milliseconds()
 		// count usage before queueing the log: a concurrent budget reload
@@ -316,10 +319,17 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		writeError(w, inbound, http.StatusForbidden, fmt.Sprintf("this API key may not use model %q", m.Name))
 		return
 	}
+	if msg := missingRequiredHeaders(snap, m, r.Header); msg != "" {
+		entry.HTTPStatus, entry.Error = 400, msg
+		writeError(w, inbound, http.StatusBadRequest, msg)
+		return
+	}
 	affinity := ""
 	if conv := convert.ConversationKey(body); conv != "" {
 		affinity = strconv.FormatInt(key.ID, 10) + "\x00" + conv
 	}
+	meta := &requestMeta{RequestID: entry.RequestID, Conversation: conversationID(affinity), Key: key, Header: r.Header}
+	r = r.WithContext(withMeta(r.Context(), meta))
 	cands := g.plan(snap, m, inbound, affinity)
 	if len(cands) == 0 {
 		entry.HTTPStatus, entry.Error = 503, "no enabled targets"
@@ -576,7 +586,8 @@ func isOfficialAnthropic(base string) bool {
 }
 
 // buildUpstream converts the client body for the candidate and creates the request.
-func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound string, body []byte, st store.Settings, path string) (*http.Request, bool, error) {
+// It also returns the resolved values of the provider's dynamic headers.
+func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound string, body []byte, st store.Settings, path string) (*http.Request, bool, map[string]string, error) {
 	var upBody []byte
 	var err error
 	clientUsage := false
@@ -593,7 +604,7 @@ func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound st
 		upBody, err = applyBodyRules(upBody, c)
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	var url string
 	switch c.proto {
@@ -611,7 +622,10 @@ func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound st
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(upBody)))
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
+	}
+	if r != nil && !c.provider.DropClientHeaders {
+		copyClientHeaders(req.Header, r.Header, c.proto)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	clientUA := ""
@@ -636,24 +650,21 @@ func buildUpstream(ctx context.Context, r *http.Request, c candidate, inbound st
 	} else {
 		req.Header.Set("Authorization", "Bearer "+c.provider.APIKey)
 	}
-	for k, v := range c.provider.Headers {
-		if v == "" {
-			req.Header.Del(k)
-		} else {
-			req.Header.Set(k, v)
-		}
-	}
-	return req, clientUsage, nil
+	resolved := applyProviderHeaders(req.Header, c.provider, c.model, metaFrom(ctx))
+	return req, clientUsage, resolved, nil
 }
 
-// defaultUA is sent when neither the client nor the provider supplies one.
-const defaultUA = "ai-route/1.0"
-
 // upstreamUA applies the provider's User-Agent policy. Some plans only
-// accept specific clients, so by default the real client UA is forwarded.
+// accept specific clients, so by default the real client UA is forwarded;
+// the gateway's own fingerprint (ai-route/<version>) is the last resort.
 func upstreamUA(p *store.Provider, clientUA string) string {
-	if p.UAMode == "override" && p.UserAgent != "" {
-		return p.UserAgent
+	switch p.UAMode {
+	case "override":
+		if p.UserAgent != "" {
+			return p.UserAgent
+		}
+	case "platform":
+		return version.UserAgent()
 	}
 	if clientUA != "" {
 		return clientUA
@@ -661,7 +672,7 @@ func upstreamUA(p *store.Provider, clientUA string) string {
 	if p.UserAgent != "" {
 		return p.UserAgent
 	}
-	return defaultUA
+	return version.UserAgent()
 }
 
 func parseRetryAfter(h string) time.Duration {
@@ -753,7 +764,8 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 		return fail(502, failSoft, err.Error())
 	}
 
-	req, clientUsage, err := buildUpstream(ctx, r, c, inbound, body, st, "")
+	req, clientUsage, resolved, err := buildUpstream(ctx, r, c, inbound, body, st, "")
+	res.attempt.Headers = resolved
 	if err != nil {
 		return fail(400, failIgnore, "build request: "+err.Error())
 	}
@@ -976,7 +988,7 @@ func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-			req, _, err := buildUpstream(ctx, r, c, convert.ProtoAnthropic, body, snap.Settings, "/messages/count_tokens")
+			req, _, _, err := buildUpstream(ctx, r, c, convert.ProtoAnthropic, body, snap.Settings, "/messages/count_tokens")
 			if err == nil {
 				resp, err := g.client.Do(req)
 				if err == nil {

@@ -73,7 +73,21 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
   前缀创建后固定不变。
 - 两个地址**至少填一个**。客户端用哪种协议请求，就优先走同协议地址，没有就自动转换。
 - **模型协议规则**：有些供应商的不同模型只在一种端点上提供（比如 OpenCode Go 的 MiniMax / Qwen 只走 `/messages`），可以按 `模型(支持 *) = openai|anthropic` 强制指定。相关预设已经预填好。
-- **自定义请求头**：每行写 `Header: 值`，会覆盖默认值。网关会透传 Anthropic 的 `anthropic-version` 和 `anthropic-beta`。
+- **请求头透传**：调用方的请求头默认原样转发给上游，但不会转发：网关自己的凭证（`Authorization`、`x-api-key`）、`Cookie`、`Accept-Encoding`、逐跳头（`Connection` 等）、暴露用户身份的头（`X-Forwarded-*`、`X-Real-IP`、`Origin`、`Referer`、`Sec-*`、`CF-*`），以及跨协议时对面协议专属的头（`anthropic-*` / `openai-*`）。个别上游对多余请求头敏感时，可以在“高级设置”里关掉“透传调用方的请求头”。
+- **自定义请求头**：每行写 `Header: 值`，会覆盖调用方的同名头，值留空表示删除该头。值可以是固定文本，也可以引用调用方的头或内置变量：
+
+  | 写法 | 含义 |
+  |---|---|
+  | `X-Foo: abc` | 固定值 |
+  | `X-Foo: {{header.X-Bar}}` | 取调用方的 `X-Bar`，**必传**：首选上游（调度顺序第一级里启用的供应商，含并列组）要求而调用方没带时，直接返回 400；作为候补时缺了就不发 |
+  | `X-Foo: {{header.X-Bar?}}` | 取调用方的值，可选，没带就不发 |
+  | `X-Foo: {{header.X-Bar ?? $conversation}}` | 调用方带了就用它的，没带由平台生成；也可以写 `?? "默认值"` |
+  | `X-Foo: ai-route-{{$requestId}}` | 内置变量，可以和文字拼接 |
+
+  内置变量：`$conversation`（`ses_` 开头，同一会话内不变：按“API Key + 第一条用户消息”计算）、`$uuid`（每个请求一个新的）、`$requestId`（网关的请求 ID，也在响应头 `X-Route-Request-Id` 和日志里）、`$timestamp`、`$keyName`、`$keyId`、`$model`（上游模型名）。变量名写错，或者引用 `header.Authorization` 这类凭证，保存时会报错。日志详情里能看到每次尝试实际发出的动态请求头。
+
+  OpenCode Go 预设已经写好 `x-opencode-session: {{header.x-opencode-session ?? $conversation}}`：自研 Agent 传了自己的会话 ID 就原样透传，Claude Code 等不认识这个头的客户端由网关按会话生成。旧版本建的 OpenCode Go 供应商里，写死的 `ai-route` 会在启动时自动改成这个写法。
+- 网关会透传 Anthropic 的 `anthropic-version` 和 `anthropic-beta`。
 - **请求参数规则**：某些模型要求额外参数时使用，每行写 `模型(可用*) [条件] = JSON`。JSON 会深度合并进发给上游的请求体（在协议转换之后），值写 `null` 表示删除该字段。条件可选：`stream` / `nonstream` 限定流式或非流式，`openai` / `anthropic` / `embeddings` 限定上游协议，多个条件用逗号分隔。例如百炼的 Qwen3 开源模型默认开启思考，非流式调用必须关掉：
 
   ```
@@ -88,7 +102,8 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route              # 默认监听 :8080�
 
 | 策略 | 行为 | 适用 |
 |---|---|---|
-| 透传客户端（默认） | 原样转发调用方的 UA（如 Claude Code 的 `claude-cli/…`）；调用方没带 UA 时，用这里填写的值，没填则用 `ai-route/1.0` | 绝大多数情况，**Kimi Code 必须用这个** |
+| 透传客户端（默认） | 原样转发调用方的 UA（如 Claude Code 的 `claude-cli/…`）；调用方没带 UA 时，用这里填写的值，没填则用平台标识 `ai-route/<版本号>` | 绝大多数情况，**Kimi Code 必须用这个** |
+| 平台标识 | 所有请求都使用 `ai-route/<版本号>` | 自建模型、中转平台等需要识别来源的上游；限制客户端类型的套餐不能用 |
 | 固定 UA | 所有请求都使用填写的 UA | 只在供应商明确要求某个固定 UA 时使用 |
 
 已知要求：
@@ -295,6 +310,7 @@ OpenAI 流式直通时，网关会自动向上游加上 `stream_options.include_
 | `internal/convert`（规则与 Claude 新模型）、`TestBodyRulesAppliedUpstream` | 请求参数规则的合并、删除、条件匹配；新版 Claude 的 adaptive thinking、effort 档位、去掉采样参数、强制工具改 auto |
 | `internal/gateway/selfhost_test.go` | 自建模型：并发满时溢出到下一个候补且不计失败、排队等待空位、不排队时返回 429、首包超时只作用于流式、健康检查连续失败移出调度并告警、恢复后加回 |
 | `internal/gateway/item7_test.go` 等 | 重排序转发与用量；同级分流的权重分布、会话粘性、同级兜底；目标分组的解析、校验和前缀改名 |
+| `internal/hdrtpl`、`internal/gateway/headers_test.go` | 请求头模板的解析、校验和取值；透传与不透传清单；必传头只在首选上校验（冷却中也按配置顺序）、候补上缺了不发；会话 ID 在同一会话内稳定；平台标识 UA；旧 OpenCode Go 配置的自动迁移 |
 | `internal/gateway/limits_test.go` | Key 限额：RPM、TPM、月预算的拦截与错误格式，被拒请求记日志且不发上游，重启后从日志恢复本月费用，切换统计货币，滑动窗口到期恢复 |
 | `internal/gateway/logs_test.go` | 请求日志：成功请求每个字段的取值（Key、请求模型与对外模型、实际上游、协议、用量、客户端 IP、耗时）；费用（单价、通配单价、缓存价、未配单价、OpenRouter 实际费用）；四种协议组合下流式的用量；各种失败（模型不存在、模型不允许、全部上游失败、流中断）；按条件筛选、分页和统计 |
 | `internal/admin/e2e_test.go` | 端到端：通过管理 API 创建供应商（自动前缀、重名去重、自动拉取模型）、模型映射和 Key（拒绝自定义值、重新生成），调用对外 API，再通过管理 API 查日志和统计 |

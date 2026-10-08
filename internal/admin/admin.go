@@ -15,6 +15,7 @@ import (
 	"ai-route/internal/alert"
 	"ai-route/internal/gateway"
 	"ai-route/internal/store"
+	"ai-route/internal/version"
 )
 
 type Admin struct {
@@ -30,7 +31,9 @@ func New(s *store.Store, gw *gateway.Gateway, token string, web fs.FS) *Admin {
 
 func (a *Admin) Register(mux *http.ServeMux) {
 	api := http.NewServeMux()
-	api.HandleFunc("GET /admin/api/ping", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, map[string]any{"ok": true}) })
+	api.HandleFunc("GET /admin/api/ping", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"ok": true, "version": version.Version, "user_agent": version.UserAgent()})
+	})
 
 	api.HandleFunc("GET /admin/api/providers", a.listProviders)
 	api.HandleFunc("POST /admin/api/providers", a.createProvider)

@@ -14,6 +14,7 @@ import (
 
 	"ai-route/internal/convert"
 	"ai-route/internal/store"
+	"ai-route/internal/version"
 )
 
 // ---------- mock upstream ----------
@@ -831,7 +832,7 @@ func TestUserAgentPolicy(t *testing.T) {
 		t.Fatalf("fixed=%q pass=%q", ua("ua-fixed"), ua("ua-pass"))
 	}
 	p := &store.Provider{UserAgent: "fallback-agent/2.0", UAMode: "passthrough"}
-	if upstreamUA(p, "") != "fallback-agent/2.0" || upstreamUA(&store.Provider{}, "") != defaultUA {
+	if upstreamUA(p, "") != "fallback-agent/2.0" || upstreamUA(&store.Provider{}, "") != version.UserAgent() {
 		t.Fatal("fallback UA not applied")
 	}
 	if err := h.st.CreateProvider(&store.Provider{Prefix: "bad", OpenAIBaseURL: "http://x/v1", UAMode: "override"}); err == nil {
