@@ -265,7 +265,9 @@ func OpenAIToAnthropicResponse(body []byte, publicModel string) ([]byte, Usage, 
 					"input": parseArgs(tc.Function.Arguments),
 				})
 			}
-			if len(m.ToolCalls) > 0 {
+			// a call cut off by max_tokens stays max_tokens: the client must
+			// not execute a half-formed call
+			if len(m.ToolCalls) > 0 && (finish == "" || finish == "stop") {
 				finish = "tool_calls"
 			}
 		}

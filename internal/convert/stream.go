@@ -434,15 +434,21 @@ type oaToAN struct {
 	curType   string // "", "text", "thinking", "tool_use"
 	curIdx    int
 	tools     map[int]*toolBlock // by OpenAI tool index
-	finish    string
-	usage     Usage
-	sawDone   bool
-	err       string
+	// pending: OpenAI tool indexes whose block has not been emitted yet.
+	// Anthropic blocks are strictly sequential, so when a second tool call
+	// starts while one is still streaming, the newcomer is buffered and
+	// written as a whole block once the live one is closed.
+	pending []int
+	finish  string
+	usage   Usage
+	sawDone bool
+	err     string
 }
 
 type toolBlock struct {
-	id    string
-	block int
+	id, name string
+	block    int // Anthropic block index; -1 while pending
+	args     strings.Builder
 }
 
 // NewOpenAIToAnthropicStream converts OpenAI chunks into an Anthropic stream.
@@ -489,6 +495,34 @@ func (c *oaToAN) openBlock(typ string, block map[string]any) []SSEEvent {
 
 func (c *oaToAN) delta(idx int, delta map[string]any) SSEEvent {
 	return jsonEvent("content_block_delta", map[string]any{"type": "content_block_delta", "index": idx, "delta": delta})
+}
+
+// flushPending closes the live block and writes every buffered tool call
+// as a complete block, in arrival order.
+func (c *oaToAN) flushPending() []SSEEvent {
+	if len(c.pending) == 0 {
+		return nil
+	}
+	out := c.closeBlock()
+	for _, i := range c.pending {
+		tb := c.tools[i]
+		out = append(out, c.openBlock("tool_use", map[string]any{
+			"type": "tool_use", "id": tb.id, "name": tb.name, "input": map[string]any{},
+		})...)
+		tb.block = c.curIdx
+		if tb.args.Len() > 0 {
+			out = append(out, c.delta(c.curIdx, map[string]any{"type": "input_json_delta", "partial_json": tb.args.String()}))
+			tb.args.Reset()
+		}
+		out = append(out, c.closeBlock()...)
+	}
+	c.pending = nil
+	return out
+}
+
+// live reports whether the tool's block is the one currently open.
+func (c *oaToAN) live(tb *toolBlock) bool {
+	return c.curType == "tool_use" && tb.block == c.curIdx
 }
 
 func (c *oaToAN) Process(ev SSEEvent) []SSEEvent {
@@ -543,12 +577,14 @@ func (c *oaToAN) Process(ev SSEEvent) []SSEEvent {
 		}
 		if reasoning != nil && *reasoning != "" {
 			if c.curType != "thinking" {
+				out = append(out, c.flushPending()...)
 				out = append(out, c.openBlock("thinking", map[string]any{"type": "thinking", "thinking": "", "signature": ""})...)
 			}
 			out = append(out, c.delta(c.curIdx, map[string]any{"type": "thinking_delta", "thinking": *reasoning}))
 		}
 		if d.Content != nil && *d.Content != "" {
 			if c.curType != "text" {
+				out = append(out, c.flushPending()...)
 				out = append(out, c.openBlock("text", map[string]any{"type": "text", "text": ""})...)
 			}
 			out = append(out, c.delta(c.curIdx, map[string]any{"type": "text_delta", "text": *d.Content}))
@@ -564,14 +600,32 @@ func (c *oaToAN) Process(ev SSEEvent) []SSEEvent {
 				if id == "" {
 					id = randID("toolu_")
 				}
-				out = append(out, c.openBlock("tool_use", map[string]any{
-					"type": "tool_use", "id": id, "name": tc.Function.Name, "input": map[string]any{},
-				})...)
-				tb = &toolBlock{id: id, block: c.curIdx}
+				tb = &toolBlock{id: id, name: tc.Function.Name, block: -1}
 				c.tools[oaIdx] = tb
+				if c.curType == "tool_use" {
+					c.pending = append(c.pending, oaIdx) // another call is still streaming
+				} else {
+					out = append(out, c.openBlock("tool_use", map[string]any{
+						"type": "tool_use", "id": id, "name": tc.Function.Name, "input": map[string]any{},
+					})...)
+					tb.block = c.curIdx
+				}
 			}
-			if tc.Function.Arguments != "" {
+			if tc.Function.Arguments == "" {
+				continue
+			}
+			switch {
+			case c.live(tb):
 				out = append(out, c.delta(tb.block, map[string]any{"type": "input_json_delta", "partial_json": tc.Function.Arguments}))
+			case tb.block < 0:
+				tb.args.WriteString(tc.Function.Arguments)
+			default:
+				// arguments after the block was closed (text came in
+				// between): the rest goes out as a second block with the
+				// same id, which is the best a sequential protocol can do
+				tb.block = -1
+				tb.args.WriteString(tc.Function.Arguments)
+				c.pending = append(c.pending, oaIdx)
 			}
 		}
 		if ch.FinishReason != nil && *ch.FinishReason != "" {
@@ -587,6 +641,7 @@ func (c *oaToAN) Finish() []SSEEvent {
 	}
 	out := c.start()
 	c.done = true
+	out = append(out, c.flushPending()...)
 	out = append(out, c.closeBlock()...)
 	finish := c.finish
 	if len(c.tools) > 0 && (finish == "" || finish == "stop") {
