@@ -1,0 +1,55 @@
+# 多实例部署：PostgreSQL + 3 个网关实例 + Caddy 负载均衡（对外端口 8080）。
+#   docker compose -f docker-compose.cluster.yml up -d --build
+# 调整实例数：docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5
+# 需要在 .env 里设置 ADMIN_TOKEN 和 POSTGRES_PASSWORD。说明见 README 的“多实例部署”。
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airoute
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: airoute
+    volumes:
+      - ai-route-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airoute -d airoute"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  ai-route:
+    build:
+      context: .
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        GO_IMAGE: ${GO_IMAGE:-golang:1.27-alpine}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-alpine:3.22}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-}
+    image: ai-route:latest
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+    environment:
+      # 所有实例必须用同一个管理令牌
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?请在 .env 中设置 ADMIN_TOKEN}
+      DATABASE_URL: postgres://airoute:${POSTGRES_PASSWORD}@postgres:5432/airoute?sslmode=disable
+      # 请求经过 Caddy 转发：从 X-Forwarded-For 取真实客户端 IP（登录失败锁定按它计）
+      TRUSTED_PROXIES: private
+      TZ: Asia/Shanghai
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  lb:
+    image: ${CADDY_IMAGE:-caddy:2-alpine}
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - ai-route
+
+volumes:
+  ai-route-pg:

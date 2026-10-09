@@ -56,6 +56,7 @@ AI Route 就是为解决这些问题写的。
 - 请求头模板：透传调用方的头，或按规则生成会话 ID 等动态值。
 - 请求参数规则：按模型给请求体注入或删除参数，比如百炼 Qwen3 非流式时关闭思考。
 - 存储：默认内置 SQLite，单个二进制即可运行；也可以使用 PostgreSQL，并提供一条命令的数据迁移。
+- 多实例：使用 PostgreSQL 时可以水平扩展，限流、并发、熔断冷却和配置在实例间精确共享。
 
 ## 工作原理
 
@@ -121,6 +122,7 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route                # 默认监听 :808
 | `DATABASE_URL` | – | PostgreSQL 连接地址，设置后不再使用 SQLite，见[数据库](#数据库sqlite-与-postgresql) |
 | `ADMIN_TOKEN` | 自动生成 | 管理后台令牌 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | 访问上游时使用的代理 |
+| `TRUSTED_PROXIES` | – | 可信的反向代理 / 负载均衡地址（逗号分隔的 IP 或 CIDR，`private` 表示所有内网地址）；来自它们的请求按 `X-Forwarded-For` 识别客户端 IP |
 
 ### 五分钟上手
 
@@ -414,7 +416,41 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
 
 反方向（`-from` 填 PostgreSQL 地址、`-to` 填一个空目录）同样可以，用来退回 SQLite。本机实测 100 万条日志迁移约 13 秒。原来的 SQLite 文件不会被修改，确认无误后再自行删除。
 
-> 换成 PostgreSQL 后仍然是单实例部署：熔断、限流计数和并发槽还在进程内存里，见下文“单实例”。
+> 使用 PostgreSQL 后还可以部署多个实例，见下文[多实例部署](#多实例部署)。
+
+## 多实例部署
+
+使用 PostgreSQL 时，可以在负载均衡后面运行多个网关实例，所有实例连接同一个数据库即可，不需要 Redis 或其他组件。
+
+```bash
+# 示例：PostgreSQL + 3 个网关实例 + Caddy 负载均衡（对外 8080），.env 里设置 ADMIN_TOKEN 和 POSTGRES_PASSWORD
+docker compose -f docker-compose.cluster.yml up -d --build
+docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # 调整实例数
+```
+
+**实例之间共享什么**
+
+| 状态 | 共享方式 | 说明 |
+|---|---|---|
+| 供应商、模型映射、API Key、设置 | 写入数据库，其他实例 1 秒内重新加载 | 在任意实例的控制台修改都可以 |
+| Key 的 RPM / TPM、并发上限 | 精确共享：检查和计数在数据库里原子完成 | 比如 RPM 300 的 Key 在 3 个实例上同时打 1000 个请求，正好放行 300 个 |
+| 供应商最大并发（自建模型） | 精确共享，满了照常溢出到下一个候补或排队 | 排队的请求也能拿到其他实例释放的名额 |
+| 熔断冷却 | 一个实例发现额度用尽、Key 失效等，其他实例 1 秒内跟着冷却；“全部重置”对所有实例生效 | 连续失败计数各实例自己算 |
+| 月预算 | 按全部实例的请求日志统计，30 秒刷新一次 | 和单实例一样只在请求开始时检查 |
+| 告警 | 同一事件只由一个实例发送 | |
+| 登录失败锁定 | 按全部实例累计 | 见下方 `TRUSTED_PROXIES` |
+| 健康检查 | 每个实例各自探测 | 告警只发一次 |
+| 日志清理 | 同一时间只有一个实例执行 | |
+
+**注意事项**
+
+- 所有实例使用同一个 `ADMIN_TOKEN` 和 `DATABASE_URL`。
+- 负载均衡要关闭响应缓冲（流式输出）。示例用的 Caddy 配置在 [`deploy/Caddyfile`](deploy/Caddyfile)，Nginx 参考上文 `proxy_buffering off`。
+- 设置 `TRUSTED_PROXIES`（例如 `private`，表示内网地址），网关才会从负载均衡传来的 `X-Forwarded-For` 里取真实客户端 IP。不设置时，登录失败锁定按负载均衡的地址计算，有人连续输错令牌会把所有管理员一起锁住。
+- 实例异常退出时，它占用的并发名额在 20 秒没有心跳后自动释放；正常停止时立即释放。“设置与接入”页面的“运行实例”列出所有实例和心跳。
+- 每个实例最多使用 16 个数据库连接，PostgreSQL 的 `max_connections`（默认 100）要大于 16 × 实例数。
+- 共享状态放在 PostgreSQL 的 UNLOGGED 表里（不写 WAL，不会拖慢请求）。PostgreSQL 崩溃重启后这些表会被清空，几秒内由各实例重建，配置和日志不受影响。
+- 开销：没有设置限额的 Key 不访问数据库；设置了限额的 Key，每个请求多约 0.6 ms。本机测试中单个限额 Key 可以达到约 6700 请求/秒（3 个实例）。
 
 ## 部署与安全
 
@@ -433,14 +469,14 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
   ```
 
   Caddy 只需要一行：`reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`。
-- **管理令牌**：`ADMIN_TOKEN` 至少 16 个字符，不能用示例值（否则拒绝启动），可以用 `openssl rand -hex 24` 生成。同一 IP 1 分钟内输错 10 次会被锁定 1 分钟。
+- **管理令牌**：`ADMIN_TOKEN` 至少 16 个字符，不能用示例值（否则拒绝启动），可以用 `openssl rand -hex 24` 生成。同一 IP 1 分钟内输错 10 次会被锁定 1 分钟；网关在反向代理后面时请设置 `TRUSTED_PROXIES`，否则所有请求都算作代理的 IP。
 - **数据安全**：上游 Key 以明文存放在数据库里。SQLite 的数据目录权限为 `0700`、数据库文件为 `0600`；使用 PostgreSQL 时请给网关单独的数据库账号，并开启 TLS（`sslmode=require`）。请控制好数据库和管理令牌的访问权限。日志里的客户端 IP 取自 `X-Forwarded-For`，直接暴露在公网时这个头可以被伪造。
 - **错误信息**：返回给客户端的错误只包含各上游的状态码和请求 ID，上游的原始报错、地址留在请求日志里，避免泄露内部地址或账户信息。
 - **请求头**：转发调用方请求头时，凭证类、浏览器类以及 `OpenAI-Organization` / `OpenAI-Project` 这类会切换账户的头都会被去掉；`anthropic-beta` 会透传（Claude Code 依赖它），客户端因此可以启用上游的 beta 功能，部分 beta 会改变计费。健康检查会带上供应商的 Key，地址请填它自己的服务。
 - **控制台**：返回 CSP、`X-Frame-Options: DENY` 等安全头，只加载自身的脚本和样式。
 - **资源保护**：单个请求体最多 64 MB，读取请求体最多 2 分钟；上游单个流式事件最多 8 MB；客户端不读数据时，单次写入 60 秒超时；日志里客户端提供的字段有长度上限，过期日志删除后会回收数据库空间。
 - **备份与迁移**：“设置与接入”里可以导出 / 导入全部配置（JSON，包含上游 Key，请妥善保管）。
-- **单实例**：熔断、限流计数、并发槽保存在进程内存里，目前只支持单实例部署（使用 PostgreSQL 也一样）；重启后熔断状态清空，本月费用从日志重新统计。
+- **实例数**：使用 SQLite 时只能运行一个实例；使用 PostgreSQL 时可以运行多个，见[多实例部署](#多实例部署)。重启后熔断状态清空（多实例时从其他实例同步），本月费用从日志重新统计。
 
 ## 资源占用与配置建议
 
@@ -467,7 +503,7 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
 
 - 给容器设置内存上限时，同时设置 `GOMEMLIMIT`（约为上限的 80%，如 `GOMEMLIMIT=1600MiB`），让 Go 在接近上限前更积极地回收内存。
 - 用 API Key 的“并发上限”和供应商的“最大并发”控制峰值内存，避免少数客户端占满资源。
-- 概览统计耗时随日志条数增长，日志量很大时缩短保留天数，或改用 PostgreSQL；无论哪种数据库都是单实例部署（见上文）。
+- 概览统计耗时随日志条数增长，日志量很大时缩短保留天数，或改用 PostgreSQL。单个实例不够用时，改用 PostgreSQL 并部署多个实例（见[多实例部署](#多实例部署)）。
 - Linux 上若有大量客户端同时建连，可适当调大 `net.core.somaxconn`。
 
 ## 常见问题
@@ -534,7 +570,7 @@ AI_ROUTE_TEST_DATABASE_URL='postgres://postgres:test@127.0.0.1:5432/airoute?sslm
 main.go               入口：参数、内嵌静态资源、HTTP 服务
 internal/gateway      对外 API、路由与切换、熔断、限流、并发与健康检查、请求头处理
 internal/convert      OpenAI Chat / Responses / Anthropic 之间的请求、响应、流式转换
-internal/store        SQLite / PostgreSQL 存储、配置快照、请求日志与统计、数据迁移
+internal/store        SQLite / PostgreSQL 存储、配置快照、请求日志与统计、数据迁移、多实例协调
 internal/admin        管理 API
 internal/alert        告警推送（飞书、钉钉、企业微信、Webhook）
 internal/hdrtpl       请求头模板
@@ -549,7 +585,7 @@ web/                  控制台前端（原生 JS，无构建步骤；英文文�
 - [x] PostgreSQL 存储与数据迁移
 - [ ] 发布预编译二进制和 Docker 镜像
 - [ ] 多管理员账号与操作审计
-- [ ] 多实例部署（共享熔断与限流状态）
+- [x] 多实例部署（共享熔断与限流状态）
 
 欢迎在 Issues 里提需求。
 

@@ -202,6 +202,9 @@ func (s *Store) cleanupLogs() {
 	if days <= 0 {
 		return
 	}
+	if s.cluster != nil && !s.cluster.Claim("log-cleanup", 50*time.Minute) {
+		return // another instance does it
+	}
 	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
 	// small batches: one huge DELETE would hold the write lock for seconds
 	var n int64

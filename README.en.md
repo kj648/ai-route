@@ -54,6 +54,7 @@ AI Route was written to solve exactly that.
 **Self-hosting and extensibility**
 - Self-hosted models (vLLM, SGLang, Ollama …): concurrency cap with overflow, active health checks and a separate first-token timeout.
 - Storage: SQLite built in, so a single binary is all you need; PostgreSQL is supported too, with a one-command data migration.
+- Multiple instances: with PostgreSQL the gateway scales out; rate limits, concurrency, breaker cooldowns and configuration are shared exactly.
 - Header templates: forward the caller's headers or generate values such as a per-conversation session id.
 - Request body rules: inject or remove parameters per model, e.g. turn off thinking for Bailian Qwen3 non-stream calls.
 
@@ -121,6 +122,7 @@ Without `ADMIN_TOKEN`, the first start generates an `admin-xxxx` token, prints i
 | `DATABASE_URL` | – | PostgreSQL URL; when set, SQLite is not used. See [Database](#database-sqlite-or-postgresql) |
 | `ADMIN_TOKEN` | generated | Admin console token |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | Proxy used to reach upstreams |
+| `TRUSTED_PROXIES` | – | Reverse proxies / load balancers to trust (comma-separated IPs or CIDRs, `private` for all private ranges); requests from them are attributed to the client in `X-Forwarded-For` |
 
 ### Five minutes to first request
 
@@ -414,7 +416,41 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
 
 The other direction works too (`-from` a PostgreSQL URL, `-to` an empty directory) if you want to go back to SQLite. One million log rows took about 13 seconds in a local test. The SQLite file is left untouched; delete it yourself once you are happy.
 
-> PostgreSQL does not make the gateway multi-instance: breakers, rate-limit counters and concurrency slots still live in process memory (see *Single instance* below).
+> With PostgreSQL you can also run several instances; see [Multi-instance deployment](#multi-instance-deployment).
+
+## Multi-instance deployment
+
+With PostgreSQL you can run several gateway instances behind a load balancer. They only need the same database — no Redis or other services.
+
+```bash
+# example: PostgreSQL + 3 gateway instances + Caddy load balancer on 8080; set ADMIN_TOKEN and POSTGRES_PASSWORD in .env
+docker compose -f docker-compose.cluster.yml up -d --build
+docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # change the number of instances
+```
+
+**What the instances share**
+
+| State | How | Notes |
+|---|---|---|
+| Providers, mappings, API keys, settings | written to the database; other instances reload within a second | edit in any instance's console |
+| Key RPM / TPM and concurrency caps | exact: checked and counted atomically in the database | e.g. 1000 simultaneous requests over 3 instances with an RPM 300 key: exactly 300 get through |
+| Provider max concurrency (self-hosted models) | exact; when full, requests overflow to the next fallback or queue as usual | queued requests also get slots freed by other instances |
+| Breaker cooldowns | when one instance finds a plan out of quota or a key revoked, the others cool it down within a second; *Reset all* applies everywhere | consecutive-failure counts stay per instance |
+| Monthly budgets | computed from every instance's request logs, refreshed every 30 s | checked when a request starts, as with one instance |
+| Alerts | each event is sent by one instance only | |
+| Admin login lockout | counted over all instances | see `TRUSTED_PROXIES` below |
+| Health checks | each instance probes on its own | alerts are sent once |
+| Log cleanup | one instance at a time | |
+
+**Notes**
+
+- Every instance uses the same `ADMIN_TOKEN` and `DATABASE_URL`.
+- The load balancer must not buffer responses (streaming). The Caddy config used by the example is [`deploy/Caddyfile`](deploy/Caddyfile); for Nginx see `proxy_buffering off` above.
+- Set `TRUSTED_PROXIES` (e.g. `private` for private networks) so the gateway takes the real client IP from the load balancer's `X-Forwarded-For`. Without it the login lockout counts the load balancer's address, and someone typing wrong tokens locks every admin out.
+- When an instance dies, its concurrency slots are released once its heartbeat is 20 seconds old; a clean stop releases them at once. *Settings → Instances* lists every instance and its heartbeat.
+- Each instance uses at most 16 database connections; PostgreSQL's `max_connections` (100 by default) must exceed 16 × instances.
+- Shared state lives in UNLOGGED PostgreSQL tables (no write-ahead log, so it does not slow requests down). If PostgreSQL crashes they start empty and the instances rebuild them within seconds; configuration and logs are not affected.
+- Cost: keys without limits never touch the database for this; a key with limits adds about 0.6 ms per request. In a local test one limited key reached about 6,700 requests/s across 3 instances.
 
 ## Deployment and security
 
@@ -433,14 +469,14 @@ The other direction works too (`-from` a PostgreSQL URL, `-to` an empty director
   ```
 
   With Caddy: `reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`.
-- **Admin token**: `ADMIN_TOKEN` must be at least 16 characters and not the example value (the gateway refuses to start otherwise); `openssl rand -hex 24` makes a good one. Ten wrong tokens from one IP within a minute lock that IP out for a minute.
+- **Admin token**: `ADMIN_TOKEN` must be at least 16 characters and not the example value (the gateway refuses to start otherwise); `openssl rand -hex 24` makes a good one. Ten wrong tokens from one IP within a minute lock that IP out for a minute; behind a reverse proxy set `TRUSTED_PROXIES`, or every request counts as the proxy's IP.
 - **Secrets**: upstream keys are stored in plain text in the database. With SQLite the data directory is created `0700` and the database files `0600`; with PostgreSQL, give the gateway its own database user and enable TLS (`sslmode=require`). Protect the database and the admin token. The client IP in logs comes from `X-Forwarded-For`, which can be forged when the gateway is exposed directly.
 - **Error messages**: clients only see each upstream's status and the request id; raw upstream errors and URLs stay in the request log, so internal hosts and account details do not leak.
 - **Headers**: when forwarding caller headers, credentials, browser headers and account-selecting ones such as `OpenAI-Organization` / `OpenAI-Project` are dropped. `anthropic-beta` is forwarded (Claude Code depends on it), so clients can enable upstream beta features, some of which change pricing. Health checks carry the provider's key — point them at the provider's own service.
 - **Console**: served with a Content-Security-Policy, `X-Frame-Options: DENY` and related headers; it only loads its own scripts and styles.
 - **Resource protection**: request bodies up to 64 MB and 2 minutes to send them; upstream stream events up to 8 MB; writes to a client that stops reading time out after 60 seconds; client-supplied log fields are length-capped, and space is reclaimed after old logs are deleted.
 - **Backup and migration**: *Settings* can export and import the whole configuration (JSON, including upstream keys — keep it safe).
-- **Single instance**: circuit-breaker state, rate-limit counters and concurrency slots live in memory, so run one instance (PostgreSQL does not change this); after a restart breakers start fresh and the month's spend is recomputed from the logs.
+- **Instances**: with SQLite run a single instance; with PostgreSQL you can run several, see [Multi-instance deployment](#multi-instance-deployment). After a restart breakers start fresh (or sync from the other instances) and the month's spend is recomputed from the logs.
 
 ## Resource usage and sizing
 
@@ -467,7 +503,7 @@ Memory grows with **requests in flight × request body size**; CPU grows with th
 
 - When the container has a memory limit, also set `GOMEMLIMIT` to about 80% of it (e.g. `GOMEMLIMIT=1600MiB`) so Go collects more aggressively before hitting the limit.
 - Use the API key *Max concurrency* and the provider *Max concurrency* to cap peak memory, so a few clients cannot take everything.
-- Stats take longer as the log grows: shorten retention for very busy gateways, or move to PostgreSQL. Either way the gateway runs as a single instance (see above).
+- Stats take longer as the log grows: shorten retention for very busy gateways, or move to PostgreSQL. When one instance is not enough, use PostgreSQL and run several (see [Multi-instance deployment](#multi-instance-deployment)).
 - On Linux, raise `net.core.somaxconn` if many clients connect at the same moment.
 
 ## FAQ
@@ -528,7 +564,7 @@ AI_ROUTE_TEST_DATABASE_URL='postgres://postgres:test@127.0.0.1:5432/airoute?sslm
 main.go               entry point: flags, embedded assets, HTTP server
 internal/gateway      public API, routing and failover, breakers, limits, concurrency and health checks, headers
 internal/convert      request / response / stream conversion between Chat, Responses and Anthropic
-internal/store        SQLite / PostgreSQL storage, config snapshots, request logs and stats, data migration
+internal/store        SQLite / PostgreSQL storage, config snapshots, request logs and stats, data migration, multi-instance coordination
 internal/admin        admin API
 internal/alert        alert delivery (Feishu, DingTalk, WeCom, webhook)
 internal/hdrtpl       header templates
@@ -543,7 +579,7 @@ Tests cover protocol conversion (including stream event order), retries and brea
 - [x] PostgreSQL storage and data migration
 - [ ] Prebuilt binaries and Docker images
 - [ ] Multiple admin accounts and an audit log
-- [ ] Multi-instance deployments (shared breaker and rate-limit state)
+- [x] Multi-instance deployments (shared breaker and rate-limit state)
 
 Requests are welcome in Issues.
 

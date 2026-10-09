@@ -267,6 +267,8 @@ type Store struct {
 	droppedLog atomic.Int64
 	logCh      chan *RequestLog
 	logDone    chan struct{}
+
+	cluster *Cluster // nil with SQLite
 }
 
 // IsPostgresURL reports whether a DATABASE_URL points at PostgreSQL.
@@ -328,11 +330,27 @@ func OpenPostgres(databaseURL string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
+	// instances starting together must not run the schema migration at the
+	// same time: hold a session lock on one connection meanwhile
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_lock(7270001)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("lock for migration: %w", err)
+	}
+	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(7270001)`)
 	return open(&dbx{DB: db, pg: true})
 }
 
 func open(db *dbx) (*Store, error) {
 	s := &Store{db: db, logCh: make(chan *RequestLog, 4096), logDone: make(chan struct{})}
+	if db.pg {
+		s.cluster = newCluster(s)
+	}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -531,6 +549,11 @@ CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_a
 	if err := s.migrateOpenCodeSession(); err != nil {
 		return err
 	}
+	if s.db.pg {
+		if _, err := s.db.Exec(clusterSchema); err != nil {
+			return err
+		}
+	}
 	return s.ensureColumn("models", "tags", `TEXT NOT NULL DEFAULT '[]'`)
 }
 
@@ -625,10 +648,22 @@ func mustJSON(v any) string {
 func (s *Store) Reload() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.reloadLocked()
+	return s.buildSnapshotLocked()
 }
 
+// reloadLocked rebuilds the snapshot after a configuration write and tells
+// other instances sharing the database to do the same.
 func (s *Store) reloadLocked() error {
+	if err := s.buildSnapshotLocked(); err != nil {
+		return err
+	}
+	if s.cluster != nil {
+		s.cluster.bumpConfig()
+	}
+	return nil
+}
+
+func (s *Store) buildSnapshotLocked() error {
 	providers, err := s.listProviders()
 	if err != nil {
 		return err
@@ -1399,6 +1434,17 @@ func (s *Store) GetKV(k string) (string, bool) {
 func (s *Store) SetKV(k, v string) error {
 	_, err := s.db.Exec(`INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, k, v)
 	return err
+}
+
+// InitKV stores v under k unless a value exists, and returns the stored
+// value: instances starting together agree on one generated secret.
+func (s *Store) InitKV(k, v string) (string, error) {
+	if _, err := s.db.Exec(`INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING`, k, v); err != nil {
+		return "", err
+	}
+	var got string
+	err := s.db.QueryRow(`SELECT v FROM settings WHERE k=?`, k).Scan(&got)
+	return got, err
 }
 
 // ---------- export / import ----------

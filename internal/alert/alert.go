@@ -47,7 +47,12 @@ type Notifier struct {
 
 	mu   sync.Mutex
 	last map[string]time.Time
-	wg   sync.WaitGroup
+
+	// with several instances: claim(key, d) takes a shared lease so only one
+	// instance sends; release(key) re-arms an event
+	claim   func(string, time.Duration) bool
+	release func(string)
+	wg      sync.WaitGroup
 }
 
 func New(config func() store.AlertConfig) *Notifier {
@@ -123,10 +128,24 @@ func (n *Notifier) Notify(a Alert) bool {
 		return false
 	}
 	n.last[key] = now
-	if o, ok := opposite[a.Event]; ok {
+	o, hasOpposite := opposite[a.Event]
+	if hasOpposite {
 		delete(n.last, o+"|"+a.Subject)
 	}
+	claim, release := n.claim, n.release
 	n.mu.Unlock()
+	if claim != nil {
+		if hasOpposite {
+			release("alert:" + o + "|" + a.Subject)
+		}
+		silence := time.Duration(c.SilenceMinutes) * time.Minute
+		if silence < time.Second {
+			silence = time.Second // still collapses the same event raised by every instance at once
+		}
+		if !claim("alert:"+key, silence) {
+			return false // another instance sent it
+		}
+	}
 	for _, h := range c.Webhooks {
 		if !h.Enabled {
 			continue
@@ -142,6 +161,14 @@ func (n *Notifier) Notify(a Alert) bool {
 		}(h)
 	}
 	return true
+}
+
+// Share makes instances sharing a database send each alert once: claim
+// takes a lease for the silence window, release ends one early.
+func (n *Notifier) Share(claim func(string, time.Duration) bool, release func(string)) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.claim, n.release = claim, release
 }
 
 // Wait blocks until alerts sent so far have been delivered (tests, shutdown).

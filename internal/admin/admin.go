@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,8 +27,9 @@ type Admin struct {
 	token string
 	web   fs.FS
 
-	failMu sync.Mutex
-	fails  map[string]*authFailures // by client IP
+	failMu  sync.Mutex
+	fails   map[string]*authFailures // by client IP
+	proxies []netip.Prefix           // trusted for X-Forwarded-For
 
 	statsMu    sync.Mutex
 	statsCache map[string]*statsEntry // by range
@@ -81,8 +83,18 @@ const (
 	authFailureWindow = time.Minute
 )
 
-// tooManyFailures reports whether ip is locked out and for how long.
+// tooManyFailures reports whether ip is locked out and for how long. With
+// several instances the failures are counted over all of them.
 func (a *Admin) tooManyFailures(ip string) (bool, time.Duration) {
+	if c := a.store.Cluster(); c != nil {
+		buckets, err := c.Window("auth:"+ip, time.Now())
+		if err == nil {
+			if store.WindowSum(buckets) < maxAuthFailures {
+				return false, 0
+			}
+			return true, store.WindowRetry(buckets, maxAuthFailures, time.Now())
+		}
+	}
 	a.failMu.Lock()
 	defer a.failMu.Unlock()
 	f, ok := a.fails[ip]
@@ -98,6 +110,11 @@ func (a *Admin) tooManyFailures(ip string) (bool, time.Duration) {
 }
 
 func (a *Admin) recordFailure(ip string) {
+	if c := a.store.Cluster(); c != nil {
+		if err := c.AddWindow("auth:"+ip, 1, time.Now()); err == nil {
+			return
+		}
+	}
 	a.failMu.Lock()
 	defer a.failMu.Unlock()
 	if a.fails == nil || len(a.fails) > 10000 {
@@ -156,6 +173,7 @@ func (a *Admin) Register(mux *http.ServeMux) {
 	api.HandleFunc("GET /admin/api/runtime", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"in_flight": a.gw.InFlight(), "health": a.gw.Health.Status()})
 	})
+	api.HandleFunc("GET /admin/api/cluster", a.clusterInfo)
 	api.HandleFunc("GET /admin/api/logs", a.logs)
 	api.HandleFunc("GET /admin/api/stats", a.stats)
 
@@ -192,7 +210,7 @@ func (a *Admin) Register(mux *http.ServeMux) {
 
 func (a *Admin) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := remoteIP(r)
+		ip := a.clientIP(r)
 		if locked, left := a.tooManyFailures(ip); locked {
 			w.Header().Set("Retry-After", strconv.Itoa(int(left.Seconds())+1))
 			writeErr(w, http.StatusTooManyRequests, errors.New("too many failed logins, try again later"))
@@ -540,6 +558,21 @@ func (a *Admin) resetBreaker(w http.ResponseWriter, r *http.Request) {
 	_ = decode(r, &req)
 	a.gw.Breaker.Reset(req.Key)
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// clusterInfo lists the instances sharing the database.
+func (a *Admin) clusterInfo(w http.ResponseWriter, r *http.Request) {
+	c := a.store.Cluster()
+	if c == nil {
+		writeJSON(w, map[string]any{"enabled": false, "instances": []store.Instance{}})
+		return
+	}
+	list, err := c.Instances()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, map[string]any{"enabled": true, "self": c.ID(), "instances": list})
 }
 
 func (a *Admin) logs(w http.ResponseWriter, r *http.Request) {

@@ -17,6 +17,7 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN:?请在 .env 中设置 ADMIN_TOKEN}
       # 留空用内置 SQLite（数据在 /data）；使用 PostgreSQL 见 docker-compose.postgres.yml
       DATABASE_URL: ${DATABASE_URL:-}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       TZ: Asia/Shanghai
       # 需要走代理访问上游时：
       # HTTPS_PROXY: http://host.docker.internal:7890

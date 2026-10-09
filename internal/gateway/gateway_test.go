@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -264,6 +265,7 @@ func oaMockUsage(model string) map[string]any {
 
 type harness struct {
 	t    *testing.T
+	loc  string // where the database lives (storetest.Loc)
 	st   *store.Store
 	gw   *Gateway
 	srv  *httptest.Server
@@ -273,7 +275,8 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	st, err := storetest.Open(t)
+	loc := storetest.Loc(t)
+	st, err := storetest.OpenAt(loc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +296,44 @@ func newHarness(t *testing.T) *harness {
 	gw.Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return &harness{t: t, st: st, gw: gw, srv: srv, mock: mock, key: k.Key}
+	h := &harness{t: t, loc: loc, st: st, gw: gw, srv: srv, mock: mock, key: k.Key}
+	h.startCluster()
+	return h
+}
+
+// startCluster runs the instance's cluster loop for the test (PostgreSQL).
+func (h *harness) startCluster() {
+	c := h.st.Cluster()
+	if c == nil {
+		return
+	}
+	c.Heartbeat()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.gw.RunCluster(ctx)
+	}()
+	h.t.Cleanup(func() { cancel(); <-done })
+}
+
+// peer starts a second gateway instance on the same database (PostgreSQL
+// only), sharing the mock upstream and the API key.
+func (h *harness) peer() *harness {
+	h.t.Helper()
+	st, err := storetest.OpenAt(h.loc)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	h.t.Cleanup(func() { st.Close() })
+	gw := New(st)
+	mux := http.NewServeMux()
+	gw.Register(mux)
+	srv := httptest.NewServer(mux)
+	h.t.Cleanup(srv.Close)
+	p := &harness{t: h.t, loc: h.loc, st: st, gw: gw, srv: srv, mock: h.mock, key: h.key}
+	p.startCluster()
+	return p
 }
 
 func mustNil(t *testing.T, err error) {

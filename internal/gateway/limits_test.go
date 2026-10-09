@@ -108,7 +108,8 @@ func TestKeyMonthlyBudget(t *testing.T) {
 func TestLimiterWindowSlides(t *testing.T) {
 	h := newHarness(t)
 	l := NewLimiter(h.st)
-	t0 := time.Now()
+	// whole seconds: shared (PostgreSQL) windows count per second
+	t0 := time.Now().Truncate(time.Second)
 	l.now = func() time.Time { return t0 }
 	k := &store.APIKey{ID: 99, RPM: 1, TPM: 100}
 	if rej := l.Admit(k); rej != nil {

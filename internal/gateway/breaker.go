@@ -75,11 +75,14 @@ type breakerEntry struct {
 const downFor = 24 * time.Hour
 
 // Breaker tracks health per provider ("p:<prefix>") and per target
-// ("t:<prefix>/<model>"). State is in memory only.
+// ("t:<prefix>/<model>"). State is in memory; with several instances,
+// cooldowns opened or cleared here are passed to publish and the other
+// instances' changes arrive through Apply.
 type Breaker struct {
 	mu       sync.Mutex
 	entries  map[string]*breakerEntry
 	settings func() store.Settings
+	publish  func(store.Cooldown) // nil with a single instance; must not block
 }
 
 func NewBreaker(settings func() store.Settings) *Breaker {
@@ -140,6 +143,9 @@ func (b *Breaker) Success(prefix, target string) {
 	now := time.Now()
 	for _, k := range []string{providerKey(prefix), targetKey(target)} {
 		e := b.entry(k)
+		if b.publish != nil && (e.Opens > 0 || !e.OpenUntil.IsZero()) {
+			b.publish(store.Cooldown{Key: k, At: now}) // recovered: others reset their backoff too
+		}
 		e.Failures, e.Opens = 0, 0
 		e.OpenUntil = time.Time{}
 		e.LastSuccessAt = now
@@ -194,13 +200,55 @@ func (b *Breaker) Failure(prefix, target string, kind failKind, retryAfter time.
 		}
 	}
 	open.OpenUntil = now.Add(cooldown)
+	if b.publish != nil {
+		b.publish(store.Cooldown{Key: open.Key, OpenUntil: open.OpenUntil, Opens: open.Opens, Error: msg, At: now})
+	}
 	return open.Key, cooldown
 }
 
-// Reset clears one entry (or all entries when key is empty).
+// Apply takes cooldowns opened or cleared by other instances.
+func (b *Breaker) Apply(changes []store.Cooldown) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, c := range changes {
+		if c.Key == "*" {
+			b.resetLocked("")
+			continue
+		}
+		e := b.entry(c.Key)
+		if c.OpenUntil.IsZero() {
+			e.Failures, e.Opens, e.OpenUntil = 0, 0, time.Time{}
+			continue
+		}
+		if c.OpenUntil.After(e.OpenUntil) {
+			e.OpenUntil = c.OpenUntil
+		}
+		if c.Opens > e.Opens {
+			e.Opens = c.Opens
+		}
+		e.Failures = 0
+		if c.Error != "" {
+			e.LastError, e.LastErrorAt = c.Error, c.At
+		}
+	}
+}
+
+// Reset clears one entry (or all entries when key is empty), on every
+// instance.
 func (b *Breaker) Reset(key string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.resetLocked(key)
+	if b.publish != nil {
+		k := key
+		if k == "" {
+			k = "*"
+		}
+		b.publish(store.Cooldown{Key: k, At: time.Now()})
+	}
+}
+
+func (b *Breaker) resetLocked(key string) {
 	if key == "" {
 		b.entries = map[string]*breakerEntry{}
 		return

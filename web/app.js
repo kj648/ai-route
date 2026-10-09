@@ -1410,7 +1410,7 @@ function logDetail(l) {
 
 // ---------------------------------------------------------------- settings
 async function pageSettings() {
-  const [st, models, alerts, keys, ping] = await Promise.all([api('GET', '/settings'), api('GET', '/models'), api('GET', '/alerts'), api('GET', '/keys'), api('GET', '/ping')]);
+  const [st, models, alerts, keys, ping, cluster] = await Promise.all([api('GET', '/settings'), api('GET', '/models'), api('GET', '/alerts'), api('GET', '/keys'), api('GET', '/ping'), api('GET', '/cluster')]);
   if (ping.user_agent) PLATFORM_UA = ping.user_agent;
   const origin = location.origin;
   const alertLang = alerts.language === 'en' ? 'en' : 'zh';
@@ -1457,6 +1457,20 @@ async function pageSettings() {
         <div><button class="btn primary" id="st-save">${t('保存设置')}</button></div>
       </div>
     </div>
+    ${cluster.enabled ? `<div class="card">
+      <div class="card-head">${t('运行实例')} <span class="btns"><span class="badge ok">${t('{n} 个在线', { n: cluster.instances.filter((i) => i.alive).length })}</span></span></div>
+      <div class="card-body"><div class="help">${t('连接同一个 PostgreSQL 的网关实例共享限流、并发、熔断冷却和配置；超过 20 秒没有心跳的实例不再占用并发名额。')}</div></div>
+      <div class="table-wrap"><table>
+        <tr><th>${t('实例')}</th><th>${t('版本')}</th><th>${t('启动时间')}</th><th>${t('最近心跳')}</th><th>${t('状态')}</th></tr>
+        ${cluster.instances.map((i) => `<tr>
+          <td class="mono">${esc(i.id)}${i.self ? ` <span class="badge">${t('当前')}</span>` : ''}</td>
+          <td class="small">${esc(i.version)}</td>
+          <td class="small">${fmtTime(i.started_at)}</td>
+          <td class="small">${fmtAgo(i.seen_at)}</td>
+          <td>${i.alive ? `<span class="badge ok">${t('在线')}</span>` : `<span class="badge">${t('离线')}</span>`}</td>
+        </tr>`).join('')}
+      </table></div>
+    </div>` : ''}
     <div class="card">
       <div class="card-head">${t('告警通知')}</div>
       <div class="card-body form">

@@ -45,6 +45,7 @@ type Gateway struct {
 	Health  *HealthChecker
 	client  *http.Client
 	slots   *slots
+	cluster *clusterGlue // nil with a single instance (SQLite)
 
 	touchMu sync.Mutex
 	touched map[int64]time.Time
@@ -69,10 +70,11 @@ func New(s *store.Store) *Gateway {
 		Limiter: NewLimiter(s),
 		Alerts:  alert.New(s.GetAlerts),
 		client:  &http.Client{Transport: transport},
-		slots:   newSlots(),
+		slots:   newSlots(s.Cluster()),
 		touched: map[int64]time.Time{},
 	}
 	g.Health = newHealthChecker(g)
+	g.setupCluster(s.Cluster())
 	return g
 }
 

@@ -19,6 +19,7 @@ import (
 	"ai-route/internal/admin"
 	"ai-route/internal/gateway"
 	"ai-route/internal/store"
+	"ai-route/internal/version"
 )
 
 //go:embed web
@@ -59,21 +60,40 @@ func main() {
 		if t, ok := st.GetKV("admin_token"); ok {
 			token = t
 		} else {
-			token = store.RandomToken("admin-", 16)
-			if err := st.SetKV("admin_token", token); err != nil {
+			generated := store.RandomToken("admin-", 16)
+			// another instance starting at the same moment may win; use its token
+			if token, err = st.InitKV("admin_token", generated); err != nil {
 				log.Fatalf("save admin token: %v", err)
 			}
-			log.Printf("generated admin token: %s  (set ADMIN_TOKEN to override)", token)
+			if token == generated {
+				log.Printf("generated admin token: %s  (set ADMIN_TOKEN to override)", token)
+			}
 		}
+	}
+
+	proxies, err := admin.ParseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	gw := gateway.New(st)
 	bg, stopBG := context.WithCancel(context.Background())
 	go gw.Health.Run(bg)
+	clusterDone := make(chan struct{})
+	if c := st.Cluster(); c != nil {
+		c.SetVersion(version.Version)
+		log.Printf("cluster: %s; other instances on this database share limits, cooldowns and config", c)
+	}
+	go func() {
+		defer close(clusterDone)
+		gw.RunCluster(bg)
+	}()
 	web, _ := fs.Sub(webFS, "web")
 	mux := http.NewServeMux()
 	gw.Register(mux)
-	admin.New(st, gw, token, web).Register(mux)
+	adm := admin.New(st, gw, token, web)
+	adm.TrustProxies(proxies)
+	adm.Register(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) })
 
 	srv := &http.Server{
@@ -102,6 +122,7 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	stopBG()
+	<-clusterDone // leaves the instance registry
 	gw.Alerts.Wait()
 	_ = st.Close()
 }
