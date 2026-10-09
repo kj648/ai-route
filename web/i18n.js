@@ -41,6 +41,7 @@ function bindLangSwitch(root) {
 
 const I18N_EN = {
   '并发上限': 'Max concurrency',
+  '当前数据库：{db}': 'Database: {db}',
   '同时在途的请求数，超过时返回 429。设了月预算或 TPM 时建议一起设：它们只在请求开始时检查，并发越高越可能超出': 'In-flight requests allowed at once; more get 429. Set it together with a monthly budget or TPM: those are only checked when a request starts, so high concurrency can overshoot them',
   '最多 {n} 个并发': 'max {n} concurrent',
   '平台标识：{ua}': 'Gateway fingerprint: {ua}',

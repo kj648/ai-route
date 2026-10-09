@@ -55,6 +55,7 @@ AI Route 就是为解决这些问题写的。
 - 自建模型（vLLM、SGLang、Ollama 等）：并发上限与溢出、主动健康检查、单独的首包超时。
 - 请求头模板：透传调用方的头，或按规则生成会话 ID 等动态值。
 - 请求参数规则：按模型给请求体注入或删除参数，比如百炼 Qwen3 非流式时关闭思考。
+- 存储：默认内置 SQLite，单个二进制即可运行；也可以使用 PostgreSQL，并提供一条命令的数据迁移。
 
 ## 工作原理
 
@@ -117,6 +118,7 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route                # 默认监听 :808
 |---|---|---|
 | `LISTEN` | `:8080` | 监听地址 |
 | `DATA_DIR` | `./data` | SQLite 数据目录 |
+| `DATABASE_URL` | – | PostgreSQL 连接地址，设置后不再使用 SQLite，见[数据库](#数据库sqlite-与-postgresql) |
 | `ADMIN_TOKEN` | 自动生成 | 管理后台令牌 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | 访问上游时使用的代理 |
 
@@ -373,6 +375,47 @@ Key 由平台自动生成（`sk-route-` 加 48 位十六进制），泄露时点
 - **`response_format`**：上游是 Anthropic 官方且为严格 JSON Schema 时，转成原生结构化输出；其他情况在系统提示词末尾要求“只输出 JSON”。
 - **Responses API 的限制**：网关不保存会话状态，所以转到非 Responses 上游时不支持 `previous_response_id` 和 `conversation`（返回 400，Codex 默认每次发完整历史，不受影响）。
 
+## 数据库：SQLite 与 PostgreSQL
+
+默认使用内置的 SQLite，不需要任何配置。设置了 `DATABASE_URL` 就改用 PostgreSQL（12 及以上），表结构在启动时自动创建和升级。
+
+| | SQLite（默认） | PostgreSQL |
+|---|---|---|
+| 适合 | 个人、团队，开箱即用 | 已有 PostgreSQL 运维（备份、监控、高可用），或想直接用 SQL / BI 工具查请求日志 |
+| 数据位置 | 数据目录里的 `ai-route.db` | 你指定的数据库 |
+| 备份 | 停服后复制数据目录，或在“设置与接入”导出配置 | 用 `pg_dump` 等常规手段 |
+
+**连接已有的 PostgreSQL**：
+
+```bash
+DATABASE_URL='postgres://airoute:密码@db.example.com:5432/airoute?sslmode=require' ./bin/ai-route
+```
+
+Docker Compose 部署时把 `DATABASE_URL` 写进 `.env` 即可。密码里有 `@`、`:`、`/` 等字符时需要做 URL 编码。网关最多同时使用 16 个数据库连接。
+
+**用 Compose 一起启动 PostgreSQL**：在 `.env` 里设置 `POSTGRES_PASSWORD`（建议 `openssl rand -hex 16`），然后：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
+```
+
+**把已有 SQLite 数据迁移到 PostgreSQL**：配置、管理令牌、请求日志全部复制，Key 的 ID 保持不变（月预算统计依赖它）。目标数据库必须是空的。
+
+```bash
+# Docker Compose：先停网关，启动 PostgreSQL，迁移，再用 PostgreSQL 启动
+docker compose stop ai-route
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d postgres
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml run --rm ai-route migrate -from /data
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
+
+# 直接运行
+./bin/ai-route migrate -from ./data -to 'postgres://airoute:密码@db.example.com:5432/airoute'
+```
+
+反方向（`-from` 填 PostgreSQL 地址、`-to` 填一个空目录）同样可以，用来退回 SQLite。本机实测 100 万条日志迁移约 13 秒。原来的 SQLite 文件不会被修改，确认无误后再自行删除。
+
+> 换成 PostgreSQL 后仍然是单实例部署：熔断、限流计数和并发槽还在进程内存里，见下文“单实例”。
+
 ## 部署与安全
 
 - **HTTPS**：对公网开放时，建议在前面加一层反向代理。流式响应需要关闭缓冲（网关已返回 `X-Accel-Buffering: no`）：
@@ -391,13 +434,13 @@ Key 由平台自动生成（`sk-route-` 加 48 位十六进制），泄露时点
 
   Caddy 只需要一行：`reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`。
 - **管理令牌**：`ADMIN_TOKEN` 至少 16 个字符，不能用示例值（否则拒绝启动），可以用 `openssl rand -hex 24` 生成。同一 IP 1 分钟内输错 10 次会被锁定 1 分钟。
-- **数据安全**：上游 Key 以明文存放在 SQLite 里，数据目录权限为 `0700`、数据库文件为 `0600`；请控制好数据目录和管理令牌的访问权限。日志里的客户端 IP 取自 `X-Forwarded-For`，直接暴露在公网时这个头可以被伪造。
+- **数据安全**：上游 Key 以明文存放在数据库里。SQLite 的数据目录权限为 `0700`、数据库文件为 `0600`；使用 PostgreSQL 时请给网关单独的数据库账号，并开启 TLS（`sslmode=require`）。请控制好数据库和管理令牌的访问权限。日志里的客户端 IP 取自 `X-Forwarded-For`，直接暴露在公网时这个头可以被伪造。
 - **错误信息**：返回给客户端的错误只包含各上游的状态码和请求 ID，上游的原始报错、地址留在请求日志里，避免泄露内部地址或账户信息。
 - **请求头**：转发调用方请求头时，凭证类、浏览器类以及 `OpenAI-Organization` / `OpenAI-Project` 这类会切换账户的头都会被去掉；`anthropic-beta` 会透传（Claude Code 依赖它），客户端因此可以启用上游的 beta 功能，部分 beta 会改变计费。健康检查会带上供应商的 Key，地址请填它自己的服务。
 - **控制台**：返回 CSP、`X-Frame-Options: DENY` 等安全头，只加载自身的脚本和样式。
 - **资源保护**：单个请求体最多 64 MB，读取请求体最多 2 分钟；上游单个流式事件最多 8 MB；客户端不读数据时，单次写入 60 秒超时；日志里客户端提供的字段有长度上限，过期日志删除后会回收数据库空间。
 - **备份与迁移**：“设置与接入”里可以导出 / 导入全部配置（JSON，包含上游 Key，请妥善保管）。
-- **单实例**：熔断、限流计数、并发槽保存在进程内存里，目前只支持单实例部署；重启后熔断状态清空，本月费用从日志重新统计。
+- **单实例**：熔断、限流计数、并发槽保存在进程内存里，目前只支持单实例部署（使用 PostgreSQL 也一样）；重启后熔断状态清空，本月费用从日志重新统计。
 
 ## 资源占用与配置建议
 
@@ -410,7 +453,9 @@ Key 由平台自动生成（`sk-route-` 加 48 位十六进制），泄露时点
 | 1000 个并发流（小 prompt） | 常驻内存约 155 MB，约 1.4 核 CPU，首字节 p99 < 1 ms |
 | 500 个并发流（每个 prompt 200 KB） | 常驻内存约 500 MB（约 1 MB / 流，主要是请求体本身） |
 | 请求日志 | 每条约 270 字节，1 万次请求约 2.7 MB |
-| 概览统计（430 万条日志） | 约 4 秒，结果缓存 10 秒 |
+| 概览统计（430 万条日志，SQLite） | 约 4 秒，结果缓存 10 秒 |
+| 100 万条日志：30 天概览 / 日志翻页 | SQLite 约 2.3 秒 / 0.18 秒；PostgreSQL 约 1.0 秒 / 0.05 秒 |
+| 日志写入（非流式，约 4.6 万请求/秒） | SQLite 和 PostgreSQL 都能完整记录，不丢日志 |
 
 内存主要随**同时进行中的请求数 × 请求体大小**增长，CPU 主要随流式事件数增长；网关本身几乎不增加延迟，瓶颈通常在上游。
 
@@ -422,7 +467,7 @@ Key 由平台自动生成（`sk-route-` 加 48 位十六进制），泄露时点
 
 - 给容器设置内存上限时，同时设置 `GOMEMLIMIT`（约为上限的 80%，如 `GOMEMLIMIT=1600MiB`），让 Go 在接近上限前更积极地回收内存。
 - 用 API Key 的“并发上限”和供应商的“最大并发”控制峰值内存，避免少数客户端占满资源。
-- 日志在 SQLite 里，单实例部署（见上文）；概览统计耗时随日志条数增长，日志量很大时缩短保留天数。
+- 概览统计耗时随日志条数增长，日志量很大时缩短保留天数，或改用 PostgreSQL；无论哪种数据库都是单实例部署（见上文）。
 - Linux 上若有大量客户端同时建连，可适当调大 `net.core.somaxconn`。
 
 ## 常见问题
@@ -479,13 +524,17 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8080/admin/api/st
 ```bash
 go test -race ./...      # 用模拟上游跑全部测试，不需要任何真实 Key
 go build -o bin/ai-route .
+
+# 存储相关测试再用 PostgreSQL 跑一遍（每个测试使用独立的 schema，结束后删除）
+AI_ROUTE_TEST_DATABASE_URL='postgres://postgres:test@127.0.0.1:5432/airoute?sslmode=disable' \
+  go test -race ./internal/store/... ./internal/gateway ./internal/admin
 ```
 
 ```
 main.go               入口：参数、内嵌静态资源、HTTP 服务
 internal/gateway      对外 API、路由与切换、熔断、限流、并发与健康检查、请求头处理
 internal/convert      OpenAI Chat / Responses / Anthropic 之间的请求、响应、流式转换
-internal/store        SQLite 存储、配置快照、请求日志与统计
+internal/store        SQLite / PostgreSQL 存储、配置快照、请求日志与统计、数据迁移
 internal/admin        管理 API
 internal/alert        告警推送（飞书、钉钉、企业微信、Webhook）
 internal/hdrtpl       请求头模板
@@ -497,6 +546,7 @@ web/                  控制台前端（原生 JS，无构建步骤；英文文�
 ## 路线图
 
 - [x] 英文 README 与控制台中英文切换
+- [x] PostgreSQL 存储与数据迁移
 - [ ] 发布预编译二进制和 Docker 镜像
 - [ ] 多管理员账号与操作审计
 - [ ] 多实例部署（共享熔断与限流状态）

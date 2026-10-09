@@ -1,0 +1,29 @@
+# 和 PostgreSQL 一起启动（数据存在 PostgreSQL 而不是 SQLite）：
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
+# 需要在 .env 里设置 POSTGRES_PASSWORD。已有 SQLite 数据的迁移方法见 README。
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    container_name: ai-route-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airoute
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: airoute
+    volumes:
+      - ai-route-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airoute -d airoute"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  ai-route:
+    environment:
+      DATABASE_URL: postgres://airoute:${POSTGRES_PASSWORD}@postgres:5432/airoute?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  ai-route-pg:

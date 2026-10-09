@@ -1,9 +1,10 @@
 // Package store persists providers, model mappings, API keys, settings and
-// request logs in SQLite, and keeps an immutable in-memory snapshot of the
+// request logs in SQLite (default) or PostgreSQL, and keeps an immutable in-memory snapshot of the
 // routing configuration that the gateway reads on every request.
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -20,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 
 	"ai-route/internal/hdrtpl"
@@ -253,7 +255,7 @@ func globMatch(pattern, s string) bool {
 }
 
 type Store struct {
-	db   *sql.DB
+	db   *dbx
 	snap atomic.Pointer[Snapshot]
 	mu   sync.Mutex // serializes writes + snapshot rebuilds
 
@@ -267,6 +269,24 @@ type Store struct {
 	logDone    chan struct{}
 }
 
+// IsPostgresURL reports whether a DATABASE_URL points at PostgreSQL.
+func IsPostgresURL(u string) bool {
+	return strings.HasPrefix(u, "postgres://") || strings.HasPrefix(u, "postgresql://")
+}
+
+// OpenAuto opens PostgreSQL when databaseURL is set, otherwise SQLite in
+// dataDir.
+func OpenAuto(databaseURL, dataDir string) (*Store, error) {
+	if databaseURL == "" {
+		return Open(dataDir)
+	}
+	if !IsPostgresURL(databaseURL) {
+		return nil, errors.New("DATABASE_URL must start with postgres:// or postgresql://")
+	}
+	return OpenPostgres(databaseURL)
+}
+
+// Open opens (or creates) the SQLite database in dataDir.
 func Open(dataDir string) (*Store, error) {
 	// the database holds upstream keys: keep it private to this user
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -282,6 +302,36 @@ func Open(dataDir string) (*Store, error) {
 	}
 	// readers (console, stats) must not starve the log writer
 	db.SetMaxOpenConns(16)
+	s, err := open(&dbx{DB: db})
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range []string{"ai-route.db", "ai-route.db-wal", "ai-route.db-shm"} {
+		_ = os.Chmod(filepath.Join(dataDir, f), 0o600)
+	}
+	return s, nil
+}
+
+// OpenPostgres connects to PostgreSQL, e.g.
+// postgres://user:password@host:5432/airoute?sslmode=disable
+func OpenPostgres(databaseURL string) (*Store, error) {
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(16)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("connect to PostgreSQL: %w", err)
+	}
+	return open(&dbx{DB: db, pg: true})
+}
+
+func open(db *dbx) (*Store, error) {
 	s := &Store{db: db, logCh: make(chan *RequestLog, 4096), logDone: make(chan struct{})}
 	if err := s.migrate(); err != nil {
 		db.Close()
@@ -291,9 +341,6 @@ func Open(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("vacuum: %w", err)
 	}
-	for _, f := range []string{"ai-route.db", "ai-route.db-wal", "ai-route.db-shm"} {
-		_ = os.Chmod(filepath.Join(dataDir, f), 0o600)
-	}
 	if err := s.Reload(); err != nil {
 		db.Close()
 		return nil, err
@@ -302,9 +349,20 @@ func Open(dataDir string) (*Store, error) {
 	return s, nil
 }
 
+// Backend is "postgres" or "sqlite".
+func (s *Store) Backend() string {
+	if s.db.pg {
+		return "postgres"
+	}
+	return "sqlite"
+}
+
 // enableIncrementalVacuum lets log cleanup shrink the file. Switching an
 // existing database needs one full VACUUM, done once.
 func (s *Store) enableIncrementalVacuum() error {
+	if s.db.pg { // PostgreSQL reclaims space with autovacuum
+		return nil
+	}
 	var mode int
 	if err := s.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
 		return err
@@ -312,7 +370,11 @@ func (s *Store) enableIncrementalVacuum() error {
 	if mode == 2 { // incremental
 		return nil
 	}
-	log.Printf("store: enabling incremental vacuum (one-time VACUUM, may take a while on a large database)")
+	var pages int64
+	_ = s.db.QueryRow(`PRAGMA page_count`).Scan(&pages)
+	if pages > 2500 { // about 10 MB: worth a note, the VACUUM takes a moment
+		log.Printf("store: enabling incremental vacuum (one-time VACUUM, may take a while on a large database)")
+	}
 	if _, err := s.db.Exec(`PRAGMA auto_vacuum = INCREMENTAL`); err != nil {
 		return err
 	}
@@ -332,7 +394,7 @@ func (s *Store) Close() error {
 func (s *Store) Snapshot() *Snapshot { return s.snap.Load() }
 
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.db.ddl(`
 CREATE TABLE IF NOT EXISTS providers (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	prefix TEXT NOT NULL UNIQUE,
@@ -420,7 +482,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
 CREATE INDEX IF NOT EXISTS idx_logs_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_model ON request_logs(public_model, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_at);
-`)
+`))
 	if err != nil {
 		return err
 	}
@@ -523,6 +585,10 @@ func (s *Store) migrateOpenCodeSession() error {
 }
 
 func (s *Store) ensureColumn(table, col, def string) error {
+	if s.db.pg {
+		_, err := s.db.Exec(s.db.ddl(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s`, table, col, def)))
+		return err
+	}
 	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
 	if err != nil {
 		return err
@@ -903,12 +969,11 @@ func (s *Store) CreateProvider(p *Provider) error {
 	}
 	p.Prefix = uniquePrefix(p.Prefix, taken)
 	t := now()
-	res, err := s.db.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, drop_client_headers, responses_api, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.DropClientHeaders), b2i(p.ResponsesAPI), b2i(p.Enabled), p.Remark, t, t)
+	err := s.db.QueryRow(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, drop_client_headers, responses_api, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
+		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.DropClientHeaders), b2i(p.ResponsesAPI), b2i(p.Enabled), p.Remark, t, t).Scan(&p.ID)
 	if err != nil {
 		return friendlyErr(err)
 	}
-	p.ID, _ = res.LastInsertId()
 	p.CreatedAt, p.UpdatedAt = t, t
 	return s.reloadLocked()
 }
@@ -954,7 +1019,7 @@ func (s *Store) UpdateProvider(p *Provider) error {
 	return s.reloadLocked()
 }
 
-func renameTargetPrefix(tx *sql.Tx, oldPrefix, newPrefix string) error {
+func renameTargetPrefix(tx *txx, oldPrefix, newPrefix string) error {
 	rows, err := tx.Query(`SELECT id, targets FROM models`)
 	if err != nil {
 		return err
@@ -1091,12 +1156,11 @@ func (s *Store) CreateModel(m *Model) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := now()
-	res, err := s.db.Exec(`INSERT INTO models (name, aliases, tags, targets, enabled, description, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)`,
-		m.Name, mustJSON(m.Aliases), mustJSON(m.Tags), mustJSON(m.Targets), b2i(m.Enabled), m.Description, t, t)
+	err := s.db.QueryRow(`INSERT INTO models (name, aliases, tags, targets, enabled, description, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?) RETURNING id`,
+		m.Name, mustJSON(m.Aliases), mustJSON(m.Tags), mustJSON(m.Targets), b2i(m.Enabled), m.Description, t, t).Scan(&m.ID)
 	if err != nil {
 		return friendlyErr(err)
 	}
-	m.ID, _ = res.LastInsertId()
 	m.CreatedAt, m.UpdatedAt = t, t
 	return s.reloadLocked()
 }
@@ -1196,12 +1260,11 @@ func (s *Store) CreateKey(k *APIKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := now()
-	res, err := s.db.Exec(`INSERT INTO api_keys (name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.MaxConcurrency, t)
+	err := s.db.QueryRow(`INSERT INTO api_keys (name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at) VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id`,
+		k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.MaxConcurrency, t).Scan(&k.ID)
 	if err != nil {
 		return friendlyErr(err)
 	}
-	k.ID, _ = res.LastInsertId()
 	k.CreatedAt = t
 	return s.reloadLocked()
 }
@@ -1418,14 +1481,17 @@ func (s *Store) Import(e *Export) error {
 			return fmt.Errorf("api key %q: %w", k.Name, err)
 		}
 		// keep the id: request logs (and so monthly budgets) refer to it
-		var id any
+		cols, args := `name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at`,
+			[]any{k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.MaxConcurrency, t}
 		if k.ID > 0 {
-			id = k.ID
+			cols, args = "id, "+cols, append([]any{k.ID}, args...)
 		}
-		if _, err := tx.Exec(`INSERT INTO api_keys (id, name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-			id, k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.MaxConcurrency, t); err != nil {
+		if _, err := tx.Exec(`INSERT INTO api_keys (`+cols+`) VALUES (`+placeholders(len(args))+`)`, args...); err != nil {
 			return friendlyErr(err)
 		}
+	}
+	if err := tx.resetID("api_keys"); err != nil {
+		return err
 	}
 	if e.Settings != (Settings{}) {
 		if _, err := tx.Exec(`INSERT INTO settings (k, v) VALUES ('settings', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, mustJSON(normalizeSettings(e.Settings))); err != nil {
@@ -1444,9 +1510,13 @@ func (s *Store) Import(e *Export) error {
 }
 
 func friendlyErr(err error) error {
-	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed") {
-		field := err.Error()[strings.LastIndex(err.Error(), ".")+1:]
-		return fmt.Errorf("%s already exists", strings.TrimRight(field, ")"))
+	if field := uniqueField(err); field != "" {
+		return fmt.Errorf("%s already exists", field)
 	}
 	return err
+}
+
+// placeholders returns "?,?,...": n of them.
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }

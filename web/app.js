@@ -1444,7 +1444,7 @@ async function pageSettings() {
         </div>
         <div class="row2">
           <div class="field"><label>${t('最长冷却（秒）')}</label><input type="number" id="st-max" min="1" value="${st.max_cooldown_seconds}"><div class="help">${t('上游返回的 Retry-After 更长时以它为准（最多 6 小时）')}</div></div>
-          <div class="field"><label>${t('日志保留天数')}</label><input type="number" id="st-ret" min="1" value="${st.log_retention_days}"></div>
+          <div class="field"><label>${t('日志保留天数')}</label><input type="number" id="st-ret" min="1" value="${st.log_retention_days}"><div class="help">${t('当前数据库：{db}', { db: ping.database === 'postgres' ? 'PostgreSQL' : 'SQLite' })}</div></div>
         </div>
         <div class="row2">
           <div class="field"><label>${t('默认 max_tokens')}</label><input type="number" id="st-mt" min="1" value="${st.default_max_tokens}"><div class="help">${t('OpenAI 请求转 Anthropic 上游且没带 max_tokens 时使用')}</div></div>

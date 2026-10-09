@@ -7,8 +7,10 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -30,13 +32,23 @@ func env(k, def string) string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		migrate(os.Args[2:])
+		return
+	}
 	listen := flag.String("listen", env("LISTEN", ":8080"), "listen address (env LISTEN)")
-	dataDir := flag.String("data", env("DATA_DIR", "./data"), "data directory (env DATA_DIR)")
+	dataDir := flag.String("data", env("DATA_DIR", "./data"), "SQLite data directory (env DATA_DIR)")
+	dbURL := flag.String("db", os.Getenv("DATABASE_URL"), "PostgreSQL URL, e.g. postgres://user:pass@host:5432/airoute (env DATABASE_URL); empty = SQLite in the data directory")
 	flag.Parse()
 
-	st, err := store.Open(*dataDir)
+	st, err := store.OpenAuto(*dbURL, *dataDir)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
+	}
+	if st.Backend() == "postgres" {
+		log.Printf("store: PostgreSQL %s", redactURL(*dbURL))
+	} else {
+		log.Printf("store: SQLite in %s", *dataDir)
 	}
 
 	token := os.Getenv("ADMIN_TOKEN")
@@ -92,6 +104,66 @@ func main() {
 	stopBG()
 	gw.Alerts.Wait()
 	_ = st.Close()
+}
+
+// migrate copies all data between SQLite and PostgreSQL:
+//
+//	ai-route migrate -from ./data -to postgres://user:pass@host:5432/airoute
+//
+// Either side may be a data directory or a PostgreSQL URL; the target must
+// be empty. Stop the gateway first so no requests are logged meanwhile.
+func migrate(args []string) {
+	flags := flag.NewFlagSet("migrate", flag.ExitOnError)
+	from := flags.String("from", env("DATA_DIR", "./data"), "source: SQLite data directory or PostgreSQL URL")
+	to := flags.String("to", os.Getenv("DATABASE_URL"), "target: PostgreSQL URL or SQLite data directory (must be empty)")
+	_ = flags.Parse(args)
+	if *to == "" || *from == *to {
+		flags.Usage()
+		os.Exit(2)
+	}
+	if !store.IsPostgresURL(*from) {
+		if _, err := os.Stat(filepath.Join(*from, "ai-route.db")); err != nil {
+			log.Fatalf("no database in %s: %v", *from, err)
+		}
+	}
+	open := func(loc string) *store.Store {
+		var st *store.Store
+		var err error
+		if store.IsPostgresURL(loc) {
+			st, err = store.OpenPostgres(loc)
+		} else {
+			st, err = store.Open(loc)
+		}
+		if err != nil {
+			log.Fatalf("open %s: %v", redactURL(loc), err)
+		}
+		return st
+	}
+	src, dst := open(*from), open(*to)
+	log.Printf("copying %s (%s) -> %s (%s)", redactURL(*from), src.Backend(), redactURL(*to), dst.Backend())
+	start := time.Now()
+	err := src.CopyTo(dst, func(table string, n int64) {
+		if table != "request_logs" || n%100000 == 0 || n < 5000 {
+			log.Printf("  %s: %d", table, n)
+		}
+	})
+	_ = src.Close()
+	_ = dst.Close()
+	if err != nil {
+		log.Fatalf("migrate: %v", err)
+	}
+	log.Printf("done in %s", time.Since(start).Round(time.Millisecond))
+}
+
+// redactURL hides the password in a database URL for logs.
+func redactURL(s string) string {
+	if u, err := url.Parse(s); err == nil && u.User != nil {
+		if _, ok := u.User.Password(); ok {
+			u.User = url.UserPassword(u.User.Username(), "xxxxx")
+			return u.String()
+		}
+	}
+	return s
 }
 
 // withCORS allows browser-based clients to call the public API directly.

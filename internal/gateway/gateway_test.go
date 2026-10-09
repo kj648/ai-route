@@ -14,6 +14,7 @@ import (
 
 	"ai-route/internal/convert"
 	"ai-route/internal/store"
+	"ai-route/internal/store/storetest"
 	"ai-route/internal/version"
 )
 
@@ -272,7 +273,7 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	st, err := store.Open(t.TempDir())
+	st, err := storetest.Open(t)
 	if err != nil {
 		t.Fatal(err)
 	}

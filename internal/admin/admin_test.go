@@ -8,11 +8,11 @@ import (
 	"testing/fstest"
 
 	"ai-route/internal/gateway"
-	"ai-route/internal/store"
+	"ai-route/internal/store/storetest"
 )
 
 func TestRoutesAndAuth(t *testing.T) {
-	st, err := store.Open(t.TempDir())
+	st, err := storetest.Open(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestRoutesAndAuth(t *testing.T) {
 }
 
 func TestAdminLockoutAndConsoleHeaders(t *testing.T) {
-	st, err := store.Open(t.TempDir())
+	st, err := storetest.Open(t)
 	if err != nil {
 		t.Fatal(err)
 	}

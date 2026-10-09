@@ -53,6 +53,7 @@ AI Route was written to solve exactly that.
 
 **Self-hosting and extensibility**
 - Self-hosted models (vLLM, SGLang, Ollama …): concurrency cap with overflow, active health checks and a separate first-token timeout.
+- Storage: SQLite built in, so a single binary is all you need; PostgreSQL is supported too, with a one-command data migration.
 - Header templates: forward the caller's headers or generate values such as a per-conversation session id.
 - Request body rules: inject or remove parameters per model, e.g. turn off thinking for Bailian Qwen3 non-stream calls.
 
@@ -117,6 +118,7 @@ Without `ADMIN_TOKEN`, the first start generates an `admin-xxxx` token, prints i
 |---|---|---|
 | `LISTEN` | `:8080` | Listen address |
 | `DATA_DIR` | `./data` | SQLite data directory |
+| `DATABASE_URL` | – | PostgreSQL URL; when set, SQLite is not used. See [Database](#database-sqlite-or-postgresql) |
 | `ADMIN_TOKEN` | generated | Admin console token |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | Proxy used to reach upstreams |
 
@@ -373,6 +375,47 @@ On each upstream the gateway **first decides whether to retry, then whether to f
 - **`response_format`**: a strict JSON schema becomes native structured output on the official Anthropic API; otherwise a "reply with JSON only" instruction is appended to the system prompt.
 - **Responses API limits**: the gateway is stateless, so `previous_response_id` and `conversation` are not supported when the upstream is not a Responses API (400). Codex sends the full history by default and is not affected.
 
+## Database: SQLite or PostgreSQL
+
+SQLite is built in and used by default — nothing to configure. Set `DATABASE_URL` to use PostgreSQL (12 or newer) instead; tables are created and upgraded on startup.
+
+| | SQLite (default) | PostgreSQL |
+|---|---|---|
+| Good for | individuals and teams, zero setup | teams that already run PostgreSQL (backups, monitoring, HA), or want to query request logs with SQL / BI tools |
+| Where data lives | `ai-route.db` in the data directory | the database you point it at |
+| Backups | copy the data directory while stopped, or export the configuration in *Settings* | `pg_dump` and friends |
+
+**Use an existing PostgreSQL**:
+
+```bash
+DATABASE_URL='postgres://airoute:password@db.example.com:5432/airoute?sslmode=require' ./bin/ai-route
+```
+
+With Docker Compose, put `DATABASE_URL` in `.env`. URL-encode characters such as `@`, `:` and `/` in the password. The gateway uses at most 16 database connections.
+
+**Start PostgreSQL alongside with Compose**: set `POSTGRES_PASSWORD` in `.env` (e.g. `openssl rand -hex 16`), then:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
+```
+
+**Move existing SQLite data to PostgreSQL**: configuration, the admin token and all request logs are copied, and key ids stay the same (monthly budgets depend on them). The target database must be empty.
+
+```bash
+# Docker Compose: stop the gateway, start PostgreSQL, migrate, start on PostgreSQL
+docker compose stop ai-route
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d postgres
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml run --rm ai-route migrate -from /data
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
+
+# binary
+./bin/ai-route migrate -from ./data -to 'postgres://airoute:password@db.example.com:5432/airoute'
+```
+
+The other direction works too (`-from` a PostgreSQL URL, `-to` an empty directory) if you want to go back to SQLite. One million log rows took about 13 seconds in a local test. The SQLite file is left untouched; delete it yourself once you are happy.
+
+> PostgreSQL does not make the gateway multi-instance: breakers, rate-limit counters and concurrency slots still live in process memory (see *Single instance* below).
+
 ## Deployment and security
 
 - **HTTPS**: put a reverse proxy in front when exposing it to the internet, with buffering off for streams (the gateway already sends `X-Accel-Buffering: no`):
@@ -391,13 +434,13 @@ On each upstream the gateway **first decides whether to retry, then whether to f
 
   With Caddy: `reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`.
 - **Admin token**: `ADMIN_TOKEN` must be at least 16 characters and not the example value (the gateway refuses to start otherwise); `openssl rand -hex 24` makes a good one. Ten wrong tokens from one IP within a minute lock that IP out for a minute.
-- **Secrets**: upstream keys are stored in plain text in SQLite; the data directory is created `0700` and the database files `0600`. Protect the data directory and the admin token. The client IP in logs comes from `X-Forwarded-For`, which can be forged when the gateway is exposed directly.
+- **Secrets**: upstream keys are stored in plain text in the database. With SQLite the data directory is created `0700` and the database files `0600`; with PostgreSQL, give the gateway its own database user and enable TLS (`sslmode=require`). Protect the database and the admin token. The client IP in logs comes from `X-Forwarded-For`, which can be forged when the gateway is exposed directly.
 - **Error messages**: clients only see each upstream's status and the request id; raw upstream errors and URLs stay in the request log, so internal hosts and account details do not leak.
 - **Headers**: when forwarding caller headers, credentials, browser headers and account-selecting ones such as `OpenAI-Organization` / `OpenAI-Project` are dropped. `anthropic-beta` is forwarded (Claude Code depends on it), so clients can enable upstream beta features, some of which change pricing. Health checks carry the provider's key — point them at the provider's own service.
 - **Console**: served with a Content-Security-Policy, `X-Frame-Options: DENY` and related headers; it only loads its own scripts and styles.
 - **Resource protection**: request bodies up to 64 MB and 2 minutes to send them; upstream stream events up to 8 MB; writes to a client that stops reading time out after 60 seconds; client-supplied log fields are length-capped, and space is reclaimed after old logs are deleted.
 - **Backup and migration**: *Settings* can export and import the whole configuration (JSON, including upstream keys — keep it safe).
-- **Single instance**: circuit-breaker state, rate-limit counters and concurrency slots live in memory, so run one instance; after a restart breakers start fresh and the month's spend is recomputed from the logs.
+- **Single instance**: circuit-breaker state, rate-limit counters and concurrency slots live in memory, so run one instance (PostgreSQL does not change this); after a restart breakers start fresh and the month's spend is recomputed from the logs.
 
 ## Resource usage and sizing
 
@@ -410,7 +453,9 @@ Measured on a local load test (Apple Silicon, loopback, mock upstream sending 50
 | 1000 concurrent streams (small prompts) | about 155 MB resident, about 1.4 CPU cores, time to first byte p99 < 1 ms |
 | 500 concurrent streams (200 KB prompt each) | about 500 MB resident (about 1 MB per stream, mostly the request body itself) |
 | Request log | about 270 bytes per row, about 2.7 MB per 10,000 requests |
-| Dashboard stats (4.3 million log rows) | about 4 s, cached for 10 s |
+| Dashboard stats (4.3 million log rows, SQLite) | about 4 s, cached for 10 s |
+| 1 million log rows: 30-day stats / log page | SQLite about 2.3 s / 0.18 s; PostgreSQL about 1.0 s / 0.05 s |
+| Log writes (non-streaming, about 46,000 requests/s) | every request logged on both SQLite and PostgreSQL, none dropped |
 
 Memory grows with **requests in flight × request body size**; CPU grows with the number of streamed events. The gateway adds almost no latency — the upstream is usually the bottleneck.
 
@@ -422,7 +467,7 @@ Memory grows with **requests in flight × request body size**; CPU grows with th
 
 - When the container has a memory limit, also set `GOMEMLIMIT` to about 80% of it (e.g. `GOMEMLIMIT=1600MiB`) so Go collects more aggressively before hitting the limit.
 - Use the API key *Max concurrency* and the provider *Max concurrency* to cap peak memory, so a few clients cannot take everything.
-- Logs live in SQLite and the gateway runs as a single instance (see above); stats take longer as the log grows, so shorten retention for very busy gateways.
+- Stats take longer as the log grows: shorten retention for very busy gateways, or move to PostgreSQL. Either way the gateway runs as a single instance (see above).
 - On Linux, raise `net.core.somaxconn` if many clients connect at the same moment.
 
 ## FAQ
@@ -473,13 +518,17 @@ Main endpoints: `providers`, `models`, `keys`, `logs`, `stats`, `status`, `setti
 ```bash
 go test -race ./...      # all tests run against mock upstreams, no real keys needed
 go build -o bin/ai-route .
+
+# run the storage-related tests again on PostgreSQL (each test gets its own schema, dropped afterwards)
+AI_ROUTE_TEST_DATABASE_URL='postgres://postgres:test@127.0.0.1:5432/airoute?sslmode=disable' \
+  go test -race ./internal/store/... ./internal/gateway ./internal/admin
 ```
 
 ```
 main.go               entry point: flags, embedded assets, HTTP server
 internal/gateway      public API, routing and failover, breakers, limits, concurrency and health checks, headers
 internal/convert      request / response / stream conversion between Chat, Responses and Anthropic
-internal/store        SQLite storage, config snapshots, request logs and stats
+internal/store        SQLite / PostgreSQL storage, config snapshots, request logs and stats, data migration
 internal/admin        admin API
 internal/alert        alert delivery (Feishu, DingTalk, WeCom, webhook)
 internal/hdrtpl       header templates
@@ -491,6 +540,7 @@ Tests cover protocol conversion (including stream event order), retries and brea
 ## Roadmap
 
 - [x] English README and console language switch
+- [x] PostgreSQL storage and data migration
 - [ ] Prebuilt binaries and Docker images
 - [ ] Multiple admin accounts and an audit log
 - [ ] Multi-instance deployments (shared breaker and rate-limit state)

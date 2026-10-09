@@ -1,14 +1,59 @@
 package store
 
 import (
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"math"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 )
+
+// testLoc mirrors storetest.Loc (which this package cannot import): a temp
+// directory, or a fresh schema when AI_ROUTE_TEST_DATABASE_URL is set.
+func testLoc(t testing.TB) string {
+	t.Helper()
+	base := os.Getenv("AI_ROUTE_TEST_DATABASE_URL")
+	if base == "" {
+		return t.TempDir()
+	}
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	schema := "t_" + hex.EncodeToString(b)
+	db, err := sql.Open("pgx", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE SCHEMA ` + schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+		db.Close()
+	})
+	u, _ := url.Parse(base)
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func openLoc(loc string) (*Store, error) {
+	if IsPostgresURL(loc) {
+		return OpenPostgres(loc)
+	}
+	return Open(loc)
+}
+
+func openTest(t testing.TB) (*Store, error) {
+	t.Helper()
+	return openLoc(testLoc(t))
+}
 
 func TestGlobMatch(t *testing.T) {
 	cases := []struct {
@@ -32,7 +77,7 @@ func TestGlobMatch(t *testing.T) {
 }
 
 func TestStatsTimelineFillsGaps(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +107,7 @@ func TestStatsTimelineFillsGaps(t *testing.T) {
 }
 
 func TestResolveModelPriority(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +137,7 @@ func TestResolveModelPriority(t *testing.T) {
 }
 
 func TestExportImportRoundTrip(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +184,7 @@ func TestDerivePrefix(t *testing.T) {
 }
 
 func TestCreateProviderPrefixUnique(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +203,7 @@ func TestCreateProviderPrefixUnique(t *testing.T) {
 }
 
 func TestAPIKeysAlwaysGenerated(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +240,7 @@ func TestAPIKeysAlwaysGenerated(t *testing.T) {
 }
 
 func TestModelTagsPersistAndExport(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +289,7 @@ func TestPriceForAndCost(t *testing.T) {
 }
 
 func TestProviderPricesPersist(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +324,7 @@ func TestProviderPricesPersist(t *testing.T) {
 }
 
 func TestStatsCostInDisplayCurrency(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,8 +362,8 @@ func TestStatsCostInDisplayCurrency(t *testing.T) {
 }
 
 func TestCostColumnsAddedToOldDatabase(t *testing.T) {
-	dir := t.TempDir()
-	st, err := Open(dir)
+	dir := testLoc(t)
+	st, err := openLoc(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +377,7 @@ func TestCostColumnsAddedToOldDatabase(t *testing.T) {
 		}
 	}
 	st.Close()
-	st, err = Open(dir)
+	st, err = openLoc(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +399,7 @@ func mustNil(t *testing.T, err error) {
 }
 
 func TestKeyLimitsPersist(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +426,7 @@ func TestKeyLimitsPersist(t *testing.T) {
 }
 
 func TestKeySpend(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +452,7 @@ func TestKeySpend(t *testing.T) {
 }
 
 func TestAlertConfigPersistAndImport(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +488,7 @@ func TestAlertConfigPersistAndImport(t *testing.T) {
 }
 
 func TestBodyRules(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +534,7 @@ func TestBodyRules(t *testing.T) {
 }
 
 func TestTargetGroups(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +563,7 @@ func TestTargetGroups(t *testing.T) {
 }
 
 func TestImportKeepsKeyIDs(t *testing.T) {
-	st, err := Open(t.TempDir())
+	st, err := openTest(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,8 +584,8 @@ func TestImportKeepsKeyIDs(t *testing.T) {
 }
 
 func TestProviderHeaderTemplates(t *testing.T) {
-	dir := t.TempDir()
-	st, err := Open(dir)
+	dir := testLoc(t)
+	st, err := openLoc(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +605,7 @@ func TestProviderHeaderTemplates(t *testing.T) {
 	mustNil(t, st.CreateProvider(&Provider{Prefix: "v030", Vendor: "opencode-go", OpenAIBaseURL: "https://opencode.ai/zen/go/v1",
 		Headers: map[string]string{"x-opencode-session": "{{header.x-opencode-session ?? $conversation}}"}}))
 	st.Close()
-	st, err = Open(dir)
+	st, err = openLoc(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

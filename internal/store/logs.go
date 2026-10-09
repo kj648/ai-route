@@ -124,7 +124,7 @@ func (s *Store) logWriter() {
 	cleanup := time.NewTicker(time.Hour)
 	defer cleanup.Stop()
 	s.cleanupLogs()
-	batch := make([]*RequestLog, 0, 64)
+	batch := make([]*RequestLog, 0, 1024)
 	flush := func() {
 		if len(batch) == 0 {
 			return
@@ -149,7 +149,8 @@ func (s *Store) logWriter() {
 				continue
 			}
 			batch = append(batch, l)
-			if len(batch) >= 64 {
+			// bigger batches while a backlog builds up: fewer transactions
+			if len(batch) >= 1024 || (len(batch) >= 64 && len(s.logCh) == 0) {
 				flush()
 			}
 		case <-tick.C:
@@ -160,28 +161,36 @@ func (s *Store) logWriter() {
 	}
 }
 
+const logCols = 25
+
 func (s *Store) insertLogs(batch []*RequestLog) error {
+	// one multi-row INSERT per batch: a round trip per row would cap the
+	// log rate on a networked database
+	const perStmt = 256 // * logCols stays under both databases' parameter limits
+	row := "(" + placeholders(logCols) + ")"
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.Prepare(`INSERT INTO request_logs (created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source, request_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	for _, l := range batch {
-		// client-supplied strings are capped so a request cannot bloat the log
-		l := *l
-		l.RequestedModel, l.PublicModel = clip(l.RequestedModel, 256), clip(l.PublicModel, 256)
-		l.KeyName, l.ClientIP, l.RequestID = clip(l.KeyName, 128), clip(l.ClientIP, 64), clip(l.RequestID, 64)
-		l.Provider, l.UpstreamModel, l.Error = clip(l.Provider, 128), clip(l.UpstreamModel, 256), clip(l.Error, 2000)
-		attempts := l.Attempts // never mutate: callers may still read the entry
-		if attempts == nil {
-			attempts = []Attempt{}
+	for len(batch) > 0 {
+		part := batch[:min(perStmt, len(batch))]
+		batch = batch[len(part):]
+		args := make([]any, 0, len(part)*logCols)
+		for _, l := range part {
+			// client-supplied strings are capped so a request cannot bloat the log
+			l := *l
+			l.RequestedModel, l.PublicModel = clip(l.RequestedModel, 256), clip(l.PublicModel, 256)
+			l.KeyName, l.ClientIP, l.RequestID = clip(l.KeyName, 128), clip(l.ClientIP, 64), clip(l.RequestID, 64)
+			l.Provider, l.UpstreamModel, l.Error = clip(l.Provider, 128), clip(l.UpstreamModel, 256), clip(l.Error, 2000)
+			attempts := l.Attempts // never mutate: callers may still read the entry
+			if attempts == nil {
+				attempts = []Attempt{}
+			}
+			args = append(args, l.CreatedAt, l.KeyID, l.KeyName, l.RequestedModel, l.PublicModel, l.Inbound, b2i(l.Stream), l.Provider, l.UpstreamModel, l.UpstreamProtocol, b2i(l.Success), l.HTTPStatus, l.LatencyMs, l.TTFBMs, l.InputTokens, l.OutputTokens, l.CachedTokens, b2i(l.Fallback), mustJSON(attempts), l.Error, l.ClientIP, l.Cost, l.Currency, l.CostSource, l.RequestID)
 		}
-		if _, err := stmt.Exec(l.CreatedAt, l.KeyID, l.KeyName, l.RequestedModel, l.PublicModel, l.Inbound, b2i(l.Stream), l.Provider, l.UpstreamModel, l.UpstreamProtocol, b2i(l.Success), l.HTTPStatus, l.LatencyMs, l.TTFBMs, l.InputTokens, l.OutputTokens, l.CachedTokens, b2i(l.Fallback), mustJSON(attempts), l.Error, l.ClientIP, l.Cost, l.Currency, l.CostSource, l.RequestID); err != nil {
+		if _, err := tx.Exec(`INSERT INTO request_logs (created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source, request_id) VALUES `+
+			strings.TrimSuffix(strings.Repeat(row+",", len(part)), ","), args...); err != nil {
 			return err
 		}
 	}
@@ -208,7 +217,7 @@ func (s *Store) cleanupLogs() {
 			break
 		}
 	}
-	if n > 0 {
+	if n > 0 && !s.db.pg {
 		// give the freed pages back to the file system
 		_, _ = s.db.Exec(`PRAGMA incremental_vacuum`)
 		_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
@@ -489,7 +498,7 @@ func tzOffsetMs() int64 {
 // currency.
 func (s *Store) KeySpend(since int64) (map[int64]float64, error) {
 	usd, cny := s.GetSettings().CurrencyFactors()
-	rows, err := s.db.Query(`SELECT key_id, SUM(cost * CASE currency WHEN 'USD' THEN ? WHEN 'CNY' THEN ? ELSE 0 END) FROM request_logs WHERE created_at >= ? AND cost > 0 GROUP BY key_id`, usd, cny, since)
+	rows, err := s.db.Query(`SELECT key_id, SUM(cost * CASE currency WHEN 'USD' THEN CAST(? AS DOUBLE PRECISION) WHEN 'CNY' THEN CAST(? AS DOUBLE PRECISION) ELSE 0 END) FROM request_logs WHERE created_at >= ? AND cost > 0 GROUP BY key_id`, usd, cny, since)
 	if err != nil {
 		return nil, err
 	}

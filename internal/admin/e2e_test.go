@@ -13,6 +13,7 @@ import (
 
 	"ai-route/internal/gateway"
 	"ai-route/internal/store"
+	"ai-route/internal/store/storetest"
 )
 
 // End-to-end through the HTTP APIs: configure providers, a mapping and a key
@@ -25,7 +26,7 @@ type e2e struct {
 }
 
 func newE2E(t *testing.T) *e2e {
-	st, err := store.Open(t.TempDir())
+	st, err := storetest.Open(t)
 	if err != nil {
 		t.Fatal(err)
 	}
