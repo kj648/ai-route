@@ -413,6 +413,16 @@ const COMPAT_LABEL = { openai: t('OpenAI 兼容'), anthropic: t('Anthropic 兼�
 // preset catalog entries keep their Chinese source text; translate on display
 const catLabel = (cat) => (CATEGORY_LABEL[cat] ? t(CATEGORY_LABEL[cat]) : '');
 
+// provider icon: the preset's brand logo, else a letter avatar tinted by name
+function providerIcon(ps, name) {
+  const ic = ps && BRAND_ICONS[ps.icon];
+  if (ic) return `<span class="pi" aria-hidden="true"><svg viewBox="${ic[0]}" fill="currentColor" fill-rule="evenodd">${ic[1]}</svg></span>`;
+  const s = String(name || '').trim() || '?';
+  let h = 0;
+  for (const c of s) h = (h * 31 + c.codePointAt(0)) % 360;
+  return `<span class="pi letter" style="--h:${h}" aria-hidden="true">${esc([...s][0].toUpperCase())}</span>`;
+}
+
 function vendorBadge(p) {
   const ps = presetById(guessVendor(p));
   return ps ? `<span class="badge cat-${ps.category}" title="${esc(t(ps.name))}">${esc(catLabel(ps.category))}</span>` : `<span class="badge">${t('自定义')}</span>`;
@@ -433,7 +443,7 @@ async function pageProviders() {
       const hc = rt.health[p.prefix];
       return `<div class="card">
         <div class="card-head">
-          <div class="toolbar"><code>${esc(p.prefix)}</code> <span>${esc(p.name || p.prefix)}</span> ${st}
+          <div class="toolbar">${providerIcon(presetById(guessVendor(p)), p.name || p.prefix)} <code>${esc(p.prefix)}</code> <span>${esc(p.name || p.prefix)}</span> ${st}
             ${vendorBadge(p)} <span class="badge blue">${COMPAT_LABEL[compatOf(p)]}</span>
             ${p.ua_mode === 'override' ? `<span class="badge warn" title="${esc(p.user_agent)}">${t('固定 UA')}</span>` : ''}</div>
           <div class="btns">
@@ -553,10 +563,12 @@ function presetGrid(selected) {
     </div>
     <div class="preset-grid" id="pp-grid">
       <button type="button" class="preset-card ${!selected ? 'on' : ''}" data-preset="">
-        <span class="pn">${t('自定义')}</span><span class="pc">${t('手动填写地址')}</span>
+        <span class="pi custom" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></span>
+        <span class="pt"><span class="pn">${t('自定义')}</span><span class="pc">${t('手动填写地址')}</span></span>
       </button>
       ${PRESETS.map((ps) => `<button type="button" class="preset-card ${selected === ps.id ? 'on' : ''}" data-preset="${esc(ps.id)}" data-cat="${ps.category}" data-q="${esc((ps.name + ' ' + t(ps.name) + ' ' + ps.id + ' ' + (ps.keywords || '')).toLowerCase())}">
-        <span class="pn">${esc(t(ps.name))}</span><span class="pc cat-${ps.category}">${esc(catLabel(ps.category))}</span>
+        ${providerIcon(ps, t(ps.name))}
+        <span class="pt"><span class="pn">${esc(t(ps.name))}</span><span class="pc cat-${ps.category}">${esc(catLabel(ps.category))}</span></span>
       </button>`).join('')}
     </div>`;
 }
