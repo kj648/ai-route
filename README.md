@@ -122,7 +122,9 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route                # 默认监听 :808
 | `DATABASE_URL` | – | PostgreSQL 连接地址，设置后不再使用 SQLite，见[数据库](#数据库sqlite-与-postgresql) |
 | `ADMIN_TOKEN` | 自动生成 | 管理后台令牌 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | 访问上游时使用的代理 |
-| `TRUSTED_PROXIES` | – | 可信的反向代理 / 负载均衡地址（逗号分隔的 IP 或 CIDR，`private` 表示所有内网地址）；来自它们的请求按 `X-Forwarded-For` 识别客户端 IP |
+| `TRUSTED_PROXIES` | – | 可信的反向代理 / 负载均衡地址（逗号分隔的 IP 或 CIDR，`private` 表示所有内网地址）；来自它们的请求按 `X-Forwarded-For` 识别客户端 IP，用于请求日志和登录锁定 |
+| `LOG_FORMAT` | `text` | 日志格式，`json` 便于接入日志系统 |
+| `LOG_LEVEL` | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
 
 ### 五分钟上手
 
@@ -446,7 +448,7 @@ docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # 调整
 
 - 所有实例使用同一个 `ADMIN_TOKEN` 和 `DATABASE_URL`。
 - 负载均衡要关闭响应缓冲（流式输出）。示例用的 Caddy 配置在 [`deploy/Caddyfile`](deploy/Caddyfile)，Nginx 参考上文 `proxy_buffering off`。
-- 设置 `TRUSTED_PROXIES`（例如 `private`，表示内网地址），网关才会从负载均衡传来的 `X-Forwarded-For` 里取真实客户端 IP。不设置时，登录失败锁定按负载均衡的地址计算，有人连续输错令牌会把所有管理员一起锁住。
+- 设置 `TRUSTED_PROXIES`（例如 `private`，表示内网地址），网关才会从负载均衡传来的 `X-Forwarded-For` 里取真实客户端 IP。不设置时，请求日志记录的是负载均衡的地址，登录失败锁定也按它计算（正确的令牌不受锁定影响，但错误尝试的额度是所有人共用的）。
 - 实例异常退出时，它占用的并发名额在 20 秒没有心跳后自动释放；正常停止时立即释放。“设置与接入”页面的“运行实例”列出所有实例和心跳。
 - 每个实例最多使用 16 个数据库连接，PostgreSQL 的 `max_connections`（默认 100）要大于 16 × 实例数。
 - 共享状态放在 PostgreSQL 的 UNLOGGED 表里（不写 WAL，不会拖慢请求）。PostgreSQL 崩溃重启后这些表会被清空，几秒内由各实例重建，配置和日志不受影响。
@@ -469,8 +471,8 @@ docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # 调整
   ```
 
   Caddy 只需要一行：`reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`。
-- **管理令牌**：`ADMIN_TOKEN` 至少 16 个字符，不能用示例值（否则拒绝启动），可以用 `openssl rand -hex 24` 生成。同一 IP 1 分钟内输错 10 次会被锁定 1 分钟；网关在反向代理后面时请设置 `TRUSTED_PROXIES`，否则所有请求都算作代理的 IP。
-- **数据安全**：上游 Key 以明文存放在数据库里。SQLite 的数据目录权限为 `0700`、数据库文件为 `0600`；使用 PostgreSQL 时请给网关单独的数据库账号，并开启 TLS（`sslmode=require`）。请控制好数据库和管理令牌的访问权限。日志里的客户端 IP 取自 `X-Forwarded-For`，直接暴露在公网时这个头可以被伪造。
+- **管理令牌**：`ADMIN_TOKEN` 至少 16 个字符，不能用示例值（否则拒绝启动），可以用 `openssl rand -hex 24` 生成。同一 IP 1 分钟内输错 10 次，之后的错误尝试会被拒绝 1 分钟；正确的令牌不受锁定影响，所以共用出口 IP 的同事不会把管理员锁在外面。网关在反向代理后面时请设置 `TRUSTED_PROXIES`，否则所有请求都算作代理的 IP。
+- **数据安全**：上游 Key 以明文存放在数据库里。SQLite 的数据目录权限为 `0700`、数据库文件为 `0600`；使用 PostgreSQL 时请给网关单独的数据库账号，并开启 TLS（`sslmode=require`）。请控制好数据库和管理令牌的访问权限。日志里的客户端 IP 只在请求来自 `TRUSTED_PROXIES` 时取自 `X-Forwarded-For`，其余情况记录 TCP 对端地址。
 - **错误信息**：返回给客户端的错误只包含各上游的状态码和请求 ID，上游的原始报错、地址留在请求日志里，避免泄露内部地址或账户信息。
 - **请求头**：转发调用方请求头时，凭证类、浏览器类以及 `OpenAI-Organization` / `OpenAI-Project` 这类会切换账户的头都会被去掉；`anthropic-beta` 会透传（Claude Code 依赖它），客户端因此可以启用上游的 beta 功能，部分 beta 会改变计费。健康检查会带上供应商的 Key，地址请填它自己的服务。
 - **控制台**：返回 CSP、`X-Frame-Options: DENY` 等安全头，只加载自身的脚本和样式。
@@ -554,6 +556,23 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8080/admin/api/st
 ```
 
 常用端点：`providers`、`models`、`keys`、`logs`、`stats`、`status`、`settings`、`alerts`、`export`、`import`。
+
+## 监控
+
+- **`GET /healthz`**：数据库可用时返回 `ok`，否则返回 503，可作为容器和负载均衡的健康检查。
+- **`GET /metrics`**：Prometheus 文本格式的指标，需要管理令牌（Prometheus 的 `authorization: { credentials: <ADMIN_TOKEN> }`）。指标按对外模型、上游和协议打标签，不包含请求内容：
+
+| 指标 | 含义 |
+|---|---|
+| `ai_route_requests_total{model,provider,inbound,status}` | 请求数 |
+| `ai_route_request_duration_seconds` / `ai_route_ttfb_seconds` | 耗时与首字节时间直方图 |
+| `ai_route_tokens_total{kind=input\|cached\|output}`、`ai_route_cost_total{currency}` | 用量与费用 |
+| `ai_route_upstream_attempts_total{target,result}`、`ai_route_fallbacks_total` | 每次上游尝试的结果、发生切换的请求数 |
+| `ai_route_rejected_total{key,status}` | 被限流、预算、权限拒绝的请求 |
+| `ai_route_breaker_open{kind,name}`、`ai_route_provider_inflight` | 冷却中的套餐 / 模型、自建模型的在途请求 |
+| `ai_route_log_dropped_total` | 因日志队列持续满载而丢失的日志条数，正常应为 0 |
+
+- **日志**：输出到标准错误，`LOG_FORMAT=json` 时每行一个 JSON 对象，字段包括 `request`（请求 ID）、`model`、`target`、`status`、`err` 等，可以和响应头 `X-Route-Request-Id` 对应。
 
 ## 开发
 

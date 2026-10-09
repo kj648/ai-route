@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -160,7 +160,7 @@ func (h *HealthChecker) record(p *store.Provider, problem string) {
 	switch {
 	case problem == "":
 		if h.g.Breaker.SetDown(p.Prefix, false, "") {
-			log.Printf("health check: %s is back", p.Prefix)
+			slog.Info("health check: provider is back", "provider", p.Prefix)
 		}
 		if alerted {
 			h.setAlerted(p.Prefix, false)
@@ -170,7 +170,7 @@ func (h *HealthChecker) record(p *store.Provider, problem string) {
 		}
 	case failures >= healthFailures:
 		if h.g.Breaker.SetDown(p.Prefix, true, "health check: "+problem) {
-			log.Printf("health check: %s is down: %s", p.Prefix, problem)
+			slog.Warn("health check: provider is down", "provider", p.Prefix, "err", problem)
 		}
 		if !alerted && h.g.Alerts.Notify(alert.Alert{Event: alert.EventHealthDown, Subject: p.Prefix,
 			Title: fmt.Sprintf(h.g.Alerts.Pick("供应商 %s 健康检查失败", "Provider %s failed its health check"), p.Prefix),

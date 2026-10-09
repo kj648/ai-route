@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -156,7 +156,7 @@ func (n *Notifier) Notify(a Alert) bool {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			if err := n.Send(ctx, h, a); err != nil {
-				log.Printf("alert webhook %s (%s): %v", h.Name, h.Type, err)
+				slog.Warn("alert webhook failed", "webhook", h.Name, "type", h.Type, "err", err)
 			}
 		}(h)
 	}

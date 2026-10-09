@@ -2,7 +2,7 @@ package gateway
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 
 	"ai-route/internal/store"
@@ -40,7 +40,7 @@ func (cg *clusterGlue) queue(cd store.Cooldown) {
 		n := cg.dropped
 		cg.dropMu.Unlock()
 		if n == 1 || n%1000 == 0 {
-			log.Printf("cluster: breaker change queue full, %d changes not shared", n)
+			slog.Warn("cluster: breaker change queue full", "unshared", n)
 		}
 	}
 }
@@ -62,7 +62,7 @@ func (g *Gateway) RunCluster(ctx context.Context) {
 				return
 			case cd := <-cg.pending:
 				if err := cg.c.PublishCooldown(cd); err != nil {
-					log.Printf("cluster: share breaker change %s: %v", cd.Key, err)
+					slog.Warn("cluster: share breaker change failed", "key", cd.Key, "err", err)
 				}
 			}
 		}
@@ -81,7 +81,7 @@ func (g *Gateway) ClusterPoll() {
 		select {
 		case cd := <-g.cluster.pending:
 			if err := g.cluster.c.PublishCooldown(cd); err != nil {
-				log.Printf("cluster: share breaker change %s: %v", cd.Key, err)
+				slog.Warn("cluster: share breaker change failed", "key", cd.Key, "err", err)
 			}
 			continue
 		default:

@@ -2,7 +2,7 @@ package gateway
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -31,7 +31,7 @@ func (s *slots) tryAcquire(prefix string, limit int) bool {
 	if s.cluster != nil && limit > 0 {
 		ok, err := s.cluster.Acquire(providerSlot(prefix), limit)
 		if err != nil {
-			log.Printf("provider concurrency: %v", err)
+			slog.Warn("provider concurrency check failed", "err", err)
 		}
 		if !ok {
 			return false

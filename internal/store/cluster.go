@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"sync"
@@ -217,7 +217,7 @@ func (c *Cluster) logErr(what string, err error) {
 		return
 	}
 	c.lastErr = time.Now()
-	log.Printf("cluster: %s: %v", what, err)
+	slog.Warn("cluster operation failed", "op", what, "err", err)
 }
 
 // ---------- registry and change polling ----------

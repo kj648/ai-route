@@ -122,7 +122,9 @@ Without `ADMIN_TOKEN`, the first start generates an `admin-xxxx` token, prints i
 | `DATABASE_URL` | – | PostgreSQL URL; when set, SQLite is not used. See [Database](#database-sqlite-or-postgresql) |
 | `ADMIN_TOKEN` | generated | Admin console token |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | Proxy used to reach upstreams |
-| `TRUSTED_PROXIES` | – | Reverse proxies / load balancers to trust (comma-separated IPs or CIDRs, `private` for all private ranges); requests from them are attributed to the client in `X-Forwarded-For` |
+| `TRUSTED_PROXIES` | – | Reverse proxies / load balancers to trust (comma-separated IPs or CIDRs, `private` for all private ranges); requests from them are attributed to the client in `X-Forwarded-For`, for the request log and the login lockout |
+| `LOG_FORMAT` | `text` | Log format; `json` for log collectors |
+| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
 ### Five minutes to first request
 
@@ -446,7 +448,7 @@ docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # change
 
 - Every instance uses the same `ADMIN_TOKEN` and `DATABASE_URL`.
 - The load balancer must not buffer responses (streaming). The Caddy config used by the example is [`deploy/Caddyfile`](deploy/Caddyfile); for Nginx see `proxy_buffering off` above.
-- Set `TRUSTED_PROXIES` (e.g. `private` for private networks) so the gateway takes the real client IP from the load balancer's `X-Forwarded-For`. Without it the login lockout counts the load balancer's address, and someone typing wrong tokens locks every admin out.
+- Set `TRUSTED_PROXIES` (e.g. `private` for private networks) so the gateway takes the real client IP from the load balancer's `X-Forwarded-For`. Without it the request log records the load balancer's address and the login lockout counts against it (the right token is never locked out, but the allowance for wrong attempts is shared by everyone).
 - When an instance dies, its concurrency slots are released once its heartbeat is 20 seconds old; a clean stop releases them at once. *Settings → Instances* lists every instance and its heartbeat.
 - Each instance uses at most 16 database connections; PostgreSQL's `max_connections` (100 by default) must exceed 16 × instances.
 - Shared state lives in UNLOGGED PostgreSQL tables (no write-ahead log, so it does not slow requests down). If PostgreSQL crashes they start empty and the instances rebuild them within seconds; configuration and logs are not affected.
@@ -469,8 +471,8 @@ docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # change
   ```
 
   With Caddy: `reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`.
-- **Admin token**: `ADMIN_TOKEN` must be at least 16 characters and not the example value (the gateway refuses to start otherwise); `openssl rand -hex 24` makes a good one. Ten wrong tokens from one IP within a minute lock that IP out for a minute; behind a reverse proxy set `TRUSTED_PROXIES`, or every request counts as the proxy's IP.
-- **Secrets**: upstream keys are stored in plain text in the database. With SQLite the data directory is created `0700` and the database files `0600`; with PostgreSQL, give the gateway its own database user and enable TLS (`sslmode=require`). Protect the database and the admin token. The client IP in logs comes from `X-Forwarded-For`, which can be forged when the gateway is exposed directly.
+- **Admin token**: `ADMIN_TOKEN` must be at least 16 characters and not the example value (the gateway refuses to start otherwise); `openssl rand -hex 24` makes a good one. After ten wrong tokens from one IP within a minute, further wrong attempts are refused for a minute; the right token is never locked out, so colleagues behind a shared address cannot shut the administrator out. Behind a reverse proxy set `TRUSTED_PROXIES`, or every request counts as the proxy's IP.
+- **Secrets**: upstream keys are stored in plain text in the database. With SQLite the data directory is created `0700` and the database files `0600`; with PostgreSQL, give the gateway its own database user and enable TLS (`sslmode=require`). Protect the database and the admin token. The client IP in logs is taken from `X-Forwarded-For` only for requests from `TRUSTED_PROXIES`; otherwise the TCP peer is logged.
 - **Error messages**: clients only see each upstream's status and the request id; raw upstream errors and URLs stay in the request log, so internal hosts and account details do not leak.
 - **Headers**: when forwarding caller headers, credentials, browser headers and account-selecting ones such as `OpenAI-Organization` / `OpenAI-Project` are dropped. `anthropic-beta` is forwarded (Claude Code depends on it), so clients can enable upstream beta features, some of which change pricing. Health checks carry the provider's key — point them at the provider's own service.
 - **Console**: served with a Content-Security-Policy, `X-Frame-Options: DENY` and related headers; it only loads its own scripts and styles.
@@ -548,6 +550,23 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8080/admin/api/st
 ```
 
 Main endpoints: `providers`, `models`, `keys`, `logs`, `stats`, `status`, `settings`, `alerts`, `export`, `import`.
+
+## Monitoring
+
+- **`GET /healthz`** returns `ok` while the database answers and 503 otherwise, for container and load-balancer health checks.
+- **`GET /metrics`** serves Prometheus text-format metrics and requires the admin token (`authorization: { credentials: <ADMIN_TOKEN> }` in the scrape config). Labels are public models, providers and protocols, never request content:
+
+| Metric | Meaning |
+|---|---|
+| `ai_route_requests_total{model,provider,inbound,status}` | requests |
+| `ai_route_request_duration_seconds` / `ai_route_ttfb_seconds` | latency and time-to-first-byte histograms |
+| `ai_route_tokens_total{kind=input\|cached\|output}`, `ai_route_cost_total{currency}` | usage and cost |
+| `ai_route_upstream_attempts_total{target,result}`, `ai_route_fallbacks_total` | the result of every upstream attempt; requests that switched target |
+| `ai_route_rejected_total{key,status}` | requests refused by limits, budgets or permissions |
+| `ai_route_breaker_open{kind,name}`, `ai_route_provider_inflight` | cooling plans / models; in-flight requests on self-hosted models |
+| `ai_route_log_dropped_total` | request-log entries lost to a persistently full queue; should stay 0 |
+
+- **Logs** go to standard error; with `LOG_FORMAT=json` every line is one JSON object with fields such as `request` (the request id, also in the `X-Route-Request-Id` response header), `model`, `target`, `status` and `err`.
 
 ## Development
 
