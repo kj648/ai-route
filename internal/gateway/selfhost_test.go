@@ -222,7 +222,11 @@ func TestHealthFlapReportsLatestState(t *testing.T) {
 	h.setProvider("oa", func(p *store.Provider) { p.HealthCheckSeconds = 10; p.HealthCheckURL = hc.URL })
 	now := time.Now()
 	h.gw.Health.now = func() time.Time { return now }
-	check := func() { h.gw.Health.CheckDue(context.Background()); now = now.Add(10 * time.Second) }
+	check := func() {
+		h.gw.Health.CheckDue(context.Background())
+		h.gw.Alerts.Wait() // webhooks are sent in the background: keep their order
+		now = now.Add(10 * time.Second)
+	}
 	check()
 	check() // down
 	healthy.Store(true)

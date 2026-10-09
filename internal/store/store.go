@@ -654,11 +654,15 @@ func (s *Store) Reload() error {
 // reloadLocked rebuilds the snapshot after a configuration write and tells
 // other instances sharing the database to do the same.
 func (s *Store) reloadLocked() error {
+	if s.cluster == nil {
+		return s.buildSnapshotLocked()
+	}
+	v := s.cluster.bumpConfig()
 	if err := s.buildSnapshotLocked(); err != nil {
 		return err
 	}
-	if s.cluster != nil {
-		s.cluster.bumpConfig()
+	if v >= 0 {
+		s.cluster.seenConfig.Store(v)
 	}
 	return nil
 }

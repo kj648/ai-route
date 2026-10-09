@@ -83,7 +83,7 @@ func (l *Limiter) Admit(k *store.APIKey) *rejection {
 		}
 	}
 	if l.cluster != nil {
-		return l.admitShared(k, now)
+		return l.admitShared(k, now.Add(l.cluster.Offset())) // windows use the database clock
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -213,7 +213,7 @@ func (l *Limiter) Record(k *store.APIKey, e *store.RequestLog) {
 	cost := l.store.GetSettings().ToDisplayCurrency(e.Cost, e.Currency)
 	t := e.InputTokens + e.OutputTokens
 	if l.cluster != nil && k.TPM > 0 && t > 0 {
-		if err := l.cluster.AddWindow("tpm:"+strconv.FormatInt(k.ID, 10), t, now); err != nil {
+		if err := l.cluster.AddWindow("tpm:"+strconv.FormatInt(k.ID, 10), t, now.Add(l.cluster.Offset())); err != nil {
 			log.Printf("rate limit (tpm): %v", err)
 		}
 	}

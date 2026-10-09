@@ -157,6 +157,11 @@ func TestClusterBreakerShared(t *testing.T) {
 		b.gw.ClusterPoll()
 		return time.Until(b.gw.Breaker.OpenUntil("oa", "oa/fail402")) > time.Second
 	})
+	// an instance started later picks up cooldowns that are still running
+	c := a.peer()
+	eventually(t, "a new instance learns the running cooldown", func() bool {
+		return time.Until(c.gw.Breaker.OpenUntil("oa", "oa/fail402")) > time.Second
+	})
 	hits := a.mock.Hits("fail402")
 	if resp, _ := b.post("/v1/chat/completions", oaReq("coder", false)); resp.Header.Get("X-Route-Target") != "an/ok" || a.mock.Hits("fail402") != hits {
 		t.Fatal("b should skip the cooling provider")

@@ -82,6 +82,7 @@ func main() {
 	clusterDone := make(chan struct{})
 	if c := st.Cluster(); c != nil {
 		c.SetVersion(version.Version)
+		c.Heartbeat() // registered before serving: slots taken from the first request on count
 		log.Printf("cluster: %s; other instances on this database share limits, cooldowns and config", c)
 	}
 	go func() {

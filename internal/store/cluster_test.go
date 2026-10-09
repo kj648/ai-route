@@ -112,3 +112,28 @@ func TestClusterLeasesAndConfigVersion(t *testing.T) {
 		t.Fatalf("tokens %q %q", x, y)
 	}
 }
+
+// Machines with skewed clocks still agree on liveness: times are kept on the
+// database's clock.
+func TestClusterClockSkew(t *testing.T) {
+	a, b := clusterStores(t)
+	b.Cluster().now = func() time.Time { return time.Now().Add(-25 * time.Second) }
+	b.Cluster().Heartbeat()
+	if d := b.Cluster().Now().Sub(time.Now()); d > time.Second || d < -time.Second {
+		t.Fatalf("b's corrected clock is off by %s", d)
+	}
+	if ok, _ := b.Cluster().Acquire("prov:gpu", 1); !ok {
+		t.Fatal("b's slot")
+	}
+	if ok, _ := a.Cluster().Acquire("prov:gpu", 1); ok {
+		t.Fatal("a treated the skewed instance as dead")
+	}
+	// leftover rows of an instance that already left are cleaned up
+	b.Cluster().leave()
+	a.Cluster().cleanup()
+	var n int
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM cluster_slots WHERE instance = ?`, b.Cluster().ID()).Scan(&n)
+	if n != 0 {
+		t.Fatalf("orphaned slot rows: %d", n)
+	}
+}

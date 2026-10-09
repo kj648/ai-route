@@ -89,6 +89,18 @@ BEGIN
 		ON CONFLICT (k, bucket) DO UPDATE SET n = cluster_counters.n + 1;
 	RETURN TRUE;
 END $$;
+-- publishers take one lock, so sequence numbers become visible in order and
+-- a poller that has seen seq N never misses a smaller one
+CREATE OR REPLACE FUNCTION ai_route_publish_breaker(p_k TEXT, p_until BIGINT, p_opens BIGINT, p_error TEXT, p_at BIGINT, p_origin TEXT)
+RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM pg_advisory_xact_lock(hashtext('breaker-publish'));
+	INSERT INTO cluster_breaker (k, open_until, opens, error, at, origin, seq)
+		VALUES (p_k, p_until, p_opens, p_error, p_at, p_origin, nextval('cluster_breaker_seq'))
+		ON CONFLICT (k) DO UPDATE SET open_until = excluded.open_until, opens = excluded.opens, error = excluded.error,
+		at = excluded.at, origin = excluded.origin, seq = excluded.seq;
+	RETURN TRUE;
+END $$;
 CREATE OR REPLACE FUNCTION ai_route_acquire(p_k TEXT, p_inst TEXT, p_mine BIGINT, p_limit BIGINT, p_alive BIGINT)
 RETURNS BOOLEAN LANGUAGE plpgsql AS $$
 DECLARE others BIGINT;
@@ -142,6 +154,10 @@ type Cluster struct {
 
 	seenConfig  atomic.Int64 // config version this instance has loaded
 	seenBreaker atomic.Int64 // last breaker change seen
+	// offset is the database clock minus this machine's (ms), measured at
+	// each heartbeat: heartbeats, windows and leases written by different
+	// machines are compared on one clock.
+	offset atomic.Int64
 
 	slotMu sync.Mutex
 	slots  map[string]*slotState // this instance's in-flight counts, the source of its rows
@@ -163,6 +179,25 @@ func newCluster(s *Store) *Cluster {
 
 // Cluster returns the coordination layer, or nil with SQLite (one instance).
 func (s *Store) Cluster() *Cluster { return s.cluster }
+
+// Now is the current time on the database's clock.
+func (c *Cluster) Now() time.Time { return c.now().Add(c.Offset()) }
+
+// Offset is how far the database clock is ahead of this machine's.
+func (c *Cluster) Offset() time.Duration { return time.Duration(c.offset.Load()) * time.Millisecond }
+
+// syncClock measures the offset to the database clock.
+func (c *Cluster) syncClock() {
+	before := c.now()
+	var dbMs int64
+	if err := c.s.db.QueryRow(`SELECT CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)`).Scan(&dbMs); err != nil {
+		c.logErr("read database clock", err)
+		return
+	}
+	after := c.now()
+	mid := before.Add(after.Sub(before) / 2)
+	c.offset.Store(dbMs - mid.UnixMilli())
+}
 
 // ID identifies this instance.
 func (c *Cluster) ID() string { return c.id }
@@ -197,10 +232,7 @@ type Handlers struct {
 // until ctx is done. It then removes this instance from the registry.
 func (c *Cluster) Run(ctx context.Context, h Handlers) {
 	c.Heartbeat()
-	// breaker changes from before this instance started are history
-	var seq int64
-	_ = c.s.db.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM cluster_breaker`).Scan(&seq)
-	c.seenBreaker.Store(seq)
+	c.catchUp(h)
 	beat := time.NewTicker(HeartbeatEvery)
 	defer beat.Stop()
 	poll := time.NewTicker(PollEvery)
@@ -223,8 +255,42 @@ func (c *Cluster) Run(ctx context.Context, h Handlers) {
 }
 
 // Heartbeat registers this instance as alive (Run does it periodically).
+// catchUp applies cooldowns still running when this instance starts; older
+// breaker history is skipped.
+func (c *Cluster) catchUp(h Handlers) {
+	var seq int64
+	if err := c.s.db.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM cluster_breaker`).Scan(&seq); err != nil {
+		c.logErr("read breaker", err)
+		return
+	}
+	rows, err := c.s.db.Query(`SELECT k, open_until, opens, error, at FROM cluster_breaker WHERE open_until > ? AND seq <= ?`, c.Now().UnixMilli(), seq)
+	if err != nil {
+		c.logErr("read breaker", err)
+		return
+	}
+	var open []Cooldown
+	for rows.Next() {
+		var cd Cooldown
+		var until, at int64
+		if err := rows.Scan(&cd.Key, &until, &cd.Opens, &cd.Error, &at); err != nil {
+			break
+		}
+		cd.OpenUntil, cd.At = c.local(until), c.local(at)
+		open = append(open, cd)
+	}
+	rows.Close()
+	c.seenBreaker.Store(seq)
+	if len(open) > 0 && h.Breaker != nil {
+		h.Breaker(open)
+	}
+}
+
+// local converts a database-clock unix ms value to this machine's clock.
+func (c *Cluster) local(ms int64) time.Time { return time.UnixMilli(ms).Add(-c.Offset()) }
+
 func (c *Cluster) Heartbeat() {
-	now := c.now().UnixMilli()
+	c.syncClock()
+	now := c.Now().UnixMilli()
 	_, err := c.s.db.Exec(`INSERT INTO cluster_instances (id, host, version, started_at, seen_at) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET seen_at = excluded.seen_at, version = excluded.version`, c.id, c.host, c.version, c.started, now)
 	c.logErr("heartbeat", err)
@@ -266,9 +332,9 @@ func (c *Cluster) Poll(h Handlers) {
 			continue
 		}
 		if until > 0 {
-			cd.OpenUntil = time.UnixMilli(until)
+			cd.OpenUntil = c.local(until)
 		}
-		cd.At = time.UnixMilli(at)
+		cd.At = c.local(at)
 		changes = append(changes, cd)
 	}
 	rows.Close()
@@ -278,20 +344,23 @@ func (c *Cluster) Poll(h Handlers) {
 	}
 }
 
-// bumpConfig tells the other instances to reload (after a config write).
-func (c *Cluster) bumpConfig() {
+// bumpConfig tells the other instances to reload (after a config write) and
+// returns the new version, or -1. It runs before this instance rebuilds its
+// own snapshot, so a write another instance commits meanwhile is either in
+// that snapshot or bumps the version again (and is picked up by Poll).
+func (c *Cluster) bumpConfig() int64 {
 	var raw string
 	err := c.s.db.QueryRow(`INSERT INTO settings (k, v) VALUES ('config_version', '1')
 		ON CONFLICT (k) DO UPDATE SET v = CAST(CAST(settings.v AS BIGINT) + 1 AS TEXT) RETURNING v`).Scan(&raw)
 	if err != nil {
 		c.logErr("bump config version", err)
-		return
+		return -1
 	}
 	v, _ := strconv.ParseInt(raw, 10, 64)
-	c.seenConfig.Store(v)
+	return v
 }
 
-func (c *Cluster) aliveSince() int64 { return c.now().Add(-InstanceTimeout).UnixMilli() }
+func (c *Cluster) aliveSince() int64 { return c.Now().Add(-InstanceTimeout).UnixMilli() }
 
 // Instances lists the registry, newest first.
 func (c *Cluster) Instances() ([]Instance, error) {
@@ -321,11 +390,12 @@ func (c *Cluster) leave() {
 
 // cleanup drops what dead instances and expired windows left behind.
 func (c *Cluster) cleanup() {
-	now := c.now()
+	now := c.Now()
 	dead := now.Add(-10 * time.Minute).UnixMilli()
-	_, err := c.s.db.Exec(`DELETE FROM cluster_slots WHERE instance IN (SELECT id FROM cluster_instances WHERE seen_at < ?)`, dead)
+	_, err := c.s.db.Exec(`DELETE FROM cluster_instances WHERE seen_at < ?`, dead)
 	c.logErr("cleanup", err)
-	_, _ = c.s.db.Exec(`DELETE FROM cluster_instances WHERE seen_at < ?`, dead)
+	// also rows written after an instance left (requests finishing during shutdown)
+	_, _ = c.s.db.Exec(`DELETE FROM cluster_slots WHERE instance NOT IN (SELECT id FROM cluster_instances)`)
 	_, _ = c.s.db.Exec(`DELETE FROM cluster_counters WHERE bucket < ?`, now.Unix()-2*windowSpan)
 	_, _ = c.s.db.Exec(`DELETE FROM cluster_leases WHERE until_ms < ?`, now.Add(-24*time.Hour).UnixMilli())
 	_, _ = c.s.db.Exec(`DELETE FROM cluster_breaker WHERE open_until < ? AND at < ?`, now.UnixMilli(), now.Add(-24*time.Hour).UnixMilli())
@@ -368,7 +438,8 @@ func WindowRetry(buckets []Bucket, limit int64, now time.Time) time.Duration {
 	for _, b := range buckets {
 		used -= b.N
 		if used < limit {
-			if d := time.Unix(b.At+windowSpan, 0).Sub(now); d > time.Second {
+			// buckets are whole seconds: so is the answer
+			if d := time.Unix(b.At+windowSpan, 0).Sub(now).Round(time.Second); d > time.Second {
 				return d
 			}
 			return time.Second
@@ -509,19 +580,20 @@ func (c *Cluster) SlotTotals(prefix string) (map[string]int, error) {
 
 // ---------- circuit breaker ----------
 
-// PublishCooldown shares a breaker change with the other instances.
+// PublishCooldown shares a breaker change with the other instances. The
+// breaker's times are on this machine's clock; the table holds the
+// database's.
 func (c *Cluster) PublishCooldown(cd Cooldown) error {
 	var until int64
 	if !cd.OpenUntil.IsZero() {
-		until = cd.OpenUntil.UnixMilli()
+		until = cd.OpenUntil.Add(c.Offset()).UnixMilli()
 	}
 	if cd.At.IsZero() {
-		cd.At = c.now()
+		cd.At = time.Now()
 	}
-	_, err := c.s.db.Exec(`INSERT INTO cluster_breaker (k, open_until, opens, error, at, origin, seq) VALUES (?, ?, ?, ?, ?, ?, nextval('cluster_breaker_seq'))
-		ON CONFLICT (k) DO UPDATE SET open_until = excluded.open_until, opens = excluded.opens, error = excluded.error,
-		at = excluded.at, origin = excluded.origin, seq = excluded.seq`, cd.Key, until, cd.Opens, clip(cd.Error, 500), cd.At.UnixMilli(), c.id)
-	return err
+	var ok bool
+	return c.s.db.QueryRow(`SELECT ai_route_publish_breaker(?, ?, ?, ?, ?, ?)`,
+		cd.Key, until, cd.Opens, clip(cd.Error, 500), cd.At.Add(c.Offset()).UnixMilli(), c.id).Scan(&ok)
 }
 
 // ---------- leases ----------
@@ -529,7 +601,7 @@ func (c *Cluster) PublishCooldown(cd Cooldown) error {
 // Claim takes the named lease for d unless another holder's lease is still
 // running: used so one instance sends an alert or runs a periodic job.
 func (c *Cluster) Claim(k string, d time.Duration) bool {
-	now := c.now().UnixMilli()
+	now := c.Now().UnixMilli()
 	var got string
 	err := c.s.db.QueryRow(`INSERT INTO cluster_leases (k, until_ms, owner) VALUES (?, ?, ?)
 		ON CONFLICT (k) DO UPDATE SET until_ms = excluded.until_ms, owner = excluded.owner

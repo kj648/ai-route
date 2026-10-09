@@ -87,12 +87,12 @@ const (
 // several instances the failures are counted over all of them.
 func (a *Admin) tooManyFailures(ip string) (bool, time.Duration) {
 	if c := a.store.Cluster(); c != nil {
-		buckets, err := c.Window("auth:"+ip, time.Now())
+		buckets, err := c.Window("auth:"+ip, c.Now())
 		if err == nil {
 			if store.WindowSum(buckets) < maxAuthFailures {
 				return false, 0
 			}
-			return true, store.WindowRetry(buckets, maxAuthFailures, time.Now())
+			return true, store.WindowRetry(buckets, maxAuthFailures, c.Now())
 		}
 	}
 	a.failMu.Lock()
@@ -111,7 +111,7 @@ func (a *Admin) tooManyFailures(ip string) (bool, time.Duration) {
 
 func (a *Admin) recordFailure(ip string) {
 	if c := a.store.Cluster(); c != nil {
-		if err := c.AddWindow("auth:"+ip, 1, time.Now()); err == nil {
+		if err := c.AddWindow("auth:"+ip, 1, c.Now()); err == nil {
 			return
 		}
 	}
