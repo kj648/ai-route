@@ -2,7 +2,7 @@ package store
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -56,7 +56,13 @@ type RequestLog struct {
 	flushed chan struct{} // FlushLogs marker, not a real entry
 }
 
-// AddLog enqueues a log entry; it never blocks the request path.
+// logEnqueueWait bounds how long a request waits for room in the log queue
+// before its entry is dropped; the response has already been sent by then,
+// so a short wait costs the client nothing and keeps the cost rows the
+// monthly budgets depend on.
+const logEnqueueWait = time.Second
+
+// AddLog enqueues a log entry, waiting briefly when the queue is full.
 func (s *Store) AddLog(l *RequestLog) {
 	s.logMu.RLock()
 	defer s.logMu.RUnlock()
@@ -65,10 +71,20 @@ func (s *Store) AddLog(l *RequestLog) {
 	}
 	select {
 	case s.logCh <- l:
+		return
 	default:
+	}
+	t := time.NewTimer(logEnqueueWait)
+	defer t.Stop()
+	select {
+	case s.logCh <- l:
+	case <-t.C:
 		s.reportDropped()
 	}
 }
+
+// DroppedLogs is the number of entries lost to a full queue since start.
+func (s *Store) DroppedLogs() int64 { return s.dropped.Load() }
 
 // reportDropped logs dropped entries at most once every 10 seconds.
 func (s *Store) reportDropped() {
@@ -76,7 +92,7 @@ func (s *Store) reportDropped() {
 	now := time.Now().UnixMilli()
 	last := s.droppedLog.Load()
 	if now-last >= 10_000 && s.droppedLog.CompareAndSwap(last, now) {
-		log.Printf("request log queue full: %d entries dropped so far", n)
+		slog.Error("request log queue full", "dropped_total", n)
 	}
 }
 
@@ -119,18 +135,32 @@ func (s *Store) FlushLogs() {
 	<-done
 }
 
+// cleanupLoop enforces log retention on its own goroutine: a large
+// backlog of deletes or a vacuum must not stall the log writer.
+func (s *Store) cleanupLoop() {
+	defer close(s.cleanupDone)
+	s.cleanupLogs()
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.cleanupStop:
+			return
+		case <-t.C:
+			s.cleanupLogs()
+		}
+	}
+}
+
 func (s *Store) logWriter() {
 	defer close(s.logDone)
-	cleanup := time.NewTicker(time.Hour)
-	defer cleanup.Stop()
-	s.cleanupLogs()
 	batch := make([]*RequestLog, 0, 1024)
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
 		if err := s.insertLogs(batch); err != nil {
-			log.Printf("write request logs: %v", err)
+			slog.Error("write request logs failed", "err", err)
 		}
 		batch = batch[:0]
 	}
@@ -155,8 +185,6 @@ func (s *Store) logWriter() {
 			}
 		case <-tick.C:
 			flush()
-		case <-cleanup.C:
-			s.cleanupLogs()
 		}
 	}
 }
@@ -209,9 +237,14 @@ func (s *Store) cleanupLogs() {
 	// small batches: one huge DELETE would hold the write lock for seconds
 	var n int64
 	for {
+		select {
+		case <-s.cleanupStop:
+			return
+		default:
+		}
 		res, err := s.db.Exec(`DELETE FROM request_logs WHERE id IN (SELECT id FROM request_logs WHERE created_at < ? LIMIT 5000)`, cutoff)
 		if err != nil {
-			log.Printf("cleanup logs: %v", err)
+			slog.Error("cleanup logs failed", "err", err)
 			return
 		}
 		k, _ := res.RowsAffected()
@@ -221,9 +254,11 @@ func (s *Store) cleanupLogs() {
 		}
 	}
 	if n > 0 && !s.db.pg {
-		// give the freed pages back to the file system
-		_, _ = s.db.Exec(`PRAGMA incremental_vacuum`)
-		_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+		// give freed pages back to the file system, a bounded slice per
+		// run: an unbounded vacuum on a big file holds the write lock for
+		// seconds and stalls request logging
+		_, _ = s.db.Exec(`PRAGMA incremental_vacuum(8192)`)
+		_, _ = s.db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
 	}
 }
 

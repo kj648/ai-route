@@ -7,11 +7,12 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -21,8 +22,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 
 	"ai-route/internal/hdrtpl"
 )
@@ -267,9 +269,34 @@ type Store struct {
 	droppedLog atomic.Int64
 	logCh      chan *RequestLog
 	logDone    chan struct{}
+	// cleanupStop ends the retention goroutine; cleanupDone closes when it
+	// has returned
+	cleanupStop chan struct{}
+	cleanupDone chan struct{}
 
 	cluster *Cluster // nil with SQLite
 }
+
+// IsDBError reports whether err came from the database itself (driver,
+// connection, timeout) rather than from validating the caller's input.
+func IsDBError(err error) bool {
+	var pgErr *pgconn.PgError
+	var sqErr *sqlite.Error
+	switch {
+	case err == nil:
+		return false
+	case errors.As(err, &pgErr), errors.As(err, &sqErr):
+		return true
+	case errors.Is(err, driver.ErrBadConn), errors.Is(err, sql.ErrConnDone), errors.Is(err, sql.ErrTxDone),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// Ping checks that the database answers.
+func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 // IsPostgresURL reports whether a DATABASE_URL points at PostgreSQL.
 func IsPostgresURL(u string) bool {
@@ -347,7 +374,8 @@ func OpenPostgres(databaseURL string) (*Store, error) {
 }
 
 func open(db *dbx) (*Store, error) {
-	s := &Store{db: db, logCh: make(chan *RequestLog, 4096), logDone: make(chan struct{})}
+	s := &Store{db: db, logCh: make(chan *RequestLog, 4096), logDone: make(chan struct{}),
+		cleanupStop: make(chan struct{}), cleanupDone: make(chan struct{})}
 	if db.pg {
 		s.cluster = newCluster(s)
 	}
@@ -364,6 +392,7 @@ func open(db *dbx) (*Store, error) {
 		return nil, err
 	}
 	go s.logWriter()
+	go s.cleanupLoop()
 	return s, nil
 }
 
@@ -391,7 +420,7 @@ func (s *Store) enableIncrementalVacuum() error {
 	var pages int64
 	_ = s.db.QueryRow(`PRAGMA page_count`).Scan(&pages)
 	if pages > 2500 { // about 10 MB: worth a note, the VACUUM takes a moment
-		log.Printf("store: enabling incremental vacuum (one-time VACUUM, may take a while on a large database)")
+		slog.Info("store: enabling incremental vacuum (one-time VACUUM, may take a while on a large database)")
 	}
 	if _, err := s.db.Exec(`PRAGMA auto_vacuum = INCREMENTAL`); err != nil {
 		return err
@@ -401,6 +430,8 @@ func (s *Store) enableIncrementalVacuum() error {
 }
 
 func (s *Store) Close() error {
+	close(s.cleanupStop)
+	<-s.cleanupDone
 	s.logMu.Lock()
 	s.logClosed = true
 	close(s.logCh)
@@ -500,6 +531,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
 CREATE INDEX IF NOT EXISTS idx_logs_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_model ON request_logs(public_model, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_at);
+CREATE INDEX IF NOT EXISTS idx_logs_key ON request_logs(key_id, created_at);
 `))
 	if err != nil {
 		return err

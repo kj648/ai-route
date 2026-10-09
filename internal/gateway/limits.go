@@ -2,7 +2,7 @@ package gateway
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
@@ -45,6 +45,10 @@ type Limiter struct {
 
 	mu   sync.Mutex
 	keys map[int64]*keyUsage
+	// spendMu serializes reloads of the month-to-date spend: when the
+	// cached value expires, one query refreshes every key instead of each
+	// concurrent request scanning the logs
+	spendMu sync.Mutex
 }
 
 func NewLimiter(s *store.Store) *Limiter {
@@ -141,7 +145,7 @@ func (l *Limiter) admitShared(k *store.APIKey, now time.Time) *rejection {
 	if k.TPM > 0 {
 		buckets, err := l.cluster.Window("tpm:"+id, now)
 		if err != nil {
-			log.Printf("rate limit (tpm): %v", err)
+			slog.Warn("rate limit: token window check failed", "key", k.Name, "err", err)
 		} else if store.WindowSum(buckets) >= int64(k.TPM) {
 			return tpmRejection(k, store.WindowRetry(buckets, int64(k.TPM), now))
 		}
@@ -149,7 +153,7 @@ func (l *Limiter) admitShared(k *store.APIKey, now time.Time) *rejection {
 	if k.RPM > 0 {
 		ok, buckets, err := l.cluster.TakeWindow("rpm:"+id, int64(k.RPM), now)
 		if err != nil {
-			log.Printf("rate limit (rpm): %v", err)
+			slog.Warn("rate limit: request window check failed", "key", k.Name, "err", err)
 		} else if !ok {
 			return rpmRejection(k, store.WindowRetry(buckets, int64(k.RPM), now))
 		}
@@ -172,7 +176,7 @@ func (l *Limiter) Enter(k *store.APIKey) *rejection {
 	}
 	if l.cluster != nil {
 		if ok, err := l.cluster.Acquire(keySlot(k.ID), k.MaxConcurrency); err != nil {
-			log.Printf("key concurrency: %v", err)
+			slog.Warn("rate limit: key concurrency check failed", "key", k.Name, "err", err)
 		} else if !ok {
 			return concurrencyRejection(k)
 		}
@@ -214,7 +218,7 @@ func (l *Limiter) Record(k *store.APIKey, e *store.RequestLog) {
 	t := e.InputTokens + e.OutputTokens
 	if l.cluster != nil && k.TPM > 0 && t > 0 {
 		if err := l.cluster.AddWindow("tpm:"+strconv.FormatInt(k.ID, 10), t, now.Add(l.cluster.Offset())); err != nil {
-			log.Printf("rate limit (tpm): %v", err)
+			slog.Warn("rate limit: recording tokens failed", "key", k.Name, "err", err)
 		}
 	}
 	l.mu.Lock()
@@ -245,17 +249,35 @@ func (l *Limiter) monthSpend(id int64, now time.Time) float64 {
 	}
 	l.mu.Unlock()
 
+	l.spendMu.Lock()
+	defer l.spendMu.Unlock()
+	l.mu.Lock()
+	if u.spendMonth == month && now.Sub(u.spendLoaded) < ttl {
+		v := u.spend // another request reloaded it while we waited
+		l.mu.Unlock()
+		return v
+	}
+	l.mu.Unlock()
+
 	l.store.FlushLogsTimeout(2 * time.Second) // so the query sees every finished request
 	spend, err := l.store.KeySpend(month)
 	if err != nil {
-		log.Printf("load key spend: %v", err)
+		slog.Warn("rate limit: loading month-to-date spend failed", "err", err)
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		return u.spend
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	u.spend, u.spendMonth, u.spendLoaded = spend[id], month, now
+	// the query covers every key: refresh them all
+	for kid, ku := range l.keys {
+		ku.spend, ku.spendMonth, ku.spendLoaded = spend[kid], month, now
+	}
+	for kid, v := range spend {
+		if _, ok := l.keys[kid]; !ok {
+			l.keys[kid] = &keyUsage{spend: v, spendMonth: month, spendLoaded: now}
+		}
+	}
 	return u.spend
 }
 
