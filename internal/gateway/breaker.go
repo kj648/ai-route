@@ -60,6 +60,7 @@ type breakerEntry struct {
 	Failures      int       `json:"failures"`   // consecutive soft failures
 	Opens         int       `json:"opens"`      // consecutive cooldowns (for backoff)
 	OpenUntil     time.Time `json:"open_until"` // zero = closed
+	OpenedAt      time.Time `json:"opened_at"`  // when the current cooldown began
 	LastError     string    `json:"last_error"`
 	LastErrorAt   time.Time `json:"last_error_at"`
 	LastSuccessAt time.Time `json:"last_success_at"`
@@ -137,19 +138,31 @@ func (b *Breaker) SetDown(prefix string, down bool, msg string) bool {
 	return changed
 }
 
-func (b *Breaker) Success(prefix, target string) {
+// Success records a request that succeeded on the target. started is when
+// the request began: a success that predates the current cooldown (the
+// request was already in flight when another request hit a 401 or an
+// exhausted quota) says nothing about the state now, so it does not clear
+// the cooldown, here or on other instances.
+func (b *Breaker) Success(prefix, target string, started time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
 	for _, k := range []string{providerKey(prefix), targetKey(target)} {
 		e := b.entry(k)
-		if b.publish != nil && (e.Opens > 0 || !e.OpenUntil.IsZero()) {
-			b.publish(store.Cooldown{Key: k, At: now}) // recovered: others reset their backoff too
-		}
-		e.Failures, e.Opens = 0, 0
-		e.OpenUntil = time.Time{}
 		e.LastSuccessAt = now
 		e.TotalSuccess++
+		if e.Opens == 0 && e.OpenUntil.IsZero() {
+			e.Failures = 0
+			continue
+		}
+		if started.Before(e.OpenedAt) {
+			continue
+		}
+		if b.publish != nil {
+			b.publish(store.Cooldown{Key: k, At: started}) // recovered: others reset their backoff too
+		}
+		e.Failures, e.Opens = 0, 0
+		e.OpenUntil, e.OpenedAt = time.Time{}, time.Time{}
 	}
 }
 
@@ -199,7 +212,7 @@ func (b *Breaker) Failure(prefix, target string, kind failKind, retryAfter time.
 			cooldown = 6 * time.Hour
 		}
 	}
-	open.OpenUntil = now.Add(cooldown)
+	open.OpenUntil, open.OpenedAt = now.Add(cooldown), now
 	if b.publish != nil {
 		b.publish(store.Cooldown{Key: open.Key, OpenUntil: open.OpenUntil, Opens: open.Opens, Error: msg, At: now})
 	}
@@ -217,11 +230,17 @@ func (b *Breaker) Apply(changes []store.Cooldown) {
 		}
 		e := b.entry(c.Key)
 		if c.OpenUntil.IsZero() {
-			e.Failures, e.Opens, e.OpenUntil = 0, 0, time.Time{}
+			if !c.At.IsZero() && c.At.Before(e.OpenedAt) {
+				continue // a success older than our cooldown
+			}
+			e.Failures, e.Opens, e.OpenUntil, e.OpenedAt = 0, 0, time.Time{}, time.Time{}
 			continue
 		}
 		if c.OpenUntil.After(e.OpenUntil) {
 			e.OpenUntil = c.OpenUntil
+			if e.OpenedAt.IsZero() || c.At.After(e.OpenedAt) {
+				e.OpenedAt = c.At
+			}
 		}
 		if c.Opens > e.Opens {
 			e.Opens = c.Opens
