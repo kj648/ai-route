@@ -10,9 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"ai-route/internal/alert"
+	"ai-route/internal/clientip"
 	"ai-route/internal/convert"
 	"ai-route/internal/store"
 	"ai-route/internal/version"
@@ -45,7 +47,8 @@ type Gateway struct {
 	Health  *HealthChecker
 	client  *http.Client
 	slots   *slots
-	cluster *clusterGlue // nil with a single instance (SQLite)
+	cluster *clusterGlue     // nil with a single instance (SQLite)
+	proxies clientip.Trusted // whose X-Forwarded-For names the client
 
 	touchMu sync.Mutex
 	touched map[int64]time.Time
@@ -75,6 +78,7 @@ func New(s *store.Store) *Gateway {
 	}
 	g.Health = newHealthChecker(g)
 	g.setupCluster(s.Cluster())
+	g.registerGauges()
 	return g
 }
 
@@ -175,20 +179,12 @@ func writeError(w http.ResponseWriter, proto string, status int, msg string) {
 	_, _ = w.Write(convert.ErrorBody(proto, status, msg))
 }
 
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ip, _, _ := strings.Cut(xff, ",")
-		return strings.TrimSpace(ip)
-	}
-	if xr := r.Header.Get("X-Real-IP"); xr != "" {
-		return xr
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
+// TrustProxies sets the proxies whose X-Forwarded-For / X-Real-IP name the
+// client in the request log (TRUSTED_PROXIES); from anyone else the TCP
+// peer is logged, since those headers could be forged.
+func (g *Gateway) TrustProxies(p []netip.Prefix) { g.proxies = clientip.Trusted(p) }
+
+func (g *Gateway) clientIP(r *http.Request) string { return g.proxies.Client(r) }
 
 // ---------- routing ----------
 
@@ -312,9 +308,9 @@ func readBody(w http.ResponseWriter, r *http.Request, inbound string) ([]byte, b
 
 // reject answers a request refused by the key's limits and logs it.
 func (g *Gateway) reject(w http.ResponseWriter, r *http.Request, inbound string, key *store.APIKey, rej *rejection) {
-	g.store.AddLog(&store.RequestLog{
+	g.log(&store.RequestLog{
 		CreatedAt: time.Now().UnixMilli(), KeyID: key.ID, KeyName: key.Name,
-		Inbound: inbound, HTTPStatus: rej.status, Error: rej.msg, ClientIP: clientIP(r),
+		Inbound: inbound, HTTPStatus: rej.status, Error: rej.msg, ClientIP: g.clientIP(r),
 	})
 	if rej.retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(rej.retryAfter.Seconds())+1))
@@ -331,7 +327,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		KeyID:     key.ID,
 		KeyName:   key.Name,
 		Inbound:   inbound,
-		ClientIP:  clientIP(r),
+		ClientIP:  g.clientIP(r),
 		RequestID: newRequestID(),
 	}
 	w.Header().Set("X-Route-Request-Id", entry.RequestID)
@@ -341,7 +337,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		// replaces the cached spend with the logged total, so a request is
 		// never counted twice (at worst missed until the next reload)
 		g.Limiter.Record(key, entry)
-		g.store.AddLog(entry)
+		g.log(entry)
 	}()
 
 	info, err := convert.ParseRequestInfo(body)
@@ -422,7 +418,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 			if res.retryAfter > delay {
 				delay = res.retryAfter
 			}
-			log.Printf("[%s] target %s failed (%d), retry %d/%d in %s: %s", m.Name, c.target, res.attempt.HTTPStatus, retry+1, maxRetries, delay, truncate(res.attempt.Error, 200))
+			slog.Warn("upstream target failed, retrying", "request", entry.RequestID, "model", m.Name, "target", c.target, "status", res.attempt.HTTPStatus, "retry", retry+1, "max_retries", maxRetries, "delay", delay, "err", truncate(res.attempt.Error, 200))
 			if !sleepCtx(r.Context(), delay) {
 				res.clientGone = true
 				break
@@ -449,7 +445,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 			entry.Cost, entry.Currency, entry.CostSource = costOf(c.provider, c.model, res.usage)
 			entry.Fallback = i > 0
 			if res.streamErr == "" {
-				g.Breaker.Success(c.prefix, c.target)
+				g.Breaker.Success(c.prefix, c.target, start)
 			} else {
 				g.failure(c, failSoft, 0, 200, res.streamErr)
 			}
@@ -457,7 +453,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		}
 		g.failure(c, res.kind, res.retryAfter, res.attempt.HTTPStatus, res.attempt.Error)
 		lastStatus, lastMsg = res.attempt.HTTPStatus, res.attempt.Error
-		log.Printf("[%s] target %s failed (%d): %s", m.Name, c.target, res.attempt.HTTPStatus, truncate(res.attempt.Error, 200))
+		slog.Warn("upstream target failed", "request", entry.RequestID, "model", m.Name, "target", c.target, "status", res.attempt.HTTPStatus, "err", truncate(res.attempt.Error, 200))
 		return false
 	}
 
@@ -1088,9 +1084,9 @@ func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	info, _ := convert.ParseRequestInfo(body)
-	g.store.AddLog(&store.RequestLog{
+	g.log(&store.RequestLog{
 		CreatedAt: time.Now().UnixMilli(), KeyID: key.ID, KeyName: key.Name, RequestedModel: info.Model,
-		Inbound: "count_tokens", Success: true, HTTPStatus: 200, ClientIP: clientIP(r), RequestID: newRequestID(),
+		Inbound: "count_tokens", Success: true, HTTPStatus: 200, ClientIP: g.clientIP(r), RequestID: newRequestID(),
 	})
 	if m := snap.ResolveModel(info.Model); m != nil && keyAllows(key, m.Name) {
 		for _, c := range g.plan(snap, m, convert.ProtoAnthropic, "") {

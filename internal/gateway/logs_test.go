@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"ai-route/internal/clientip"
 	"ai-route/internal/store"
 )
 
@@ -19,6 +20,8 @@ func TestRequestLogSuccessFields(t *testing.T) {
 	h := newHarness(t)
 	mustNil(t, h.st.CreateModel(&store.Model{Name: "dess", Aliases: []string{"claude-*"}, Targets: []string{"an/ok"}, Enabled: true}))
 	before := time.Now().UnixMilli()
+	private, _ := clientip.Parse("private") // the test server and the hops in the header
+	h.gw.TrustProxies(private)
 	resp, body := h.postWith("/v1/chat/completions", oaReq("claude-sonnet-x", false), map[string]string{"X-Forwarded-For": "10.1.2.3, 172.16.0.1"})
 	if resp.StatusCode != 200 {
 		t.Fatal(body)

@@ -5,7 +5,7 @@ import (
 	"embed"
 	"flag"
 	"io/fs"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +18,7 @@ import (
 
 	"ai-route/internal/admin"
 	"ai-route/internal/gateway"
+	"ai-route/internal/metrics"
 	"ai-route/internal/store"
 	"ai-route/internal/version"
 )
@@ -32,7 +33,32 @@ func env(k, def string) string {
 	return def
 }
 
+// setupLogging configures the process logger: LOG_FORMAT=text (default) or
+// json, LOG_LEVEL=debug|info|warn|error. The standard log package is routed
+// through the same handler.
+func setupLogging() {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(env("LOG_LEVEL", "info"))); err != nil {
+		level = slog.LevelInfo
+	}
+	opts := &slog.HandlerOptions{Level: level}
+	var h slog.Handler
+	if strings.EqualFold(os.Getenv("LOG_FORMAT"), "json") {
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	} else {
+		h = slog.NewTextHandler(os.Stderr, opts)
+	}
+	slog.SetDefault(slog.New(h))
+}
+
+// fatal logs the message and exits.
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
+}
+
 func main() {
+	setupLogging()
 	if len(os.Args) > 1 && os.Args[1] == "migrate" {
 		migrate(os.Args[2:])
 		return
@@ -44,17 +70,17 @@ func main() {
 
 	st, err := store.OpenAuto(*dbURL, *dataDir)
 	if err != nil {
-		log.Fatalf("open store: %v", err)
+		fatal("open store failed", "err", err)
 	}
 	if st.Backend() == "postgres" {
-		log.Printf("store: PostgreSQL %s", redactURL(*dbURL))
+		slog.Info("store opened", "backend", "postgres", "url", redactURL(*dbURL))
 	} else {
-		log.Printf("store: SQLite in %s", *dataDir)
+		slog.Info("store opened", "backend", "sqlite", "dir", *dataDir)
 	}
 
 	token := os.Getenv("ADMIN_TOKEN")
 	if token != "" && (len(token) < 16 || token == "change-me-to-a-long-random-string") {
-		log.Fatalf("ADMIN_TOKEN is too weak: use at least 16 random characters (e.g. `openssl rand -hex 24`), not the example value")
+		fatal("ADMIN_TOKEN is too weak: use at least 16 random characters (e.g. `openssl rand -hex 24`), not the example value")
 	}
 	if token == "" {
 		if t, ok := st.GetKV("admin_token"); ok {
@@ -63,27 +89,28 @@ func main() {
 			generated := store.RandomToken("admin-", 16)
 			// another instance starting at the same moment may win; use its token
 			if token, err = st.InitKV("admin_token", generated); err != nil {
-				log.Fatalf("save admin token: %v", err)
+				fatal("save admin token failed", "err", err)
 			}
 			if token == generated {
-				log.Printf("generated admin token: %s  (set ADMIN_TOKEN to override)", token)
+				slog.Warn("generated an admin token; set ADMIN_TOKEN to choose your own", "token", token)
 			}
 		}
 	}
 
 	proxies, err := admin.ParseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
 	if err != nil {
-		log.Fatal(err)
+		fatal(err.Error())
 	}
 
 	gw := gateway.New(st)
+	gw.TrustProxies(proxies)
 	bg, stopBG := context.WithCancel(context.Background())
 	go gw.Health.Run(bg)
 	clusterDone := make(chan struct{})
 	if c := st.Cluster(); c != nil {
 		c.SetVersion(version.Version)
 		c.Heartbeat() // registered before serving: slots taken from the first request on count
-		log.Printf("cluster: %s; other instances on this database share limits, cooldowns and config", c)
+		slog.Info("cluster mode: other instances on this database share limits, cooldowns and config", "instance", c.String())
 	}
 	go func() {
 		defer close(clusterDone)
@@ -95,7 +122,16 @@ func main() {
 	adm := admin.New(st, gw, token, web)
 	adm.TrustProxies(proxies)
 	adm.Register(mux)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.Handle("GET /metrics", adm.Protect(metrics.Handler()))
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		if err := st.Ping(ctx); err != nil {
+			http.Error(w, "database unavailable: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	})
 
 	srv := &http.Server{
 		Addr:              *listen,
@@ -109,16 +145,16 @@ func main() {
 		if strings.HasPrefix(host, ":") {
 			host = "localhost" + host
 		}
-		log.Printf("ai-route listening on %s (admin console: http://%s/admin/)", *listen, host)
+		slog.Info("ai-route listening", "addr", *listen, "console", "http://"+host+"/admin/", "version", version.Version)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
+			fatal("listen failed", "err", err)
 		}
 	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	log.Printf("shutting down...")
+	slog.Info("shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
@@ -145,7 +181,7 @@ func migrate(args []string) {
 	}
 	if !store.IsPostgresURL(*from) {
 		if _, err := os.Stat(filepath.Join(*from, "ai-route.db")); err != nil {
-			log.Fatalf("no database in %s: %v", *from, err)
+			fatal("no database found", "dir", *from, "err", err)
 		}
 	}
 	open := func(loc string) *store.Store {
@@ -157,24 +193,24 @@ func migrate(args []string) {
 			st, err = store.Open(loc)
 		}
 		if err != nil {
-			log.Fatalf("open %s: %v", redactURL(loc), err)
+			fatal("open failed", "location", redactURL(loc), "err", err)
 		}
 		return st
 	}
 	src, dst := open(*from), open(*to)
-	log.Printf("copying %s (%s) -> %s (%s)", redactURL(*from), src.Backend(), redactURL(*to), dst.Backend())
+	slog.Info("copying", "from", redactURL(*from), "from_backend", src.Backend(), "to", redactURL(*to), "to_backend", dst.Backend())
 	start := time.Now()
 	err := src.CopyTo(dst, func(table string, n int64) {
 		if table != "request_logs" || n%100000 == 0 || n < 5000 {
-			log.Printf("  %s: %d", table, n)
+			slog.Info("copied", "table", table, "rows", n)
 		}
 	})
 	_ = src.Close()
 	_ = dst.Close()
 	if err != nil {
-		log.Fatalf("migrate: %v", err)
+		fatal("migrate failed", "err", err)
 	}
-	log.Printf("done in %s", time.Since(start).Round(time.Millisecond))
+	slog.Info("done", "took", time.Since(start).Round(time.Millisecond))
 }
 
 // redactURL hides the password in a database URL for logs.

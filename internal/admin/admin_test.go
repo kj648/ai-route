@@ -69,8 +69,13 @@ func TestAdminLockoutAndConsoleHeaders(t *testing.T) {
 			t.Fatalf("attempt %d: %d", i, c)
 		}
 	}
-	if w := call("the-right-token-123"); w.Code != 429 || w.Header().Get("Retry-After") == "" {
-		t.Fatalf("locked out IP should get 429 even with the right token, got %d", w.Code)
+	if w := call("wrong"); w.Code != 429 || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("locked out IP should get 429 on further wrong tokens, got %d", w.Code)
+	}
+	// the right token is never locked out: behind a shared address someone
+	// else's failures must not shut the administrator out
+	if w := call("the-right-token-123"); w.Code != 200 {
+		t.Fatalf("right token from a locked IP: %d %s", w.Code, w.Body.String())
 	}
 	r := httptest.NewRequest("GET", "/admin/", nil)
 	w := httptest.NewRecorder()

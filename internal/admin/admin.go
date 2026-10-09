@@ -6,16 +6,17 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
-	"net"
+	"log/slog"
 	"net/http"
-	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"ai-route/internal/alert"
+	"ai-route/internal/clientip"
 	"ai-route/internal/gateway"
 	"ai-route/internal/store"
 	"ai-route/internal/version"
@@ -29,7 +30,7 @@ type Admin struct {
 
 	failMu  sync.Mutex
 	fails   map[string]*authFailures // by client IP
-	proxies []netip.Prefix           // trusted for X-Forwarded-For
+	proxies clientip.Trusted         // trusted for X-Forwarded-For
 
 	statsMu    sync.Mutex
 	statsCache map[string]*statsEntry // by range
@@ -117,8 +118,20 @@ func (a *Admin) recordFailure(ip string) {
 	}
 	a.failMu.Lock()
 	defer a.failMu.Unlock()
-	if a.fails == nil || len(a.fails) > 10000 {
-		a.fails = map[string]*authFailures{} // bounded: forget everything rather than grow
+	if a.fails == nil {
+		a.fails = map[string]*authFailures{}
+	}
+	if len(a.fails) > 10000 {
+		// bounded: drop expired windows first; only if an attacker is
+		// spraying from thousands of addresses forget everything
+		for k, f := range a.fails {
+			if time.Since(f.since) > authFailureWindow {
+				delete(a.fails, k)
+			}
+		}
+		if len(a.fails) > 10000 {
+			a.fails = map[string]*authFailures{}
+		}
 	}
 	f, ok := a.fails[ip]
 	if !ok || time.Since(f.since) > authFailureWindow {
@@ -126,16 +139,6 @@ func (a *Admin) recordFailure(ip string) {
 		a.fails[ip] = f
 	}
 	f.count++
-}
-
-// remoteIP is the TCP peer: X-Forwarded-For could be forged to dodge the
-// lockout.
-func remoteIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 func New(s *store.Store, gw *gateway.Gateway, token string, web fs.FS) *Admin {
@@ -208,21 +211,27 @@ func (a *Admin) Register(mux *http.ServeMux) {
 	})
 }
 
+// Protect wraps a handler in the admin token check (used for /metrics).
+func (a *Admin) Protect(next http.Handler) http.Handler { return a.auth(next) }
+
 func (a *Admin) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(a.token)) == 1 {
+			// the right token is never locked out: behind a shared NAT or an
+			// untrusted proxy, someone else's failures must not shut the
+			// real administrator out
+			next.ServeHTTP(w, r)
+			return
+		}
 		ip := a.clientIP(r)
 		if locked, left := a.tooManyFailures(ip); locked {
 			w.Header().Set("Retry-After", strconv.Itoa(int(left.Seconds())+1))
 			writeErr(w, http.StatusTooManyRequests, errors.New("too many failed logins, try again later"))
 			return
 		}
-		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(tok), []byte(a.token)) != 1 {
-			a.recordFailure(ip)
-			writeErr(w, http.StatusUnauthorized, errors.New("unauthorized"))
-			return
-		}
-		next.ServeHTTP(w, r)
+		a.recordFailure(ip)
+		writeErr(w, http.StatusUnauthorized, errors.New("unauthorized"))
 	})
 }
 
@@ -237,12 +246,18 @@ func writeErr(w http.ResponseWriter, status int, err error) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
 }
 
+// storeErr maps a store error to a status: not found, a database failure
+// (the client did nothing wrong), or invalid input.
 func storeErr(w http.ResponseWriter, err error) {
-	if errors.Is(err, store.ErrNotFound) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, err)
-		return
+	case store.IsDBError(err):
+		slog.Error("admin: database error", "err", err)
+		writeErr(w, http.StatusInternalServerError, errors.New("database error; see the gateway log"))
+	default:
+		writeErr(w, http.StatusBadRequest, err)
 	}
-	writeErr(w, http.StatusBadRequest, err)
 }
 
 func pathID(r *http.Request) int64 {
@@ -555,7 +570,10 @@ func (a *Admin) resetBreaker(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Key string `json:"key"`
 	}
-	_ = decode(r, &req)
+	if err := decode(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
 	a.gw.Breaker.Reset(req.Key)
 	writeJSON(w, map[string]any{"ok": true})
 }
@@ -596,7 +614,8 @@ func (a *Admin) logs(w http.ResponseWriter, r *http.Request) {
 
 func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
 	var d, bucket time.Duration
-	switch r.URL.Query().Get("range") {
+	rng := r.URL.Query().Get("range")
+	switch rng {
 	case "1h":
 		d, bucket = time.Hour, 5*time.Minute
 	case "7d":
@@ -604,9 +623,9 @@ func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
 	case "30d":
 		d, bucket = 30*24*time.Hour, 24*time.Hour
 	default:
-		d, bucket = 24*time.Hour, time.Hour
+		rng, d, bucket = "24h", 24*time.Hour, time.Hour // cache by the effective range
 	}
-	st, err := a.cachedStats(r.URL.Query().Get("range"), time.Now().Add(-d).UnixMilli(), bucket.Milliseconds())
+	st, err := a.cachedStats(rng, time.Now().Add(-d).UnixMilli(), bucket.Milliseconds())
 	if err != nil {
 		writeErr(w, 500, err)
 		return
@@ -623,7 +642,7 @@ func (a *Admin) updateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.UpdateSettings(st); err != nil {
-		writeErr(w, 400, err)
+		storeErr(w, err)
 		return
 	}
 	a.gw.Limiter.Forget() // budgets are in the display currency
@@ -651,7 +670,7 @@ func (a *Admin) updateAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.UpdateAlerts(c); err != nil {
-		writeErr(w, 400, err)
+		storeErr(w, err)
 		return
 	}
 	writeJSON(w, a.store.GetAlerts())
@@ -690,7 +709,7 @@ func (a *Admin) importConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.Import(&e); err != nil {
-		writeErr(w, 400, err)
+		storeErr(w, err)
 		return
 	}
 	a.gw.Breaker.Reset("")
