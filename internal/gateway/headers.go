@@ -19,7 +19,7 @@ import (
 // in the request context so every upstream call of the request sees it.
 type requestMeta struct {
 	RequestID    string
-	Conversation string // ses_..., "" when the request has no user message
+	Conversation string // ses_...; random when the request has no user message
 	Key          *store.APIKey
 	Header       http.Header // the caller's headers
 }
@@ -42,13 +42,24 @@ func newRequestID() string {
 }
 
 // conversationID turns the routing affinity (API key + first user message)
-// into a session id that stays the same for the whole conversation.
+// into a session id that stays the same for the whole conversation. Without
+// one (no user message, health checks, admin tests) it is random: upstreams
+// such as OpenCode Go reject requests without a session header.
 func conversationID(affinity string) string {
 	if affinity == "" {
-		return ""
+		var b [12]byte
+		_, _ = rand.Read(b[:])
+		return "ses_" + hex.EncodeToString(b[:])
 	}
 	sum := sha256.Sum256([]byte(affinity))
 	return "ses_" + hex.EncodeToString(sum[:12])
+}
+
+// probeMeta is the template context for the gateway's own upstream calls
+// (health checks, model lists, admin tests): a fresh request and session id,
+// and the caller headers given (if any).
+func probeMeta(h http.Header) *requestMeta {
+	return &requestMeta{RequestID: newRequestID(), Conversation: conversationID(""), Header: h}
 }
 
 // dropHeaders are never copied from the caller: credentials for the gateway

@@ -125,7 +125,7 @@ func (h *HealthChecker) probe(ctx context.Context, p *store.Provider) string {
 	}
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("User-Agent", "ai-route-healthcheck")
-	applyProviderHeaders(req.Header, p, "", nil)
+	applyProviderHeaders(req.Header, p, "", probeMeta(nil))
 	resp, err := h.g.client.Do(req)
 	if err != nil {
 		return fmt.Sprintf("GET %s: %v", target, err)

@@ -1,7 +1,11 @@
 package gateway
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"ai-route/internal/store"
@@ -144,5 +148,50 @@ func TestPlatformUserAgent(t *testing.T) {
 	h.post("/v1/chat/completions", oaReq("coder", false)) // harness sends claude-cli/9.9
 	if got := h.mock.lastHdr["ok"].Get("User-Agent"); got != version.UserAgent() || !strings.HasPrefix(got, "ai-route/") {
 		t.Fatalf("UA %q", got)
+	}
+}
+
+// The gateway's own upstream calls (admin "test" buttons, health checks)
+// and requests without a user message still send a session header:
+// OpenCode Go rejects requests without one.
+func TestSessionHeaderOnGatewayOwnCalls(t *testing.T) {
+	h := newHarness(t)
+	var probeSession atomic.Value
+	hc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probeSession.Store(r.Header.Get("x-opencode-session"))
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	t.Cleanup(hc.Close)
+	h.setProvider("oa", func(p *store.Provider) {
+		p.Headers = map[string]string{"x-opencode-session": store.OpenCodeSessionHeader}
+		p.HealthCheckSeconds, p.HealthCheckURL = 10, hc.URL
+	})
+	h.model("coder", "oa/ok")
+	p := h.st.Snapshot().Providers["oa"]
+
+	// "test" on the provider page
+	res := h.gw.TestTarget(context.Background(), p, "ok", "", false)
+	s1 := h.mock.lastHdr["ok"].Get("x-opencode-session")
+	if !res.OK || !strings.HasPrefix(s1, "ses_") {
+		t.Fatalf("provider test: ok=%v session=%q", res.OK, s1)
+	}
+	// "test" on the model page
+	if res := h.gw.TestModel(context.Background(), "coder", "openai", false, ""); !res.OK || !strings.HasPrefix(h.mock.lastHdr["ok"].Get("x-opencode-session"), "ses_") {
+		t.Fatalf("model test: %+v", res)
+	}
+	// health check
+	h.gw.Health.CheckDue(context.Background())
+	if s, _ := probeSession.Load().(string); !strings.HasPrefix(s, "ses_") {
+		t.Fatalf("health check session: %q", s)
+	}
+	// a request with no user message gets a fresh id each time
+	req := oaReq("coder", false)
+	req["messages"] = []map[string]any{{"role": "system", "content": "only a system prompt"}}
+	h.post("/v1/chat/completions", req)
+	a := h.mock.lastHdr["ok"].Get("x-opencode-session")
+	h.post("/v1/chat/completions", req)
+	b := h.mock.lastHdr["ok"].Get("x-opencode-session")
+	if !strings.HasPrefix(a, "ses_") || !strings.HasPrefix(b, "ses_") || a == b {
+		t.Fatalf("no-user-message sessions: %q %q", a, b)
 	}
 }

@@ -26,7 +26,7 @@ import (
 
 // Vars lists the built-in variables and what they hold.
 var Vars = map[string]string{
-	"conversation": "stable per conversation: ses_ + hash of API key and first user message",
+	"conversation": "stable per conversation: ses_ + hash of API key and first user message (random when there is none)",
 	"uuid":         "new random UUID for every request",
 	"requestId":    "the gateway's request id (shown in the request log)",
 	"timestamp":    "unix seconds",

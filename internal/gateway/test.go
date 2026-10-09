@@ -103,16 +103,11 @@ func extractReply(proto string, stream bool, body string) string {
 	return sb.String()
 }
 
-// TestModel sends a tiny request through the normal routing path of a public
-// model (breakers and fallbacks included). The request is logged.
-func (g *Gateway) TestModel(ctx context.Context, model, proto string, stream bool, prompt string) TestResult {
-	if proto != convert.ProtoAnthropic {
-		proto = convert.ProtoOpenAI
-	}
-	body := testBody(model, stream, prompt)
+// testRequest is the caller side of an admin test: headers the providers
+// require from callers get a test value.
+func (g *Gateway) testRequest(ctx context.Context) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("")).WithContext(ctx)
 	r.Header.Set("User-Agent", "ai-route-admin-test")
-	// headers the providers require from callers get a test value
 	for _, p := range g.store.Snapshot().Providers {
 		for _, v := range p.Headers {
 			if t, err := hdrtpl.Parse(v); err == nil {
@@ -122,6 +117,17 @@ func (g *Gateway) TestModel(ctx context.Context, model, proto string, stream boo
 			}
 		}
 	}
+	return r
+}
+
+// TestModel sends a tiny request through the normal routing path of a public
+// model (breakers and fallbacks included). The request is logged.
+func (g *Gateway) TestModel(ctx context.Context, model, proto string, stream bool, prompt string) TestResult {
+	if proto != convert.ProtoAnthropic {
+		proto = convert.ProtoOpenAI
+	}
+	body := testBody(model, stream, prompt)
+	r := g.testRequest(ctx)
 	rec := httptest.NewRecorder()
 	start := time.Now()
 	key := &store.APIKey{Name: "(admin test)", Enabled: true}
@@ -146,8 +152,11 @@ func (g *Gateway) TestTarget(ctx context.Context, p *store.Provider, model, prot
 	}
 	c := candidate{target: p.Prefix + "/" + model, prefix: p.Prefix, model: model, provider: p, proto: proto}
 	body := testBody(model, stream, "")
-	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("")).WithContext(ctx)
-	r.Header.Set("User-Agent", "ai-route-admin-test")
+	r := g.testRequest(ctx)
+	// try() is called directly, without route(): give header templates
+	// their request and session ids
+	r = r.WithContext(withMeta(r.Context(), probeMeta(r.Header)))
+	ctx = r.Context()
 	rec := httptest.NewRecorder()
 	start := time.Now()
 	inbound := proto
@@ -211,7 +220,7 @@ func (g *Gateway) fetchModels(ctx context.Context, p *store.Provider, url string
 	req.Header.Set("x-api-key", p.APIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("User-Agent", upstreamUA(p, ""))
-	applyProviderHeaders(req.Header, p, "", nil)
+	applyProviderHeaders(req.Header, p, "", probeMeta(nil))
 	resp, err := g.client.Do(req)
 	if err != nil {
 		return nil, err
