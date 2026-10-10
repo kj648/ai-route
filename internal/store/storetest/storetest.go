@@ -52,11 +52,11 @@ func Loc(tb testing.TB) string {
 }
 
 // OpenAt opens the store at a Loc.
-func OpenAt(loc string) (*store.Store, error) {
+func OpenAt(loc string, opts ...store.Option) (*store.Store, error) {
 	if store.IsPostgresURL(loc) {
-		return store.OpenPostgres(loc)
+		return store.OpenPostgres(loc, opts...)
 	}
-	return store.Open(loc)
+	return store.Open(loc, opts...)
 }
 
 // Open opens a new, empty store.

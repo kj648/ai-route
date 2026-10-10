@@ -51,6 +51,12 @@ func setupLogging() {
 	slog.SetDefault(slog.New(h))
 }
 
+// secretOption passes SECRET_KEY / SECRET_KEY_PREVIOUS to the store: with
+// a key, upstream API keys and webhook secrets are encrypted at rest.
+func secretOption() store.Option {
+	return store.WithSecretKey(os.Getenv("SECRET_KEY"), os.Getenv("SECRET_KEY_PREVIOUS"))
+}
+
 // fatal logs the message and exits.
 func fatal(msg string, args ...any) {
 	slog.Error(msg, args...)
@@ -68,9 +74,12 @@ func main() {
 	dbURL := flag.String("db", os.Getenv("DATABASE_URL"), "PostgreSQL URL, e.g. postgres://user:pass@host:5432/airoute (env DATABASE_URL); empty = SQLite in the data directory")
 	flag.Parse()
 
-	st, err := store.OpenAuto(*dbURL, *dataDir)
+	st, err := store.OpenAuto(*dbURL, *dataDir, secretOption())
 	if err != nil {
 		fatal("open store failed", "err", err)
+	}
+	if !st.Encrypted() {
+		slog.Info("SECRET_KEY not set: upstream API keys are stored in plain text in the database")
 	}
 	if st.Backend() == "postgres" {
 		slog.Info("store opened", "backend", "postgres", "url", redactURL(*dbURL))
@@ -106,6 +115,7 @@ func main() {
 	gw.TrustProxies(proxies)
 	bg, stopBG := context.WithCancel(context.Background())
 	go gw.Health.Run(bg)
+	go gw.Quotas.Run(bg)
 	clusterDone := make(chan struct{})
 	if c := st.Cluster(); c != nil {
 		c.SetVersion(version.Version)
@@ -188,9 +198,9 @@ func migrate(args []string) {
 		var st *store.Store
 		var err error
 		if store.IsPostgresURL(loc) {
-			st, err = store.OpenPostgres(loc)
+			st, err = store.OpenPostgres(loc, secretOption())
 		} else {
-			st, err = store.Open(loc)
+			st, err = store.Open(loc, secretOption())
 		}
 		if err != nil {
 			fatal("open failed", "location", redactURL(loc), "err", err)

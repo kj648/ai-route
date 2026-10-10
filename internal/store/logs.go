@@ -17,6 +17,9 @@ type Attempt struct {
 	LatencyMs  int64  `json:"latency_ms"`
 	Error      string `json:"error,omitempty"`
 	Cooling    bool   `json:"cooling,omitempty"` // tried as last resort while cooling down
+	// OverQuota: the provider had used up one of its plan quotas, so the
+	// target was tried after the others
+	OverQuota bool `json:"over_quota,omitempty"`
 	// Headers are the resolved values of dynamic provider headers.
 	Headers map[string]string `json:"headers,omitempty"`
 }
@@ -138,6 +141,7 @@ func (s *Store) FlushLogs() {
 // backlog of deletes or a vacuum must not stall the log writer.
 func (s *Store) cleanupLoop() {
 	defer close(s.cleanupDone)
+	s.cleanupCaptures()
 	s.cleanupLogs()
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
@@ -146,6 +150,7 @@ func (s *Store) cleanupLoop() {
 		case <-s.cleanupStop:
 			return
 		case <-t.C:
+			s.cleanupCaptures()
 			s.cleanupLogs()
 		}
 	}

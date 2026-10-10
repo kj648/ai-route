@@ -76,11 +76,13 @@ type Provider struct {
 	DropClientHeaders bool `json:"drop_client_headers"`
 	// ResponsesAPI: the OpenAI base URL also serves /responses, so Responses
 	// API clients are passed through instead of converted to chat.
-	ResponsesAPI bool   `json:"responses_api"`
-	Enabled      bool   `json:"enabled"`
-	Remark       string `json:"remark"`
-	CreatedAt    int64  `json:"created_at"`
-	UpdatedAt    int64  `json:"updated_at"`
+	ResponsesAPI bool `json:"responses_api"`
+	// Quotas are the plan's own allowances (see Quota).
+	Quotas    []Quota `json:"quotas"`
+	Enabled   bool    `json:"enabled"`
+	Remark    string  `json:"remark"`
+	CreatedAt int64   `json:"created_at"`
+	UpdatedAt int64   `json:"updated_at"`
 }
 
 // BodyRule merges Set into the request body sent upstream (after protocol
@@ -216,6 +218,8 @@ type Snapshot struct {
 	Keys        map[string]*APIKey // by key string
 	Settings    Settings
 	Alerts      AlertConfig
+	// Captures are the capture rules with requests left (see capture.go).
+	Captures []*CaptureRule
 }
 
 // ResolveModel finds a public model by exact name, exact alias, then glob alias.
@@ -275,6 +279,7 @@ type Store struct {
 	cleanupDone chan struct{}
 
 	cluster *Cluster // nil with SQLite
+	sec     *sealer  // secrets at rest (see secret.go)
 }
 
 // IsDBError reports whether err came from the database itself (driver,
@@ -305,18 +310,18 @@ func IsPostgresURL(u string) bool {
 
 // OpenAuto opens PostgreSQL when databaseURL is set, otherwise SQLite in
 // dataDir.
-func OpenAuto(databaseURL, dataDir string) (*Store, error) {
+func OpenAuto(databaseURL, dataDir string, opts ...Option) (*Store, error) {
 	if databaseURL == "" {
-		return Open(dataDir)
+		return Open(dataDir, opts...)
 	}
 	if !IsPostgresURL(databaseURL) {
 		return nil, errors.New("DATABASE_URL must start with postgres:// or postgresql://")
 	}
-	return OpenPostgres(databaseURL)
+	return OpenPostgres(databaseURL, opts...)
 }
 
 // Open opens (or creates) the SQLite database in dataDir.
-func Open(dataDir string) (*Store, error) {
+func Open(dataDir string, opts ...Option) (*Store, error) {
 	// the database holds upstream keys: keep it private to this user
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
@@ -331,7 +336,7 @@ func Open(dataDir string) (*Store, error) {
 	}
 	// readers (console, stats) must not starve the log writer
 	db.SetMaxOpenConns(16)
-	s, err := open(&dbx{DB: db})
+	s, err := open(&dbx{DB: db}, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +348,7 @@ func Open(dataDir string) (*Store, error) {
 
 // OpenPostgres connects to PostgreSQL, e.g.
 // postgres://user:password@host:5432/airoute?sslmode=disable
-func OpenPostgres(databaseURL string) (*Store, error) {
+func OpenPostgres(databaseURL string, opts ...Option) (*Store, error) {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, err
@@ -370,11 +375,20 @@ func OpenPostgres(databaseURL string) (*Store, error) {
 		return nil, fmt.Errorf("lock for migration: %w", err)
 	}
 	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(7270001)`)
-	return open(&dbx{DB: db, pg: true})
+	return open(&dbx{DB: db, pg: true}, opts)
 }
 
-func open(db *dbx) (*Store, error) {
-	s := &Store{db: db, logCh: make(chan *RequestLog, 4096), logDone: make(chan struct{}),
+func open(db *dbx, opts []Option) (*Store, error) {
+	var o options
+	for _, f := range opts {
+		f(&o)
+	}
+	sec, err := newSealer(o)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	s := &Store{db: db, sec: sec, logCh: make(chan *RequestLog, 4096), logDone: make(chan struct{}),
 		cleanupStop: make(chan struct{}), cleanupDone: make(chan struct{})}
 	if db.pg {
 		s.cluster = newCluster(s)
@@ -466,6 +480,7 @@ CREATE TABLE IF NOT EXISTS providers (
 	health_check_url TEXT NOT NULL DEFAULT '',
 	drop_client_headers INTEGER NOT NULL DEFAULT 0,
 	responses_api INTEGER NOT NULL DEFAULT 0,
+	quotas TEXT NOT NULL DEFAULT '[]',
 	currency TEXT NOT NULL DEFAULT 'CNY',
 	enabled INTEGER NOT NULL DEFAULT 1,
 	remark TEXT NOT NULL DEFAULT '',
@@ -532,7 +547,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_model ON request_logs(public_model, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_key ON request_logs(key_id, created_at);
-` + statsSchema))
+` + statsSchema + captureSchema))
 	if err != nil {
 		return err
 	}
@@ -551,6 +566,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_key ON request_logs(key_id, created_at);
 		{"health_check_url", `TEXT NOT NULL DEFAULT ''`},
 		{"drop_client_headers", `INTEGER NOT NULL DEFAULT 0`},
 		{"responses_api", `INTEGER NOT NULL DEFAULT 0`},
+		{"quotas", `TEXT NOT NULL DEFAULT '[]'`},
 	} {
 		if err := s.ensureColumn("providers", c[0], c[1]); err != nil {
 			return err
@@ -589,7 +605,10 @@ CREATE INDEX IF NOT EXISTS idx_logs_key ON request_logs(key_id, created_at);
 	if err := s.ensureColumn("models", "tags", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
 		return err
 	}
-	return s.ensureStatsBackfilled()
+	if err := s.ensureStatsBackfilled(); err != nil {
+		return err
+	}
+	return s.resealSecrets()
 }
 
 // OpenCodeSessionHeader is the OpenCode Go preset's session header value:
@@ -723,7 +742,18 @@ func (s *Store) buildSnapshotLocked() error {
 	if err != nil {
 		return err
 	}
+	rules, err := s.listCaptureRules()
+	if err != nil {
+		return err
+	}
+	var captures []*CaptureRule
+	for _, r := range rules {
+		if r.Active(now()) {
+			captures = append(captures, r)
+		}
+	}
 	snap := &Snapshot{
+		Captures:    captures,
 		Alerts:      alerts,
 		Providers:   map[string]*Provider{},
 		Models:      models,
@@ -763,16 +793,20 @@ func (s *Store) buildSnapshotLocked() error {
 
 // ---------- providers ----------
 
-const providerCols = `id, prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, drop_client_headers, responses_api, enabled, remark, created_at, updated_at`
+const providerCols = `id, prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, drop_client_headers, responses_api, quotas, enabled, remark, created_at, updated_at`
 
-func scanProvider(sc interface{ Scan(...any) error }) (*Provider, error) {
+func (s *Store) scanProvider(sc interface{ Scan(...any) error }) (*Provider, error) {
 	p := &Provider{}
-	var headers, protos, models, prices, rules string
+	var headers, protos, models, prices, rules, quotas string
 	var enabled, dropHeaders, responsesAPI int
-	if err := sc.Scan(&p.ID, &p.Prefix, &p.Name, &p.OpenAIBaseURL, &p.AnthropicBaseURL, &p.APIKey, &headers, &protos, &models, &p.Vendor, &p.UAMode, &p.UserAgent, &p.TimeoutSeconds, &prices, &p.Currency, &rules, &p.MaxConcurrency, &p.FirstTokenTimeoutSeconds, &p.HealthCheckSeconds, &p.HealthCheckURL, &dropHeaders, &responsesAPI, &enabled, &p.Remark, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.Prefix, &p.Name, &p.OpenAIBaseURL, &p.AnthropicBaseURL, &p.APIKey, &headers, &protos, &models, &p.Vendor, &p.UAMode, &p.UserAgent, &p.TimeoutSeconds, &prices, &p.Currency, &rules, &p.MaxConcurrency, &p.FirstTokenTimeoutSeconds, &p.HealthCheckSeconds, &p.HealthCheckURL, &dropHeaders, &responsesAPI, &quotas, &enabled, &p.Remark, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	p.Enabled, p.DropClientHeaders, p.ResponsesAPI = enabled == 1, dropHeaders == 1, responsesAPI == 1
+	var err error
+	if p.APIKey, err = s.sec.open(p.APIKey); err != nil {
+		return nil, fmt.Errorf("provider %s: %w", p.Prefix, err)
+	}
 	_ = json.Unmarshal([]byte(headers), &p.Headers)
 	_ = json.Unmarshal([]byte(protos), &p.ModelProtocols)
 	_ = json.Unmarshal([]byte(models), &p.Models)
@@ -781,6 +815,10 @@ func scanProvider(sc interface{ Scan(...any) error }) (*Provider, error) {
 		p.Prices = map[string]Price{}
 	}
 	_ = json.Unmarshal([]byte(rules), &p.BodyRules)
+	_ = json.Unmarshal([]byte(quotas), &p.Quotas)
+	if p.Quotas == nil {
+		p.Quotas = []Quota{}
+	}
 	if p.BodyRules == nil {
 		p.BodyRules = []BodyRule{}
 	}
@@ -804,7 +842,7 @@ func (s *Store) listProviders() ([]*Provider, error) {
 	defer rows.Close()
 	var out []*Provider
 	for rows.Next() {
-		p, err := scanProvider(rows)
+		p, err := s.scanProvider(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -816,7 +854,7 @@ func (s *Store) listProviders() ([]*Provider, error) {
 func (s *Store) ListProviders() ([]*Provider, error) { return s.listProviders() }
 
 func (s *Store) GetProvider(id int64) (*Provider, error) {
-	p, err := scanProvider(s.db.QueryRow(`SELECT `+providerCols+` FROM providers WHERE id=?`, id))
+	p, err := s.scanProvider(s.db.QueryRow(`SELECT `+providerCols+` FROM providers WHERE id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -933,6 +971,11 @@ func normalizeProvider(p *Provider) error {
 	if p.ResponsesAPI && p.OpenAIBaseURL == "" {
 		return errors.New("responses_api needs openai_base_url")
 	}
+	quotas, err := normalizeQuotas(p.Quotas)
+	if err != nil {
+		return err
+	}
+	p.Quotas = quotas
 	return nil
 }
 
@@ -1043,8 +1086,8 @@ func (s *Store) CreateProvider(p *Provider) error {
 	}
 	p.Prefix = uniquePrefix(p.Prefix, taken)
 	t := now()
-	err := s.db.QueryRow(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, drop_client_headers, responses_api, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
-		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.DropClientHeaders), b2i(p.ResponsesAPI), b2i(p.Enabled), p.Remark, t, t).Scan(&p.ID)
+	err := s.db.QueryRow(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, drop_client_headers, responses_api, quotas, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
+		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, s.sec.seal(p.APIKey), mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.DropClientHeaders), b2i(p.ResponsesAPI), mustJSON(p.Quotas), b2i(p.Enabled), p.Remark, t, t).Scan(&p.ID)
 	if err != nil {
 		return friendlyErr(err)
 	}
@@ -1060,7 +1103,7 @@ func (s *Store) UpdateProvider(p *Provider) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	old, err := scanProvider(s.db.QueryRow(`SELECT `+providerCols+` FROM providers WHERE id=?`, p.ID))
+	old, err := s.scanProvider(s.db.QueryRow(`SELECT `+providerCols+` FROM providers WHERE id=?`, p.ID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
@@ -1078,8 +1121,8 @@ func (s *Store) UpdateProvider(p *Provider) error {
 	}
 	defer tx.Rollback()
 	t := now()
-	if _, err := tx.Exec(`UPDATE providers SET prefix=?, name=?, openai_base_url=?, anthropic_base_url=?, api_key=?, headers=?, model_protocols=?, models=?, vendor=?, ua_mode=?, user_agent=?, timeout_seconds=?, prices=?, currency=?, body_rules=?, max_concurrency=?, first_token_timeout_seconds=?, health_check_seconds=?, health_check_url=?, drop_client_headers=?, responses_api=?, enabled=?, remark=?, updated_at=? WHERE id=?`,
-		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.DropClientHeaders), b2i(p.ResponsesAPI), b2i(p.Enabled), p.Remark, t, p.ID); err != nil {
+	if _, err := tx.Exec(`UPDATE providers SET prefix=?, name=?, openai_base_url=?, anthropic_base_url=?, api_key=?, headers=?, model_protocols=?, models=?, vendor=?, ua_mode=?, user_agent=?, timeout_seconds=?, prices=?, currency=?, body_rules=?, max_concurrency=?, first_token_timeout_seconds=?, health_check_seconds=?, health_check_url=?, drop_client_headers=?, responses_api=?, quotas=?, enabled=?, remark=?, updated_at=? WHERE id=?`,
+		p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, s.sec.seal(p.APIKey), mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.DropClientHeaders), b2i(p.ResponsesAPI), mustJSON(p.Quotas), b2i(p.Enabled), p.Remark, t, p.ID); err != nil {
 		return friendlyErr(err)
 	}
 	if old.Prefix != p.Prefix {
@@ -1512,13 +1555,22 @@ func (s *Store) Export() (*Export, error) {
 	if err != nil {
 		return nil, err
 	}
-	alerts := s.GetAlerts()
+	// with SECRET_KEY the file carries the secrets sealed, like the
+	// database: it can be imported where the same key is set
+	for _, x := range p {
+		x.APIKey = s.sec.seal(x.APIKey)
+	}
+	alerts := s.sec.sealAlerts(s.GetAlerts())
 	return &Export{Version: 1, Providers: p, Models: m, Keys: k, Settings: s.GetSettings(), Alerts: &alerts}, nil
 }
 
 // Import replaces the whole configuration (providers, models, keys, settings).
 func (s *Store) Import(e *Export) error {
 	for _, p := range e.Providers {
+		var err error
+		if p.APIKey, err = s.sec.open(p.APIKey); err != nil {
+			return fmt.Errorf("provider %q: %w", p.Prefix, err)
+		}
 		if err := normalizeProvider(p); err != nil {
 			return fmt.Errorf("provider %q: %w", p.Prefix, err)
 		}
@@ -1529,6 +1581,9 @@ func (s *Store) Import(e *Export) error {
 		}
 	}
 	if e.Alerts != nil {
+		if err := s.sec.openAlerts(e.Alerts); err != nil {
+			return fmt.Errorf("alerts: %w", err)
+		}
 		if err := normalizeAlerts(e.Alerts); err != nil {
 			return fmt.Errorf("alerts: %w", err)
 		}
@@ -1547,8 +1602,8 @@ func (s *Store) Import(e *Export) error {
 	}
 	t := now()
 	for _, p := range e.Providers {
-		if _, err := tx.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, drop_client_headers, responses_api, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, p.APIKey, mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.DropClientHeaders), b2i(p.ResponsesAPI), b2i(p.Enabled), p.Remark, t, t); err != nil {
+		if _, err := tx.Exec(`INSERT INTO providers (prefix, name, openai_base_url, anthropic_base_url, api_key, headers, model_protocols, models, vendor, ua_mode, user_agent, timeout_seconds, prices, currency, body_rules, max_concurrency, first_token_timeout_seconds, health_check_seconds, health_check_url, drop_client_headers, responses_api, quotas, enabled, remark, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			p.Prefix, p.Name, p.OpenAIBaseURL, p.AnthropicBaseURL, s.sec.seal(p.APIKey), mustJSON(p.Headers), mustJSON(p.ModelProtocols), mustJSON(p.Models), p.Vendor, p.UAMode, p.UserAgent, p.TimeoutSeconds, mustJSON(p.Prices), p.Currency, mustJSON(p.BodyRules), p.MaxConcurrency, p.FirstTokenTimeoutSeconds, p.HealthCheckSeconds, p.HealthCheckURL, b2i(p.DropClientHeaders), b2i(p.ResponsesAPI), mustJSON(p.Quotas), b2i(p.Enabled), p.Remark, t, t); err != nil {
 			return friendlyErr(err)
 		}
 	}
@@ -1584,7 +1639,7 @@ func (s *Store) Import(e *Export) error {
 		}
 	}
 	if e.Alerts != nil {
-		if _, err := tx.Exec(`INSERT INTO settings (k, v) VALUES ('alerts', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, mustJSON(e.Alerts)); err != nil {
+		if _, err := tx.Exec(`INSERT INTO settings (k, v) VALUES ('alerts', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, mustJSON(s.sec.sealAlerts(*e.Alerts))); err != nil {
 			return err
 		}
 	}

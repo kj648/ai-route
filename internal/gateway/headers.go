@@ -22,6 +22,7 @@ type requestMeta struct {
 	Conversation string // ses_...; random when the request has no user message
 	Key          *store.APIKey
 	Header       http.Header // the caller's headers
+	capture      *capture    // non-nil while the request is being captured
 }
 
 type metaKey struct{}

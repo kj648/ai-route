@@ -116,6 +116,9 @@ func (s *Store) getAlerts() (AlertConfig, error) {
 	if a.Webhooks == nil {
 		a.Webhooks = []Webhook{}
 	}
+	if err := s.sec.openAlerts(&a); err != nil {
+		return a, fmt.Errorf("alerts: %w", err)
+	}
 	return a, nil
 }
 
@@ -127,7 +130,7 @@ func (s *Store) UpdateAlerts(a AlertConfig) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.SetKV("alerts", mustJSON(a)); err != nil {
+	if err := s.SetKV("alerts", mustJSON(s.sec.sealAlerts(a))); err != nil {
 		return err
 	}
 	return s.reloadLocked()

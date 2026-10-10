@@ -378,6 +378,34 @@ function parsePrices(text) {
 const toPriceLines = (prices) => Object.entries(prices || {})
   .map(([k, v]) => `${k} = ${v.input} / ${v.cache != null ? v.cache + ' / ' : ''}${v.output}`).join('\n');
 // request body rules: "model(*) [stream|nonstream, openai|anthropic|embeddings] = {json}"
+// quotas: one line per period, "5h = 600" (requests) or "week = 0 / 50000000" (requests / tokens)
+const QUOTA_PERIODS = ['5h', 'day', 'week', 'month'];
+const QUOTA_LABEL = { '5h': t('最近 5 小时'), day: t('今天'), week: t('本周'), month: t('本月') };
+function parseQuotas(text) {
+  const out = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const [k, v] = line.split('=').map((x) => (x || '').trim());
+    const [req, tok] = (v || '').split('/').map((x) => (x || '').trim().replace(/[_,]/g, ''));
+    const period = (k || '').toLowerCase();
+    if (!QUOTA_PERIODS.includes(period) || !/^\d+$/.test(req || '') || (tok && !/^\d+$/.test(tok))) {
+      throw new Error(t('配额格式不对：{line}（应为 周期 = 请求数 / tokens，周期是 5h、day、week、month）', { line }));
+    }
+    out.push({ period, requests: Number(req), tokens: Number(tok || 0) });
+  }
+  return out;
+}
+const toQuotaLines = (qs) => (qs || []).map((q) => `${q.period} = ${q.requests || 0}${q.tokens ? ' / ' + q.tokens : ''}`).join('\n');
+function quotaUsageHTML(us) {
+  return us.map((u) => {
+    const parts = [];
+    if (u.requests) parts.push(t('{used} / {max} 次', { used: fmtNum(u.used_requests), max: fmtNum(u.requests) }));
+    if (u.tokens) parts.push(t('{used} / {max} tokens', { used: fmtNum(u.used_tokens), max: fmtNum(u.tokens) }));
+    return `<div>${t('{period}：{usage}', { period: esc(QUOTA_LABEL[u.period] || u.period), usage: parts.join(t('，')) })}${u.over ? ` <span class="badge warn">${t('已用完，排到其他候补后面')}</span>` : ''}</div>`;
+  }).join('');
+}
+
 const RULE_TAGS = { stream: 'when', nonstream: 'when', openai: 'protocol', anthropic: 'protocol', responses: 'protocol', embeddings: 'protocol', rerank: 'protocol' };
 function parseRules(text) {
   const rules = [];
@@ -437,6 +465,7 @@ async function pageProviders() {
       const ps = idx.provider[p.prefix];
       const used = models.filter((m) => usesProvider(m, p.prefix)).map((m) => m.name);
       let st = p.enabled ? `<span class="badge ok">${t('启用')}</span>` : `<span class="badge">${t('停用')}</span>`;
+      if (p.enabled && (p.quota_usage || []).some((u) => u.over)) st = `<span class="badge warn">${t('配额用完')}</span>`;
       if (p.enabled && ps && ps.open) st = ps.down
         ? `<span class="badge err" title="${esc(ps.last_error)}">${t('健康检查失败')}</span>`
         : `<span class="badge warn" title="${esc(ps.last_error)}">${t('冷却中 {left}', { left: fmtSecs(ps.remaining_seconds) })}</span>`;
@@ -462,6 +491,7 @@ async function pageProviders() {
             <div class="k">${t('被映射引用')}</div><div class="small">${used.length ? used.map(esc).join(t('，')) : `<span class="muted">${t('无')}</span>`}</div>
             ${p.max_concurrency ? `<div class="k">${t('并发')}</div><div class="small">${t('{n} / {max}（满了会溢出到下一个候补）', { n: rt.in_flight[p.prefix] || 0, max: p.max_concurrency })}</div>` : ''}
             ${p.health_check_seconds ? `<div class="k">${t('健康检查')}</div><div class="small">${t('每 {n} 秒', { n: p.health_check_seconds })}${hc && hc.last_check > 0 ? `${t('，最近 {ago}', { ago: fmtAgo(hc.last_check) })}${hc.failures ? `${t('，')}<span class="err-text">${t('连续失败 {n} 次', { n: hc.failures })}</span>` : `${t('，')}<span class="ok-text">${t('正常')}</span>`}` : ''}</div>` : ''}
+            ${(p.quota_usage || []).length ? `<div class="k">${t('套餐配额')}</div><div class="small">${quotaUsageHTML(p.quota_usage)}</div>` : ''}
             ${p.first_token_timeout_seconds ? `<div class="k">${t('首包超时')}</div><div class="small">${t('{n} 秒', { n: p.first_token_timeout_seconds })}</div>` : ''}
             ${p.remark ? `<div class="k">${t('备注')}</div><div class="small">${esc(p.remark)}</div>` : ''}
           </div>
@@ -587,7 +617,7 @@ function presetInfoHTML(ps) {
 
 function providerForm(p, models, providers) {
   const isNew = !p;
-  p = p || { prefix: '', name: '', vendor: '', openai_base_url: '', anthropic_base_url: '', api_key: '', headers: {}, model_protocols: {}, models: [], ua_mode: 'passthrough', user_agent: '', timeout_seconds: 300, prices: {}, currency: 'CNY', body_rules: [], max_concurrency: 0, first_token_timeout_seconds: 0, health_check_seconds: 0, health_check_url: '', enabled: true, remark: '' };
+  p = p || { prefix: '', name: '', vendor: '', openai_base_url: '', anthropic_base_url: '', api_key: '', headers: {}, model_protocols: {}, models: [], ua_mode: 'passthrough', user_agent: '', timeout_seconds: 300, prices: {}, currency: 'CNY', body_rules: [], max_concurrency: 0, first_token_timeout_seconds: 0, health_check_seconds: 0, health_check_url: '', quotas: [], enabled: true, remark: '' };
   const state = {
     vendor: guessVendor(p),
     models: [...(p.models || [])],
@@ -661,6 +691,9 @@ function providerForm(p, models, providers) {
             <input type="text" id="pf-hc-url" value="${esc(p.health_check_url || '')}" placeholder="${esc(t('健康检查地址（可选，默认 GET 模型列表接口，如 http://gpu-1:8000/v1/models）'))}" style="margin-top:8px">
             <div class="help">${t('检查请求会带上这个供应商的 Key 和自定义请求头，地址请填它自己的服务')}</div>
           </div>
+          <div class="field"><label>${t('套餐配额')}</label>
+            <textarea id="pf-quotas" placeholder="5h = 600&#10;week = 0 / 50000000">${esc(toQuotaLines(p.quotas))}</textarea>
+            <div class="help">${t('每行 <code>周期 = 请求数 / tokens</code>，0 或省略表示不限。周期：<code>5h</code>（最近 5 小时，滚动）、<code>day</code>（今天）、<code>week</code>（本周，从周一算）、<code>month</code>（本月）。达到上限后，这个供应商在所有模型的调度顺序里排到其他候补后面，窗口有余量后自动回到原位；它不会被禁用，其他候补都失败时仍会兜底。计数来自请求日志，可能比上游自己的统计略有出入。')}</div></div>
           <div class="field"><label>${t('请求参数规则')}</label>
             <textarea id="pf-rules" placeholder='qwen3-* [nonstream] = {"enable_thinking": false}'>${esc(toRuleLines(p.body_rules))}</textarea>
             <div class="help">${t('每行 <code>模型(可用*) [条件] = JSON</code>，把 JSON 合并进发给上游的请求体（协议转换之后），值为 <code>null</code> 表示删除该字段。条件可选：<code>stream</code> / <code>nonstream</code>，<code>openai</code> / <code>anthropic</code> / <code>responses</code> / <code>embeddings</code> / <code>rerank</code>，多个用逗号分隔')}</div></div>
@@ -815,10 +848,11 @@ function providerForm(p, models, providers) {
 
       $('#pf-save', m).onclick = async () => {
         addFromInput();
-        let prices, bodyRules;
+        let prices, bodyRules, quotas;
         try {
           prices = parsePrices($('#pf-prices', m).value);
           bodyRules = parseRules($('#pf-rules', m).value);
+          quotas = parseQuotas($('#pf-quotas', m).value);
         } catch (e) { return toast(e.message, 'err'); }
         const body = {
           ...formBody(),
@@ -831,6 +865,7 @@ function providerForm(p, models, providers) {
           models: state.models,
           prices,
           body_rules: bodyRules,
+          quotas,
           max_concurrency: Math.floor(Number($('#pf-maxc', m).value) || 0),
           first_token_timeout_seconds: Math.floor(Number($('#pf-ftt', m).value) || 0),
           health_check_seconds: Math.floor(Number($('#pf-hc', m).value) || 0),
@@ -862,7 +897,7 @@ function providerForm(p, models, providers) {
 }
 
 function attemptResultHTML(a) {
-  return `<td class="small ${a.error ? 'err-text' : 'ok-text'}">${a.error ? esc(a.error) : t('成功')}${a.cooling ? ` <span class="badge warn">${t('冷却中兜底')}</span>` : ''}${a.headers ? `<div class="muted mono">${Object.entries(a.headers).map(([k, v]) => `${esc(k)}: ${esc(v)}`).join('<br>')}</div>` : ''}</td>`;
+  return `<td class="small ${a.error ? 'err-text' : 'ok-text'}">${a.error ? esc(a.error) : t('成功')}${a.cooling ? ` <span class="badge warn">${t('冷却中兜底')}</span>` : ''}${a.over_quota ? ` <span class="badge warn">${t('配额用完兜底')}</span>` : ''}${a.headers ? `<div class="muted mono">${Object.entries(a.headers).map(([k, v]) => `${esc(k)}: ${esc(v)}`).join('<br>')}</div>` : ''}</td>`;
 }
 const retryBadge = (a) => (a.retry ? ` <span class="badge">${t('重试 {n}', { n: a.retry })}</span>` : '');
 
@@ -1351,10 +1386,16 @@ function keyForm(k, models, st) {
 const logFilter = { model: '', provider: '', status: '', fallback: false, offset: 0, limit: 50 };
 async function pageLogs() {
   const qs = new URLSearchParams({ model: logFilter.model, provider: logFilter.provider, status: logFilter.status, fallback: logFilter.fallback ? '1' : '', offset: logFilter.offset, limit: logFilter.limit });
-  const [data, models, providers] = await Promise.all([api('GET', '/logs?' + qs), api('GET', '/models'), api('GET', '/providers')]);
+  const [data, models, providers, caps] = await Promise.all([api('GET', '/logs?' + qs), api('GET', '/models'), api('GET', '/providers'), api('GET', '/captures')]);
   const items = data.items;
+  const capByReq = {};
+  for (const c of caps.items) capByReq[c.request_id] = c.id;
+  const activeRules = caps.rules.filter((r) => r.remaining > 0 && r.expires_at > Date.now());
   $('#page').innerHTML = `
-    ${head(t('请求日志'), t('共 {n} 条 · 点击行查看每次尝试的详情', { n: data.total }), `<button class="btn" id="log-refresh">${t('刷新')}</button>`)}
+    ${head(t('请求日志'), t('共 {n} 条 · 点击行查看每次尝试的详情', { n: data.total }), `<button class="btn" id="log-capture">${t('抓取报文')}</button><button class="btn" id="log-refresh">${t('刷新')}</button>`)}
+    ${activeRules.length ? `<div class="card"><div class="card-body form">${activeRules.map((r) => `<div class="toolbar small"><span class="badge warn">${t('抓取中')}</span>
+      ${esc(captureScope(r))} · ${t('已抓 {done} / {total} 条，{left} 后结束', { done: r.total - r.remaining, total: r.total, left: fmtSecs(Math.round((r.expires_at - Date.now()) / 1000)) })}
+      <button class="btn sm" data-stop-rule="${r.id}">${t('停止')}</button></div>`).join('')}</div></div>` : ''}
     <div class="card">
       <div class="card-head" style="font-weight:400">
         <div class="toolbar">
@@ -1372,7 +1413,7 @@ async function pageLogs() {
           <td class="small">${esc(l.public_model || l.requested_model)}${l.public_model && l.requested_model !== l.public_model ? `<div class="muted">${esc(l.requested_model)}</div>` : ''}</td>
           <td class="small mono">${l.provider ? esc(l.provider + '/' + l.upstream_model) : '-'}${l.fallback ? ` <span class="badge warn">${t('切换')}</span>` : ''}</td>
           <td class="small">${esc(l.inbound)}${l.upstream_protocol && l.upstream_protocol !== l.inbound ? ' → ' + esc(l.upstream_protocol) : ''}${l.stream ? ` <span class="badge">${t('流')}</span>` : ''}</td>
-          <td>${l.success ? `<span class="badge ok">${t('成功')}</span>` : `<span class="badge err" title="${esc(l.error)}">${l.http_status && l.http_status !== 200 ? l.http_status : t('失败')}</span>`}</td>
+          <td>${l.success ? `<span class="badge ok">${t('成功')}</span>` : `<span class="badge err" title="${esc(l.error)}">${l.http_status && l.http_status !== 200 ? l.http_status : t('失败')}</span>`}${capByReq[l.request_id] ? ` <span class="badge blue">${t('报文')}</span>` : ''}</td>
           <td class="num small">${fmtMs(l.latency_ms)}</td>
           <td class="num small">${l.ttfb_ms ? fmtMs(l.ttfb_ms) : '-'}</td>
           <td class="num small">${fmtNum(l.input_tokens)} / ${fmtNum(l.output_tokens)}</td>
@@ -1388,14 +1429,20 @@ async function pageLogs() {
   $('#lf-status').onchange = (e) => { logFilter.status = e.target.value; upd(); };
   $('#lf-fallback').onchange = (e) => { logFilter.fallback = e.target.checked; upd(); };
   $('#log-refresh').onclick = route;
+  $('#log-capture').onclick = () => captureForm(models, caps);
+  $$('[data-stop-rule]').forEach((b) => b.onclick = async () => {
+    await api('DELETE', '/captures/rules/' + b.dataset.stopRule);
+    toast(t('已停止抓取'), 'ok');
+    route();
+  });
   if ($('#lp-prev')) {
     $('#lp-prev').onclick = () => { logFilter.offset = Math.max(0, logFilter.offset - logFilter.limit); route(); };
     $('#lp-next').onclick = () => { logFilter.offset += logFilter.limit; route(); };
   }
-  $$('tr.clickable').forEach((tr) => tr.onclick = () => logDetail(items[Number(tr.dataset.i)]));
+  $$('tr.clickable').forEach((tr) => tr.onclick = () => { const l = items[Number(tr.dataset.i)]; logDetail(l, capByReq[l.request_id]); });
 }
 
-function logDetail(l) {
+function logDetail(l, captureId) {
   const atts = (l.attempts || []).map((a, i) => `<tr><td>${i + 1}</td><td class="mono small">${esc(a.target)}${retryBadge(a)}</td><td>${esc(a.protocol)}</td><td>${a.http_status || '-'}</td><td>${fmtMs(a.latency_ms)}</td>${attemptResultHTML(a)}</tr>`).join('');
   openModal({
     title: t('请求详情 #{id}', { id: l.id }),
@@ -1417,6 +1464,97 @@ function logDetail(l) {
       </div>
       ${atts ? `<div class="table-wrap"><table><tr><th>#</th><th>${t('上游')}</th><th>${t('协议')}</th><th>${t('状态')}</th><th>${t('耗时')}</th><th>${t('结果')}</th></tr>${atts}</table></div>` : ''}
     </div>`,
+    foot: captureId ? `<button class="btn" id="ld-capture">${t('查看报文')}</button>` : '',
+    onMount: (m) => { if (captureId) $('#ld-capture', m).onclick = () => captureView(captureId); },
+  });
+}
+
+// ---------------------------------------------------------------- request capture
+function captureScope(r) {
+  const key = r.key_id ? r.key_name || `#${r.key_id}` : t('全部 Key');
+  return `${key} · ${r.model || t('全部模型')}`;
+}
+
+async function captureForm(models, caps) {
+  const keys = await api('GET', '/keys');
+  openModal({
+    title: t('抓取报文'),
+    body: `<div class="form">
+      <div class="hint-box small">${t('接下来匹配的请求会完整保存：客户端发来的请求、每次发给上游的请求和上游的响应、最后返回给客户端的内容。用来排查客户端兼容和协议转换问题。报文含完整的提示词，只有管理员能看，{h} 小时后自动删除{enc}。', { h: caps.retention_hours, enc: caps.encrypted ? t('，落库时用 SECRET_KEY 加密') : '' })}</div>
+      <div class="row2">
+        <div class="field"><label>API Key</label><select id="cp-key"><option value="0">${t('全部 Key')}</option>${keys.map((k) => `<option value="${k.id}">${esc(k.name || maskApiKey(k.key))}</option>`).join('')}</select></div>
+        <div class="field"><label>${t('模型')}</label><select id="cp-model"><option value="">${t('全部模型')}</option>${models.map((m) => `<option>${esc(m.name)}</option>`).join('')}</select></div>
+      </div>
+      <div class="row2">
+        <div class="field"><label>${t('抓取条数')}</label><input type="number" id="cp-count" min="1" max="50" value="5"><div class="help">${t('最多 50 条，抓满自动停止')}</div></div>
+        <div class="field"><label>${t('最长等待（分钟）')}</label><input type="number" id="cp-ttl" min="1" max="1440" value="60"><div class="help">${t('到时间没抓满也停止')}</div></div>
+      </div>
+      ${caps.items.length ? `<div class="toolbar small muted">${t('已保存 {n} 条报文', { n: caps.items.length })} <button type="button" class="btn sm danger" id="cp-clear">${t('全部删除')}</button></div>` : ''}
+    </div>`,
+    foot: `<button class="btn" data-close>${t('取消')}</button><button class="btn primary" id="cp-start">${t('开始抓取')}</button>`,
+    onMount: (m) => {
+      $('#cp-start', m).onclick = async () => {
+        try {
+          await api('POST', '/captures/rules', {
+            key_id: Number($('#cp-key', m).value), model: $('#cp-model', m).value,
+            count: Math.floor(Number($('#cp-count', m).value) || 0), ttl_minutes: Math.floor(Number($('#cp-ttl', m).value) || 0),
+          });
+          closeModal();
+          toast(t('已开始抓取，匹配的请求会在日志里标出“报文”'), 'ok');
+          route();
+        } catch (e) { toast(e.message, 'err'); }
+      };
+      if ($('#cp-clear', m)) $('#cp-clear', m).onclick = async () => {
+        if (!(await confirmBox(t('删除全部已抓取的报文？')))) return;
+        await api('DELETE', '/captures');
+        closeModal();
+        toast(t('已删除'), 'ok');
+        route();
+      };
+    },
+  });
+}
+
+// pretty-prints JSON bodies; streams and other text are shown as is
+function prettyBody(s) {
+  if (!s) return '';
+  try { return JSON.stringify(JSON.parse(s), null, 2); } catch (e) { return s; }
+}
+
+function bodyBlock(title, text, open, idx) {
+  const body = prettyBody(text);
+  return `<details ${open ? 'open' : ''}><summary class="small">${esc(title)} <span class="muted">${fmtNum(text ? text.length : 0)} B</span></summary>
+    ${body ? `<div class="btns" style="margin:6px 0"><button type="button" class="btn sm" data-copy-body="${idx}">${t('复制')}</button></div><pre class="box">${esc(body)}</pre>` : `<div class="muted small">${t('（空）')}</div>`}</details>`;
+}
+
+async function captureView(id) {
+  const c = await api('GET', '/captures/' + id);
+  const bodies = [];
+  const block = (title, text, open = false) => { bodies.push(prettyBody(text)); return bodyBlock(title, text, open, bodies.length - 1); };
+  const html = c.unreadable
+    ? `<div class="hint-box small err-text">${t('这条报文是用另一个 SECRET_KEY 加密的，当前实例打不开')}</div>`
+    : `${c.truncated ? `<div class="hint-box small">${t('部分报文超过 1 MB，只保存了开头')}</div>` : ''}
+      ${block(t('客户端请求'), c.client_request, true)}
+      ${(c.attempts || []).map((a, i) => `<div class="card" style="margin:8px 0"><div class="card-body form">
+        <div class="small"><b>${t('尝试 {n}', { n: i + 1 })}</b> <span class="mono">${esc(a.target)}</span> · ${esc(a.protocol)} · ${a.status ? 'HTTP ' + a.status : t('无响应')}</div>
+        ${a.url ? `<div class="mono small muted">POST ${esc(a.url)}</div>` : ''}
+        ${block(t('发给上游的请求'), a.request)}
+        ${block(t('上游的响应'), a.response)}
+      </div></div>`).join('')}
+      ${block(t('返回给客户端'), c.client_response)}`;
+  openModal({
+    title: t('报文 {id}', { id: c.request_id || '#' + c.id }),
+    wide: true,
+    body: `<div class="form">
+      <div class="kv">
+        <div class="k">${t('时间')}</div><div>${fmtTime(c.created_at)}</div>
+        <div class="k">API Key</div><div>${esc(c.key_name || '-')}</div>
+        <div class="k">${t('模型')}</div><div>${esc(c.model)} · ${esc(c.inbound)}</div>
+        <div class="k">${t('返回状态')}</div><div>HTTP ${c.status || '-'}</div>
+      </div>
+      ${html}
+    </div>`,
+    onMount: (m) => $$('[data-copy-body]', m).forEach((b) => b.onclick = () => copyText(bodies[Number(b.dataset.copyBody)])),
   });
 }
 
@@ -1506,6 +1644,9 @@ async function pageSettings() {
       <div class="card-head">${t('备份 / 迁移')}</div>
       <div class="card-body form">
         <div class="muted small">${t('导出全部套餐（含上游 Key）、模型映射、API Key 和设置为 JSON。导入会<b>覆盖</b>现有配置（日志不受影响）。导出文件含密钥，请妥善保管。')}</div>
+        <div class="small">${ping.encrypted
+          ? `<span class="badge ok">${t('已加密')}</span> ${t('上游 Key 和告警 Webhook 在数据库里用 SECRET_KEY 加密保存；导出文件里也是密文，只能导入到设置了同一个 SECRET_KEY 的实例。')}`
+          : `<span class="badge warn">${t('未加密')}</span> ${t('上游 Key 在数据库和导出文件里都是明文。设置环境变量 SECRET_KEY（至少 16 位随机字符）后重启，现有的 Key 会自动加密。')}`}</div>
         <div class="btns"><button class="btn" id="cfg-export">${t('导出配置')}</button><button class="btn" id="cfg-import">${t('导入配置')}</button><input type="file" id="cfg-file" accept=".json" style="display:none"></div>
       </div>
     </div>`;

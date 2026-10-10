@@ -44,12 +44,15 @@ AI Route was written to solve exactly that.
 - Retry before failing over: network blips, 5xx and short rate limits are retried on the same upstream first, so a conversation is not moved elsewhere and its prompt cache survives.
 - Circuit breaker: when quota runs out or a key is invalid, the whole provider cools down and is only used as a last resort; cooldowns back off exponentially.
 - Weighted groups: put several upstreams (e.g. two keys of the same plan) on the same priority with weights; one conversation always sticks to the same member.
+- Plan quotas: give a coding plan its allowance (requests or tokens per 5 hours, day, week or month); once it is used up the plan moves behind the pay-as-you-go APIs, and comes back when the window has room.
 
 **Management and cost**
 - Multiple client keys with allowed models, expiry, monthly budget, requests per minute and tokens per minute.
 - Request logs show which upstream actually answered, how many fallbacks happened, latency, time to first token, usage and cost.
 - Cost tracking: set unit prices for pay-as-you-go models, OpenRouter's actual charge is used directly; the overview breaks cost down by model, upstream, provider and key.
 - Alerts to Feishu/Lark, DingTalk, WeCom or any webhook, in English or Chinese.
+- Request capture: to debug a client or a protocol conversion, keep the full bodies of the next few requests of a key or model; they are deleted after 24 hours.
+- Secret encryption: with `SECRET_KEY` set, upstream keys, alert webhooks and captured bodies are encrypted in the database and in exports.
 
 **Self-hosting and extensibility**
 - Self-hosted models (vLLM, SGLang, Ollama …): concurrency cap with overflow, active health checks and a separate first-token timeout.
@@ -121,6 +124,8 @@ Without `ADMIN_TOKEN`, the first start generates an `admin-xxxx` token, prints i
 | `DATA_DIR` | `./data` | SQLite data directory |
 | `DATABASE_URL` | – | PostgreSQL URL; when set, SQLite is not used. See [Database](#database-sqlite-or-postgresql) |
 | `ADMIN_TOKEN` | generated | Admin console token |
+| `SECRET_KEY` | – | Encrypts upstream keys, alert webhooks and captured requests in the database; at least 16 characters. See [Secret encryption](#secret-encryption) |
+| `SECRET_KEY_PREVIOUS` | – | The old `SECRET_KEY` while rotating; values are re-encrypted with the new key on start |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | Proxy used to reach upstreams |
 | `TRUSTED_PROXIES` | – | Reverse proxies / load balancers to trust (comma-separated IPs or CIDRs, `private` for all private ranges); requests from them are attributed to the client in `X-Forwarded-For`, for the request log and the login lockout |
 | `LOG_FORMAT` | `text` | Log format; `json` for log collectors |
@@ -244,6 +249,22 @@ Added on the *Providers* page. A vendor's **coding plan** and its **pay-as-you-g
 - **Model protocol rules**: when some models are only served on one endpoint, one line per rule: `model(* allowed) = openai|anthropic|responses`. E.g. OpenCode Go serves MiniMax only on `/messages` and GPT Luna only on `/responses`; the preset has these rules.
 - **Responses API switch**: with *OpenAI endpoint also serves the Responses API* checked, Codex and other Responses clients are passed through; otherwise they are converted to Chat Completions. The OpenAI preset has it on; most OpenAI-compatible vendors (Kimi, GLM, DeepSeek …) have no `/responses`, so leave it off for them.
 - **Unit prices**: see [Cost tracking](#cost-tracking).
+- **Plan quotas**: see [Plan quotas](#plan-quotas).
+
+#### Plan quotas
+
+Coding plans usually allow so many requests per 5 hours or so many tokens per week, then make you wait for the window. In the provider's advanced settings, write one line per quota: `period = requests / tokens`, where 0 or left out means no limit:
+
+```
+5h = 600
+week = 0 / 50000000
+```
+
+Periods are `5h` (the last 5 hours, rolling), `day` (today), `week` (this week, from Monday 00:00) and `month` (this month). Once any of them is used up, the provider moves behind the other targets in every routing order, and returns to its place when the window has room again. It is not disabled: it is still the last resort when every other target fails, and the log marks that attempt "quota used up, last resort".
+
+- Counts come from the request log: only requests this provider answered count. They are recounted from the database every 30 seconds, with this instance's requests added in between; all instances share the same counts.
+- It is the gateway's own estimate and may differ slightly from the upstream's, whose weekly window may not start on Monday, for example. A real 429 from the upstream still trips the circuit breaker as usual.
+- Provider cards show the usage of each quota, and `/metrics` has `ai_route_provider_quota_used_ratio` for alerting.
 
 #### User-Agent policy
 
@@ -348,6 +369,16 @@ Add webhooks under *Settings → Alerts*; each one has a *Send test* button:
 | Generic JSON | Receives `POST {event, subject, title, text, time}` |
 
 Triggers: an upstream answers 401/402 (invalid key, out of credit), every upstream of a model failed, a provider or model is cooled down for longer than a threshold (10 minutes by default), a self-hosted model fails or recovers its health check. The same alert is sent at most once per silence window (30 minutes by default). Messages start with `[AI Route]` — use that as the keyword if your bot filters by keyword — and can be sent in English or Chinese.
+
+### Request capture
+
+When someone reports that a client fails through the gateway, the request log shows status and timings but not the bodies. Click *Capture requests* on the *Request log* page and pick an API key and / or model, how many requests (up to 50) and how long to wait. The next matching requests are saved in full:
+
+- what the client sent;
+- every request sent upstream (after protocol conversion) and the upstream's raw response, streams as raw SSE;
+- what the client got back.
+
+Captured requests are marked in the log; open one to view and copy the bodies. Nothing is captured by default, and without a capture rule there is no overhead. Captures contain the full prompts and only administrators can see them. Each body is capped at 1 MB, at most 200 captures are kept, and they are deleted after 24 hours; with `SECRET_KEY` set they are encrypted in the database.
 
 ## Routing, retries and circuit breaking
 
@@ -474,13 +505,22 @@ docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # change
 
   With Caddy: `reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`.
 - **Admin token**: `ADMIN_TOKEN` must be at least 16 characters and not the example value (the gateway refuses to start otherwise); `openssl rand -hex 24` makes a good one. After ten wrong tokens from one IP within a minute, further wrong attempts are refused for a minute; the right token is never locked out, so colleagues behind a shared address cannot shut the administrator out. Behind a reverse proxy set `TRUSTED_PROXIES`, or every request counts as the proxy's IP.
-- **Secrets**: upstream keys are stored in plain text in the database. With SQLite the data directory is created `0700` and the database files `0600`; with PostgreSQL, give the gateway its own database user and enable TLS (`sslmode=require`). Protect the database and the admin token. The client IP in logs is taken from `X-Forwarded-For` only for requests from `TRUSTED_PROXIES`; otherwise the TCP peer is logged.
+- **Secrets**: without `SECRET_KEY`, upstream keys are stored in plain text in the database; setting it is recommended, see [Secret encryption](#secret-encryption). With SQLite the data directory is created `0700` and the database files `0600`; with PostgreSQL, give the gateway its own database user and enable TLS (`sslmode=require`). Protect the database and the admin token. The client IP in logs is taken from `X-Forwarded-For` only for requests from `TRUSTED_PROXIES`; otherwise the TCP peer is logged.
 - **Error messages**: clients only see each upstream's status and the request id; raw upstream errors and URLs stay in the request log, so internal hosts and account details do not leak.
 - **Headers**: when forwarding caller headers, credentials, browser headers and account-selecting ones such as `OpenAI-Organization` / `OpenAI-Project` are dropped. `anthropic-beta` is forwarded (Claude Code depends on it), so clients can enable upstream beta features, some of which change pricing. Health checks carry the provider's key — point them at the provider's own service.
 - **Console**: served with a Content-Security-Policy, `X-Frame-Options: DENY` and related headers; it only loads its own scripts and styles.
 - **Resource protection**: request bodies up to 64 MB and 2 minutes to send them; upstream stream events up to 8 MB; writes to a client that stops reading time out after 60 seconds; client-supplied log fields are length-capped, and space is reclaimed after old logs are deleted.
-- **Backup and migration**: *Settings* can export and import the whole configuration (JSON, including upstream keys — keep it safe).
+- **Backup and migration**: *Settings* can export and import the whole configuration (JSON, including upstream keys — keep it safe; with `SECRET_KEY` set they are exported encrypted).
 - **Instances**: with SQLite run a single instance; with PostgreSQL you can run several, see [Multi-instance deployment](#multi-instance-deployment). After a restart breakers start fresh (or sync from the other instances) and the month's spend is recomputed from the logs.
+
+### Secret encryption
+
+Set `SECRET_KEY` (at least 16 characters, e.g. `openssl rand -hex 32`) and restart: the gateway then encrypts upstream keys, alert webhook URLs and signing secrets, and captured requests in the database with AES-256-GCM. Values stored in plain text before are encrypted on start. Without it, anyone holding the database file or a `pg_dump` holds every plan's key.
+
+- **Keep it safe**: once the database holds encrypted values, the gateway refuses to start without the right `SECRET_KEY`. All instances of a cluster use the same value.
+- **Exports**: exported upstream keys and webhooks are encrypted too, and import only where the same `SECRET_KEY` (or `SECRET_KEY_PREVIOUS`) is set.
+- **Rotation**: put the old value in `SECRET_KEY_PREVIOUS` and the new one in `SECRET_KEY`, restart once, and everything is re-encrypted; then drop `SECRET_KEY_PREVIOUS`. `SECRET_KEY_PREVIOUS` alone, without `SECRET_KEY`, decrypts everything back to plain text.
+- **Not encrypted**: client API keys (`sk-route-…`) and the admin token stay in plain text; they only give access to the gateway itself.
 
 ## Resource usage and sizing
 
@@ -551,7 +591,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:8080/admin/api/pro
 curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8080/admin/api/stats?range=24h"
 ```
 
-Main endpoints: `providers`, `models`, `keys`, `logs`, `stats`, `status`, `settings`, `alerts`, `export`, `import`.
+Main endpoints: `providers`, `models`, `keys`, `logs`, `stats`, `status`, `settings`, `alerts`, `captures`, `export`, `import`.
 
 ## Monitoring
 
@@ -566,6 +606,7 @@ Main endpoints: `providers`, `models`, `keys`, `logs`, `stats`, `status`, `setti
 | `ai_route_upstream_attempts_total{target,result}`, `ai_route_fallbacks_total` | the result of every upstream attempt; requests that switched target |
 | `ai_route_rejected_total{key,status}` | requests refused by limits, budgets or permissions |
 | `ai_route_breaker_open{kind,name}`, `ai_route_provider_inflight` | cooling plans / models; in-flight requests on self-hosted models |
+| `ai_route_provider_quota_used_ratio{provider,period,kind}` | share of a plan quota used in the current window; 1 = used up |
 | `ai_route_log_dropped_total` | request-log entries lost to a persistently full queue; should stay 0 |
 
 - **Logs** go to standard error; with `LOG_FORMAT=json` every line is one JSON object with fields such as `request` (the request id, also in the `X-Route-Request-Id` response header), `model`, `target`, `status` and `err`.

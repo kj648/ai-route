@@ -36,6 +36,9 @@ services:
       DATABASE_URL: postgres://airoute:${POSTGRES_PASSWORD}@postgres:5432/airoute?sslmode=disable
       # 请求经过 Caddy 转发：从 X-Forwarded-For 取真实客户端 IP（登录失败锁定按它计）
       TRUSTED_PROXIES: private
+      # 所有实例必须用同一个加密密钥（建议设置，见 README 的“密钥加密”）
+      SECRET_KEY: ${SECRET_KEY:-}
+      SECRET_KEY_PREVIOUS: ${SECRET_KEY_PREVIOUS:-}
       TZ: Asia/Shanghai
     depends_on:
       postgres:

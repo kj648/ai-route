@@ -45,6 +45,7 @@ type Gateway struct {
 	Limiter *Limiter
 	Alerts  *alert.Notifier
 	Health  *HealthChecker
+	Quotas  *Quotas
 	client  *http.Client
 	slots   *slots
 	cluster *clusterGlue     // nil with a single instance (SQLite)
@@ -52,6 +53,9 @@ type Gateway struct {
 
 	touchMu sync.Mutex
 	touched map[int64]time.Time
+
+	capUsed sync.Map       // capture rule id -> used up (seen on this instance)
+	capWG   sync.WaitGroup // captures being saved
 }
 
 func New(s *store.Store) *Gateway {
@@ -72,6 +76,7 @@ func New(s *store.Store) *Gateway {
 		Breaker: NewBreaker(s.GetSettings),
 		Limiter: NewLimiter(s),
 		Alerts:  alert.New(s.GetAlerts),
+		Quotas:  newQuotas(s),
 		client:  &http.Client{Transport: transport},
 		slots:   newSlots(s.Cluster()),
 		touched: map[int64]time.Time{},
@@ -195,6 +200,8 @@ type candidate struct {
 	provider *store.Provider
 	proto    string
 	openTill time.Time
+	// overQuota: the provider has used up one of its plan quotas
+	overQuota bool
 }
 
 func splitTarget(t string) (string, string) {
@@ -233,12 +240,12 @@ func chooseProtocol(p *store.Provider, model, inbound string) string {
 	return convert.ProtoAnthropic
 }
 
-// plan orders the targets: healthy ones in configured order, then cooled-down
-// ones (soonest recovery first) as a last resort. Weighted groups are
-// ordered per request by orderGroup; affinity keeps a conversation on the
-// same member.
+// plan orders the targets: healthy ones in configured order, then those of
+// providers over their plan quota, then cooled-down ones (soonest recovery
+// first) as a last resort. Weighted groups are ordered per request by
+// orderGroup; affinity keeps a conversation on the same member.
 func (g *Gateway) plan(snap *store.Snapshot, m *store.Model, inbound, affinity string) []candidate {
-	var healthy, cooling []candidate
+	var healthy, overQuota, cooling []candidate
 	var targets []string
 	for _, entry := range m.Targets {
 		targets = append(targets, orderGroup(store.ParseTargetEntry(entry), affinity)...)
@@ -254,14 +261,18 @@ func (g *Gateway) plan(snap *store.Snapshot, m *store.Model, inbound, affinity s
 			continue
 		}
 		c.openTill = g.Breaker.OpenUntil(prefix, t)
-		if c.openTill.IsZero() {
-			healthy = append(healthy, c)
-		} else {
+		c.overQuota = len(p.Quotas) > 0 && g.Quotas.Over(prefix)
+		switch {
+		case !c.openTill.IsZero():
 			cooling = append(cooling, c)
+		case c.overQuota:
+			overQuota = append(overQuota, c)
+		default:
+			healthy = append(healthy, c)
 		}
 	}
 	sort.SliceStable(cooling, func(i, j int) bool { return cooling[i].openTill.Before(cooling[j].openTill) })
-	return append(healthy, cooling...)
+	return append(append(healthy, overQuota...), cooling...)
 }
 
 func (g *Gateway) handle(w http.ResponseWriter, r *http.Request, inbound string) {
@@ -337,6 +348,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		// replaces the cached spend with the logged total, so a request is
 		// never counted twice (at worst missed until the next reload)
 		g.Limiter.Record(key, entry)
+		g.Quotas.Record(entry)
 		g.log(entry)
 	}()
 
@@ -377,6 +389,10 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		affinity = strconv.FormatInt(key.ID, 10) + "\x00" + conv
 	}
 	meta := &requestMeta{RequestID: entry.RequestID, Conversation: conversationID(affinity), Key: key, Header: r.Header}
+	if cp := g.startCapture(snap, w, key, m.Name, inbound, entry.RequestID, body); cp != nil {
+		meta.capture, w = cp, cp.client
+		defer g.saveCapture(cp)
+	}
 	r = r.WithContext(withMeta(r.Context(), meta))
 	cands := g.plan(snap, m, inbound, affinity)
 	if len(cands) == 0 {
@@ -409,6 +425,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		for retry := 0; ; retry++ {
 			res = g.try(r.Context(), w, r, c, inbound, body, info.Stream, m.Name, st)
 			res.attempt.Cooling = !c.openTill.IsZero()
+			res.attempt.OverQuota = c.overQuota
 			res.attempt.Retry = retry
 			entry.Attempts = append(entry.Attempts, res.attempt)
 			if res.committed || res.clientGone || !res.retryable || retry >= maxRetries {
@@ -843,6 +860,15 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 
 	req, clientUsage, resolved, err := buildUpstream(ctx, r, c, inbound, body, st, "")
 	res.attempt.Headers = resolved
+	var ca *captureAttempt
+	if m := metaFrom(parent); m != nil && m.capture != nil {
+		url := ""
+		if req != nil {
+			url = req.URL.Redacted()
+		}
+		ca = m.capture.attempt(c.target, c.proto, url, requestBody(req))
+		defer func() { ca.done(res.attempt.HTTPStatus, res.attempt.Error) }()
+	}
 	if err != nil {
 		return fail(400, failIgnore, "build request: "+err.Error())
 	}
@@ -850,6 +876,7 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 	if err != nil {
 		return netFail(err)
 	}
+	resp.Body = ca.tee(resp.Body)
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

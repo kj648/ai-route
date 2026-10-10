@@ -84,3 +84,43 @@ func TestAdminLockoutAndConsoleHeaders(t *testing.T) {
 		t.Fatalf("console headers: %v", w.Header())
 	}
 }
+
+func TestCaptureEndpoints(t *testing.T) {
+	st, err := storetest.Open(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	gw := gateway.New(st)
+	mux := http.NewServeMux()
+	New(st, gw, "tok", fstest.MapFS{"index.html": {Data: []byte("x")}}).Register(mux)
+	call := func(method, path, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, r)
+		return rec
+	}
+	if rec := call("POST", "/admin/api/captures/rules", `{"count":0}`); rec.Code != 400 {
+		t.Fatalf("zero count: %d %s", rec.Code, rec.Body)
+	}
+	if rec := call("POST", "/admin/api/captures/rules", `{"model":"coder","count":3}`); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"remaining":3`) {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	rec := call("GET", "/admin/api/captures", "")
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"model":"coder"`) || !strings.Contains(rec.Body.String(), `"retention_hours":24`) {
+		t.Fatalf("list: %d %s", rec.Code, rec.Body)
+	}
+	if len(st.Snapshot().Captures) != 1 {
+		t.Fatal("rule not in the snapshot")
+	}
+	if rec := call("GET", "/admin/api/captures/99", ""); rec.Code != 404 {
+		t.Fatalf("missing capture: %d", rec.Code)
+	}
+	if rec := call("DELETE", "/admin/api/captures/rules/1", ""); rec.Code != 200 || len(st.Snapshot().Captures) != 0 {
+		t.Fatalf("delete rule: %d, %d left", rec.Code, len(st.Snapshot().Captures))
+	}
+	if rec := call("DELETE", "/admin/api/captures", ""); rec.Code != 200 {
+		t.Fatalf("delete captures: %d", rec.Code)
+	}
+}

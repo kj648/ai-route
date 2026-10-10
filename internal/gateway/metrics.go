@@ -60,6 +60,21 @@ func (g *Gateway) registerGauges() {
 			}
 			return out
 		})
+	metrics.NewGaugeFunc("ai_route_provider_quota_used_ratio", "Share of a provider's plan quota used in the current window (1 = used up).",
+		[]string{"provider", "period", "kind"}, func() []metrics.Sample {
+			var out []metrics.Sample
+			for p, us := range g.Quotas.snapshot() {
+				for _, u := range us {
+					if u.Requests > 0 {
+						out = append(out, metrics.Sample{Labels: []string{p, u.Period, "requests"}, Value: float64(u.UsedRequests) / float64(u.Requests)})
+					}
+					if u.Tokens > 0 {
+						out = append(out, metrics.Sample{Labels: []string{p, u.Period, "tokens"}, Value: float64(u.UsedTokens) / float64(u.Tokens)})
+					}
+				}
+			}
+			return out
+		})
 	metrics.NewGaugeFunc("ai_route_log_dropped_total", "Request log entries lost because the log queue stayed full.", nil,
 		func() []metrics.Sample { return []metrics.Sample{{Value: float64(g.store.DroppedLogs())}} })
 }

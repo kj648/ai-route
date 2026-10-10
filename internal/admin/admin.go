@@ -148,7 +148,7 @@ func New(s *store.Store, gw *gateway.Gateway, token string, web fs.FS) *Admin {
 func (a *Admin) Register(mux *http.ServeMux) {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /admin/api/ping", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"ok": true, "version": version.Version, "user_agent": version.UserAgent(), "database": a.store.Backend()})
+		writeJSON(w, map[string]any{"ok": true, "version": version.Version, "user_agent": version.UserAgent(), "database": a.store.Backend(), "encrypted": a.store.Encrypted()})
 	})
 
 	api.HandleFunc("GET /admin/api/providers", a.listProviders)
@@ -179,6 +179,11 @@ func (a *Admin) Register(mux *http.ServeMux) {
 	api.HandleFunc("GET /admin/api/cluster", a.clusterInfo)
 	api.HandleFunc("GET /admin/api/logs", a.logs)
 	api.HandleFunc("GET /admin/api/stats", a.stats)
+	api.HandleFunc("GET /admin/api/captures", a.listCaptures)
+	api.HandleFunc("DELETE /admin/api/captures", a.deleteCaptures)
+	api.HandleFunc("GET /admin/api/captures/{id}", a.getCapture)
+	api.HandleFunc("POST /admin/api/captures/rules", a.createCaptureRule)
+	api.HandleFunc("DELETE /admin/api/captures/rules/{id}", a.deleteCaptureRule)
 
 	api.HandleFunc("GET /admin/api/settings", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, a.store.GetSettings()) })
 	api.HandleFunc("PUT /admin/api/settings", a.updateSettings)
@@ -284,6 +289,8 @@ type providerView struct {
 	*store.Provider
 	APIKey    string `json:"api_key"`
 	HasAPIKey bool   `json:"has_api_key"`
+	// QuotaUsage is how much of each quota the current window used.
+	QuotaUsage []gateway.QuotaUsage `json:"quota_usage"`
 }
 
 func (a *Admin) listProviders(w http.ResponseWriter, r *http.Request) {
@@ -292,9 +299,14 @@ func (a *Admin) listProviders(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err)
 		return
 	}
+	quotas := a.gw.Quotas.Status()
 	out := make([]providerView, 0, len(ps))
 	for _, p := range ps {
-		out = append(out, providerView{Provider: p, APIKey: maskKey(p.APIKey), HasAPIKey: p.APIKey != ""})
+		usage := quotas[p.Prefix]
+		if usage == nil {
+			usage = []gateway.QuotaUsage{}
+		}
+		out = append(out, providerView{Provider: p, APIKey: maskKey(p.APIKey), HasAPIKey: p.APIKey != "", QuotaUsage: usage})
 	}
 	writeJSON(w, out)
 }
@@ -315,6 +327,7 @@ func (a *Admin) createProvider(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
+	a.gw.Quotas.Refresh()
 	writeJSON(w, map[string]any{"id": p.ID, "prefix": p.Prefix})
 }
 
@@ -332,6 +345,7 @@ func (a *Admin) updateProvider(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
+	a.gw.Quotas.Refresh() // quotas may have changed
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -714,5 +728,82 @@ func (a *Admin) importConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	a.gw.Breaker.Reset("")
 	a.gw.Limiter.Forget()
+	a.gw.Quotas.Refresh()
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// ---------- request capture ----------
+
+func (a *Admin) listCaptures(w http.ResponseWriter, r *http.Request) {
+	rules, err := a.store.ListCaptureRules()
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	items, err := a.store.ListCaptures()
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	type ruleView struct {
+		*store.CaptureRule
+		KeyName string `json:"key_name"`
+	}
+	names := map[int64]string{}
+	for _, k := range a.store.Snapshot().Keys {
+		names[k.ID] = k.Name
+	}
+	views := make([]ruleView, 0, len(rules))
+	for _, r := range rules {
+		views = append(views, ruleView{r, names[r.KeyID]})
+	}
+	writeJSON(w, map[string]any{"rules": views, "items": items, "retention_hours": int(store.CaptureRetention.Hours()),
+		"encrypted": a.store.Encrypted()})
+}
+
+func (a *Admin) getCapture(w http.ResponseWriter, r *http.Request) {
+	c, err := a.store.GetCapture(pathID(r))
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	writeJSON(w, c)
+}
+
+func (a *Admin) deleteCaptures(w http.ResponseWriter, r *http.Request) {
+	if err := a.store.DeleteCaptures(); err != nil {
+		storeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (a *Admin) createCaptureRule(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		KeyID      int64  `json:"key_id"`
+		Model      string `json:"model"`
+		Count      int    `json:"count"`
+		TTLMinutes int    `json:"ttl_minutes"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.TTLMinutes == 0 {
+		req.TTLMinutes = 60
+	}
+	rule := &store.CaptureRule{KeyID: req.KeyID, Model: req.Model, Total: req.Count}
+	if err := a.store.CreateCaptureRule(rule, time.Duration(req.TTLMinutes)*time.Minute); err != nil {
+		storeErr(w, err)
+		return
+	}
+	writeJSON(w, rule)
+}
+
+func (a *Admin) deleteCaptureRule(w http.ResponseWriter, r *http.Request) {
+	if err := a.store.DeleteCaptureRule(pathID(r)); err != nil {
+		storeErr(w, err)
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }

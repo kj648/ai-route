@@ -43,11 +43,11 @@ func testLoc(t testing.TB) string {
 	return u.String()
 }
 
-func openLoc(loc string) (*Store, error) {
+func openLoc(loc string, opts ...Option) (*Store, error) {
 	if IsPostgresURL(loc) {
-		return OpenPostgres(loc)
+		return OpenPostgres(loc, opts...)
 	}
-	return Open(loc)
+	return Open(loc, opts...)
 }
 
 func openTest(t testing.TB) (*Store, error) {

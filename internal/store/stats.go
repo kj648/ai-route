@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS request_stats (
 	PRIMARY KEY (hour, key_id, key_name, public_model, provider, upstream_model)
 );
 CREATE INDEX IF NOT EXISTS idx_stats_key ON request_stats(key_id, hour);
+CREATE INDEX IF NOT EXISTS idx_stats_provider ON request_stats(provider, hour);
 `
 
 // statsUpsert adds a group's counters to its rollup row (the existing row

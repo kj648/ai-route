@@ -44,12 +44,15 @@ AI Route 就是为解决这些问题写的。
 - 先重试再切换：网络抖动、5xx、短时限流先在同一个上游重试，避免会话被切走、提示词缓存失效。
 - 熔断冷却：额度用尽、Key 失效时整个套餐冷却，冷却期间排到最后兜底，时长指数退避。
 - 同级分流：同一优先级放多个上游（比如同一家的两个 Key），按权重分流，同一会话固定走同一个。
+- 套餐配额：给编码套餐填上“每 5 小时 / 每天 / 每周 / 每月”的请求数或 tokens 上限，用满后自动排到按量 API 后面，窗口有余量再回来。
 
 **管理与成本**
 - 多个对外 Key：可以限制可用模型、设到期时间、月预算、每分钟请求数和 tokens。
 - 请求日志记录实际走了哪个上游、切换了几次、耗时、首字时间、用量和费用。
 - 成本核算：给按量模型配单价，OpenRouter 直接用实际扣费；概览按模型、上游、套餐、Key 汇总。
 - 失效告警：推送到飞书、钉钉、企业微信群机器人或任意 Webhook，消息可选中文或英文。
+- 抓取报文：排查客户端兼容或协议转换问题时，按 Key 或模型抓取接下来几条请求的完整报文，24 小时后自动删除。
+- 密钥加密：设置 `SECRET_KEY` 后，上游 Key、告警 Webhook 和抓取的报文在数据库和导出文件里都是密文。
 
 **自建与扩展**
 - 自建模型（vLLM、SGLang、Ollama 等）：并发上限与溢出、主动健康检查、单独的首包超时。
@@ -121,6 +124,8 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route                # 默认监听 :808
 | `DATA_DIR` | `./data` | SQLite 数据目录 |
 | `DATABASE_URL` | – | PostgreSQL 连接地址，设置后不再使用 SQLite，见[数据库](#数据库sqlite-与-postgresql) |
 | `ADMIN_TOKEN` | 自动生成 | 管理后台令牌 |
+| `SECRET_KEY` | – | 加密数据库里的上游 Key、告警 Webhook 和抓取的报文，至少 16 个字符，见[密钥加密](#密钥加密) |
+| `SECRET_KEY_PREVIOUS` | – | 更换 `SECRET_KEY` 时填旧的那个，启动时自动换成新密钥加密 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | 访问上游时使用的代理 |
 | `TRUSTED_PROXIES` | – | 可信的反向代理 / 负载均衡地址（逗号分隔的 IP 或 CIDR，`private` 表示所有内网地址）；来自它们的请求按 `X-Forwarded-For` 识别客户端 IP，用于请求日志和登录锁定 |
 | `LOG_FORMAT` | `text` | 日志格式，`json` 便于接入日志系统 |
@@ -244,6 +249,22 @@ wire_api = "responses"
 - **模型协议规则**：某些模型只在一种端点上提供时使用，每行 `模型(可用*) = openai|anthropic|responses`。比如 OpenCode Go 的 MiniMax 只走 `/messages`，GPT Luna 只走 `/responses`，预设已填好。
 - **Responses API 开关**：勾选“OpenAI 地址也支持 Responses API”后，Codex 等客户端的请求原样转发；不勾选就转成 Chat Completions。OpenAI 官方预设已勾选；Kimi、GLM、DeepSeek 等多数兼容厂商没有 `/responses`，不要勾。
 - **单价**：见[成本核算](#成本核算)。
+- **套餐配额**：见[套餐配额](#套餐配额)。
+
+#### 套餐配额
+
+编码套餐一般限制“每 5 小时多少次请求”或“每周多少 tokens”，用完要等窗口恢复。在供应商的“高级设置”里每行写一条：`周期 = 请求数 / tokens`，0 或省略表示不限，例如：
+
+```
+5h = 600
+week = 0 / 50000000
+```
+
+周期可以是 `5h`（最近 5 小时，滚动计算）、`day`（今天）、`week`（本周，从周一 0 点算）、`month`（本月）。任何一条用满后，这个供应商在所有模型的调度顺序里排到其他候补后面，窗口有余量后自动回到原位。它不会被禁用：其他候补都失败时仍会兜底，日志里这次尝试标为“配额用完兜底”。
+
+- 计数来自请求日志：只统计这个供应商实际应答的请求，每 30 秒从数据库重新统计一次，期间本实例的请求实时累加；多实例共享同一份计数。
+- 这是网关自己的估算，和上游的统计可能略有出入，比如上游的周窗口不一定从周一开始。上游真的返回 429 时，熔断仍会照常生效。
+- 供应商卡片上显示每条配额的用量，`/metrics` 里有 `ai_route_provider_quota_used_ratio`，可以配告警。
 
 #### User-Agent 策略
 
@@ -348,6 +369,16 @@ Key 由平台自动生成（`sk-route-` 加 48 位十六进制），泄露时点
 | 通用 JSON | 收到 `POST {event, subject, title, text, time}` |
 
 触发条件：上游返回 401 / 402（Key 失效、欠费）、某个模型的整条调度链全部失败、套餐或模型一次冷却超过阈值（默认 10 分钟）、自建模型健康检查失败或恢复。同一件事在静默时间（默认 30 分钟）内只推送一次。消息都以 `[AI Route]` 开头，机器人用“自定义关键词”时填 `AI Route` 即可；推送语言可选中文或英文。
+
+### 抓取报文
+
+用户反馈“某个客户端经过网关就报错”时，请求日志只有状态和耗时，看不到报文。这时在“请求日志”页点“抓取报文”，选择 API Key 和 / 或模型、抓几条（最多 50）、最长等多久，接下来匹配的请求会完整保存：
+
+- 客户端发来的请求；
+- 每次发给上游的请求（协议转换之后）和上游的原始响应，流式响应保存原始 SSE；
+- 最后返回给客户端的内容。
+
+抓到的请求在日志里标为“报文”，点开详情就能查看和复制。默认不抓任何请求，没有抓取规则时没有额外开销。报文含完整的提示词，只有管理员可见；每段最多保存 1 MB，最多保留 200 条，24 小时后自动删除；设置了 `SECRET_KEY` 时加密落库。
 
 ## 路由、重试与熔断
 
@@ -474,13 +505,22 @@ docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # 调整
 
   Caddy 只需要一行：`reverse_proxy 127.0.0.1:8080 { flush_interval -1 }`。
 - **管理令牌**：`ADMIN_TOKEN` 至少 16 个字符，不能用示例值（否则拒绝启动），可以用 `openssl rand -hex 24` 生成。同一 IP 1 分钟内输错 10 次，之后的错误尝试会被拒绝 1 分钟；正确的令牌不受锁定影响，所以共用出口 IP 的同事不会把管理员锁在外面。网关在反向代理后面时请设置 `TRUSTED_PROXIES`，否则所有请求都算作代理的 IP。
-- **数据安全**：上游 Key 以明文存放在数据库里。SQLite 的数据目录权限为 `0700`、数据库文件为 `0600`；使用 PostgreSQL 时请给网关单独的数据库账号，并开启 TLS（`sslmode=require`）。请控制好数据库和管理令牌的访问权限。日志里的客户端 IP 只在请求来自 `TRUSTED_PROXIES` 时取自 `X-Forwarded-For`，其余情况记录 TCP 对端地址。
+- **数据安全**：不设置 `SECRET_KEY` 时上游 Key 以明文存放在数据库里，建议设置，见下方[密钥加密](#密钥加密)。SQLite 的数据目录权限为 `0700`、数据库文件为 `0600`；使用 PostgreSQL 时请给网关单独的数据库账号，并开启 TLS（`sslmode=require`）。请控制好数据库和管理令牌的访问权限。日志里的客户端 IP 只在请求来自 `TRUSTED_PROXIES` 时取自 `X-Forwarded-For`，其余情况记录 TCP 对端地址。
 - **错误信息**：返回给客户端的错误只包含各上游的状态码和请求 ID，上游的原始报错、地址留在请求日志里，避免泄露内部地址或账户信息。
 - **请求头**：转发调用方请求头时，凭证类、浏览器类以及 `OpenAI-Organization` / `OpenAI-Project` 这类会切换账户的头都会被去掉；`anthropic-beta` 会透传（Claude Code 依赖它），客户端因此可以启用上游的 beta 功能，部分 beta 会改变计费。健康检查会带上供应商的 Key，地址请填它自己的服务。
 - **控制台**：返回 CSP、`X-Frame-Options: DENY` 等安全头，只加载自身的脚本和样式。
 - **资源保护**：单个请求体最多 64 MB，读取请求体最多 2 分钟；上游单个流式事件最多 8 MB；客户端不读数据时，单次写入 60 秒超时；日志里客户端提供的字段有长度上限，过期日志删除后会回收数据库空间。
-- **备份与迁移**：“设置与接入”里可以导出 / 导入全部配置（JSON，包含上游 Key，请妥善保管）。
+- **备份与迁移**：“设置与接入”里可以导出 / 导入全部配置（JSON，包含上游 Key，请妥善保管；设置了 `SECRET_KEY` 时导出的是密文）。
 - **实例数**：使用 SQLite 时只能运行一个实例；使用 PostgreSQL 时可以运行多个，见[多实例部署](#多实例部署)。重启后熔断状态清空（多实例时从其他实例同步），本月费用从日志重新统计。
+
+### 密钥加密
+
+设置环境变量 `SECRET_KEY`（至少 16 个字符，可以用 `openssl rand -hex 32` 生成）后重启，网关会用 AES-256-GCM 加密数据库里的上游 Key、告警 Webhook 地址与签名密钥、抓取的报文；已有的明文值在启动时自动加密。没有它，拿到数据库文件或 `pg_dump` 的人就拿到了所有套餐的 Key。
+
+- **必须保管好**：数据库里有密文时，不设置或设错 `SECRET_KEY` 网关会拒绝启动。多实例时所有实例用同一个值。
+- **导出文件**：导出的上游 Key 和 Webhook 也是密文，只能导入到 `SECRET_KEY`（或 `SECRET_KEY_PREVIOUS`）相同的实例。
+- **更换密钥**：把旧值放进 `SECRET_KEY_PREVIOUS`、新值放进 `SECRET_KEY`，重启一次，全部会换成新密钥；之后可以去掉 `SECRET_KEY_PREVIOUS`。只设 `SECRET_KEY_PREVIOUS` 不设 `SECRET_KEY`，就是解密回明文。
+- **不加密的部分**：对外 API Key（`sk-route-…`）和管理令牌仍是明文，它们只能访问网关本身。
 
 ## 资源占用与配置建议
 
@@ -557,7 +597,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:8080/admin/api/pro
 curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8080/admin/api/stats?range=24h"
 ```
 
-常用端点：`providers`、`models`、`keys`、`logs`、`stats`、`status`、`settings`、`alerts`、`export`、`import`。
+常用端点：`providers`、`models`、`keys`、`logs`、`stats`、`status`、`settings`、`alerts`、`captures`、`export`、`import`。
 
 ## 监控
 
@@ -572,6 +612,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8080/admin/api/st
 | `ai_route_upstream_attempts_total{target,result}`、`ai_route_fallbacks_total` | 每次上游尝试的结果、发生切换的请求数 |
 | `ai_route_rejected_total{key,status}` | 被限流、预算、权限拒绝的请求 |
 | `ai_route_breaker_open{kind,name}`、`ai_route_provider_inflight` | 冷却中的套餐 / 模型、自建模型的在途请求 |
+| `ai_route_provider_quota_used_ratio{provider,period,kind}` | 套餐配额在当前窗口的用量占比，1 表示用满 |
 | `ai_route_log_dropped_total` | 因日志队列持续满载而丢失的日志条数，正常应为 0 |
 
 - **日志**：输出到标准错误，`LOG_FORMAT=json` 时每行一个 JSON 对象，字段包括 `request`（请求 ID）、`model`、`target`、`status`、`err` 等，可以和响应头 `X-Route-Request-Id` 对应。
