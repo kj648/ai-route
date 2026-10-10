@@ -1,5 +1,6 @@
 // Package convert translates requests, responses and SSE streams between the
-// OpenAI Chat Completions protocol and the Anthropic Messages protocol.
+// OpenAI Chat Completions, OpenAI Responses and Anthropic Messages
+// protocols through one intermediate form (see ir.go).
 package convert
 
 import (
@@ -49,13 +50,15 @@ type OAChatRequest struct {
 }
 
 type OAResponseFormat struct {
-	Type       string `json:"type"` // text | json_object | json_schema
-	JSONSchema *struct {
-		Name        string          `json:"name,omitempty"`
-		Description string          `json:"description,omitempty"`
-		Schema      json.RawMessage `json:"schema,omitempty"`
-		Strict      bool            `json:"strict,omitempty"`
-	} `json:"json_schema,omitempty"`
+	Type       string        `json:"type"` // text | json_object | json_schema
+	JSONSchema *oaJSONSchema `json:"json_schema,omitempty"`
+}
+
+type oaJSONSchema struct {
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Strict      bool            `json:"strict,omitempty"`
 }
 
 type OAStreamOptions struct {
@@ -187,6 +190,10 @@ type ANBlock struct {
 	IsError   bool            `json:"is_error,omitempty"`
 	Thinking  string          `json:"thinking,omitempty"`
 	Signature string          `json:"signature,omitempty"`
+	// Data is the opaque payload of a redacted_thinking block.
+	Data         string          `json:"data,omitempty"`
+	Title        string          `json:"title,omitempty"` // document
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 type ANSource struct {
@@ -197,10 +204,11 @@ type ANSource struct {
 }
 
 type ANTool struct {
-	Type        string          `json:"type,omitempty"`
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	Type         string          `json:"type,omitempty"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"input_schema,omitempty"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 type ANToolChoice struct {

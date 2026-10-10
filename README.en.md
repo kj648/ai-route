@@ -373,7 +373,9 @@ On each upstream the gateway **first decides whether to retry, then whether to f
 | Same protocol | Passed through; only `model` is rewritten |
 | OpenAI ⇄ Anthropic | System messages, tool calls and results, images, reasoning and `cache_control` are mapped; stream events are converted one by one |
 | Responses ⇄ Chat | `instructions` / `developer` → `system`, `function_call` ⇄ `tool_calls`; Codex's freeform tools (e.g. `apply_patch`) become a function with one string parameter and are turned back afterwards; OpenAI built-in tools (`web_search` …) have no equivalent and are dropped |
-| Responses ⇄ Anthropic | Through Chat Completions |
+| Responses ⇄ Anthropic | Direct: `input_file` ⇄ `document`, tool results with images, `is_error` and reasoning summaries are kept; nothing goes through Chat |
+
+Every protocol is parsed into one intermediate form (Anthropic's content-block model with a few extensions) and written out in the upstream's protocol, so any pair takes one parse and one emit. Only what the target protocol cannot express is lost: for a Chat upstream, images inside tool results move to the front of the next user message and documents are dropped; thinking the gateway synthesized from another protocol carries no signature and is removed for Anthropic upstreams.
 
 - **`reasoning_effort`**: for Claude Opus / Sonnet 4.6+ and Fable it becomes `thinking: {type: "adaptive"}` plus `output_config.effort`, and parameters those models reject are removed; other models get `budget_tokens`.
 - **`response_format`**: a strict JSON schema becomes native structured output on the official Anthropic API; otherwise a "reply with JSON only" instruction is appended to the system prompt.

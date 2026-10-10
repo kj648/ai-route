@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"time"
 )
 
 func randID(prefix string) string {
@@ -138,19 +137,6 @@ func anStopToOpenAI(r string) string {
 	}
 }
 
-func oaFinishToAnthropic(r string) string {
-	switch r {
-	case "length":
-		return "max_tokens"
-	case "tool_calls", "function_call":
-		return "tool_use"
-	case "content_filter":
-		return "refusal"
-	default:
-		return "end_turn"
-	}
-}
-
 func oaUsageFrom(u Usage) map[string]any {
 	m := map[string]any{
 		"prompt_tokens":     u.Input,
@@ -172,119 +158,6 @@ func anUsageFrom(u Usage) map[string]any {
 		m["cache_read_input_tokens"] = u.Cached
 	}
 	return m
-}
-
-// AnthropicToOpenAIResponse converts a messages response to a chat completion.
-// publicModel is reported back to the client.
-func AnthropicToOpenAIResponse(body []byte, publicModel string) ([]byte, Usage, error) {
-	var r ANResponse
-	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, Usage{}, err
-	}
-	var text, reasoning string
-	var toolCalls []map[string]any
-	for _, b := range r.Content {
-		switch b.Type {
-		case "text":
-			text += b.Text
-		case "thinking":
-			reasoning += b.Thinking
-		case "tool_use":
-			args := string(b.Input)
-			if isNullOrEmpty(b.Input) {
-				args = "{}"
-			}
-			toolCalls = append(toolCalls, map[string]any{
-				"id": b.ID, "type": "function",
-				"function": map[string]any{"name": b.Name, "arguments": args},
-			})
-		}
-	}
-	msg := map[string]any{"role": "assistant", "content": text}
-	if text == "" && len(toolCalls) > 0 {
-		msg["content"] = nil
-	}
-	if reasoning != "" {
-		msg["reasoning_content"] = reasoning
-	}
-	if len(toolCalls) > 0 {
-		msg["tool_calls"] = toolCalls
-	}
-	usage := r.Usage.toUsage()
-	id := r.ID
-	if id == "" {
-		id = randID("chatcmpl-")
-	}
-	out := map[string]any{
-		"id":      id,
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   publicModel,
-		"choices": []map[string]any{{
-			"index":         0,
-			"message":       msg,
-			"finish_reason": anStopToOpenAI(r.StopReason),
-		}},
-		"usage": oaUsageFrom(usage),
-	}
-	b, err := json.Marshal(out)
-	return b, usage, err
-}
-
-// OpenAIToAnthropicResponse converts a chat completion to a messages response.
-func OpenAIToAnthropicResponse(body []byte, publicModel string) ([]byte, Usage, error) {
-	var r OAResponse
-	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, Usage{}, err
-	}
-	content := []map[string]any{}
-	finish := "stop"
-	if len(r.Choices) > 0 {
-		c := r.Choices[0]
-		if c.FinishReason != nil {
-			finish = *c.FinishReason
-		}
-		if m := c.Message; m != nil {
-			reasoning := m.ReasoningContent
-			if reasoning == "" {
-				reasoning = m.Reasoning
-			}
-			if reasoning != "" {
-				content = append(content, map[string]any{"type": "thinking", "thinking": reasoning, "signature": ConvertedSignature})
-			}
-			if t := oaContentText(m.Content); t != "" {
-				content = append(content, map[string]any{"type": "text", "text": t})
-			}
-			for _, tc := range m.ToolCalls {
-				id := tc.ID
-				if id == "" {
-					id = randID("toolu_")
-				}
-				content = append(content, map[string]any{
-					"type": "tool_use", "id": id, "name": tc.Function.Name,
-					"input": parseArgs(tc.Function.Arguments),
-				})
-			}
-			// a call cut off by max_tokens stays max_tokens: the client must
-			// not execute a half-formed call
-			if len(m.ToolCalls) > 0 && (finish == "" || finish == "stop") {
-				finish = "tool_calls"
-			}
-		}
-	}
-	usage := r.Usage.toUsage()
-	out := map[string]any{
-		"id":            randID("msg_"),
-		"type":          "message",
-		"role":          "assistant",
-		"model":         publicModel,
-		"content":       content,
-		"stop_reason":   oaFinishToAnthropic(finish),
-		"stop_sequence": nil,
-		"usage":         anUsageFrom(usage),
-	}
-	b, err := json.Marshal(out)
-	return b, usage, err
 }
 
 // ErrorBody builds an error response body in the client's protocol.

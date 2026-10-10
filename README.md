@@ -373,7 +373,9 @@ Key 由平台自动生成（`sk-route-` 加 48 位十六进制），泄露时点
 | 同协议 | 直通，只改写 `model` 字段 |
 | OpenAI ⇄ Anthropic | 系统消息、工具调用与结果、图片、思考内容、`cache_control` 互相转换；流式事件逐个转换 |
 | Responses ⇄ Chat | `instructions` / `developer` → `system`，`function_call` ⇄ `tool_calls`；Codex 的自定义工具（如 `apply_patch`）转成单个字符串参数的函数，结果再还原；内置工具（`web_search` 等）没有对应物会被丢弃 |
-| Responses ⇄ Anthropic | 以 Chat 为中转 |
+| Responses ⇄ Anthropic | 直接转换：`input_file` ⇄ `document`，带图片的工具结果、`is_error`、推理摘要都保留，不经过 Chat |
+
+三种协议都先解析成同一个中间表示（以 Anthropic 的内容块模型为基础），再写成上游的协议，所以任意两种协议之间只经过一次解析和一次生成。只有目标协议表达不了的内容才会丢失：发给 Chat 上游时，工具结果里的图片会提到下一条用户消息前面，文档会被丢弃；网关从其他协议合成的思考内容没有签名，发给 Anthropic 上游时会去掉。
 
 - **`reasoning_effort`**：发给 Claude Opus / Sonnet 4.6 及以后、Fable 时转成 `thinking: {type: "adaptive"}` 加 `output_config.effort`，并去掉新模型不接受的参数；发给其他模型时转成 `budget_tokens`。
 - **`response_format`**：上游是 Anthropic 官方且为严格 JSON Schema 时，转成原生结构化输出；其他情况在系统提示词末尾要求“只输出 JSON”。
