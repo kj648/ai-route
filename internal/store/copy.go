@@ -60,6 +60,10 @@ func (s *Store) CopyTo(dst *Store, progress func(table string, copied int64)) er
 			return fmt.Errorf("%s: %w", t, err)
 		}
 	}
+	// the hourly rollup is derived: rebuild it from the copied logs
+	if err := dst.RebuildStats(); err != nil {
+		return fmt.Errorf("request_stats: %w", err)
+	}
 	return dst.reloadLocked()
 }
 

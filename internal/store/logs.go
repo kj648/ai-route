@@ -3,7 +3,6 @@ package store
 import (
 	"encoding/json"
 	"log/slog"
-	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -201,6 +200,7 @@ func (s *Store) insertLogs(batch []*RequestLog) error {
 		return err
 	}
 	defer tx.Rollback()
+	clipped := make([]RequestLog, 0, len(batch))
 	for len(batch) > 0 {
 		part := batch[:min(perStmt, len(batch))]
 		batch = batch[len(part):]
@@ -216,11 +216,15 @@ func (s *Store) insertLogs(batch []*RequestLog) error {
 				attempts = []Attempt{}
 			}
 			args = append(args, l.CreatedAt, l.KeyID, l.KeyName, l.RequestedModel, l.PublicModel, l.Inbound, b2i(l.Stream), l.Provider, l.UpstreamModel, l.UpstreamProtocol, b2i(l.Success), l.HTTPStatus, l.LatencyMs, l.TTFBMs, l.InputTokens, l.OutputTokens, l.CachedTokens, b2i(l.Fallback), mustJSON(attempts), l.Error, l.ClientIP, l.Cost, l.Currency, l.CostSource, l.RequestID)
+			clipped = append(clipped, l)
 		}
 		if _, err := tx.Exec(`INSERT INTO request_logs (created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source, request_id) VALUES `+
 			strings.TrimSuffix(strings.Repeat(row+",", len(part)), ","), args...); err != nil {
 			return err
 		}
+	}
+	if err := s.upsertStats(tx, clipped); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -252,6 +256,10 @@ func (s *Store) cleanupLogs() {
 		if k < 5000 {
 			break
 		}
+	}
+	statsCutoff := time.Now().Add(-statsRetentionDays * 24 * time.Hour).UnixMilli()
+	if _, err := s.db.Exec(`DELETE FROM request_stats WHERE hour < ?`, statsCutoff); err != nil {
+		slog.Error("cleanup stats failed", "err", err)
 	}
 	if n > 0 && !s.db.pg {
 		// give freed pages back to the file system, a bounded slice per
@@ -391,170 +399,4 @@ func (st Settings) ToDisplayCurrency(amount float64, currency string) float64 {
 		return amount * cny
 	}
 	return 0
-}
-
-// statAcc accumulates one group of the stats.
-type statAcc struct {
-	row            StatRow
-	latency        int64
-	ttfbSum, ttfbN int64
-}
-
-func (a *statAcc) result(key string) StatRow {
-	r := a.row
-	r.Key = key
-	if r.Requests > 0 {
-		r.AvgLatencyMs = float64(a.latency) / float64(r.Requests)
-	}
-	if a.ttfbN > 0 {
-		r.AvgTTFBMs = float64(a.ttfbSum) / float64(a.ttfbN)
-	}
-	return r
-}
-
-// sortedRows orders groups by request count (then key), like the console expects.
-func sortedRows(m map[string]*statAcc) []StatRow {
-	out := make([]StatRow, 0, len(m))
-	for k, a := range m {
-		out = append(out, a.result(k))
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Requests != out[j].Requests {
-			return out[i].Requests > out[j].Requests
-		}
-		return out[i].Key < out[j].Key
-	})
-	return out
-}
-
-// GetStats aggregates logs since the given unix ms in a single scan; the
-// timeline uses fixed buckets of bucketMs (gaps filled with zero rows, keys
-// in local time). Costs are converted to the display currency.
-func (s *Store) GetStats(since int64, bucketMs int64) (*Stats, error) {
-	settings := s.GetSettings()
-	usd, cny := settings.CurrencyFactors()
-	st := &Stats{Since: since, BucketMs: bucketMs, Currency: settings.Currency}
-	rows, err := s.db.Query(`SELECT created_at, public_model, provider, upstream_model, key_name, success, fallback,
-		input_tokens, output_tokens, cached_tokens, latency_ms, ttfb_ms, cost, currency, cost_source
-		FROM request_logs WHERE created_at >= ?`, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var total statAcc
-	byModel, byProvider, byTarget, byKey := map[string]*statAcc{}, map[string]*statAcc{}, map[string]*statAcc{}, map[string]*statAcc{}
-	byBucket := map[int64]*statAcc{}
-	off := tzOffsetMs()
-	group := func(m map[string]*statAcc, k string) *statAcc {
-		a, ok := m[k]
-		if !ok {
-			a = &statAcc{}
-			m[k] = a
-		}
-		return a
-	}
-	for rows.Next() {
-		var created, in, out, cached, latency, ttfb int64
-		var model, provider, upModel, keyName, currency, source string
-		var success, fallback int
-		var cost float64
-		if err := rows.Scan(&created, &model, &provider, &upModel, &keyName, &success, &fallback,
-			&in, &out, &cached, &latency, &ttfb, &cost, &currency, &source); err != nil {
-			return nil, err
-		}
-		switch currency {
-		case CurrencyUSD:
-			cost *= usd
-		case CurrencyCNY:
-			cost *= cny
-		default:
-			cost = 0
-		}
-		target := "(none)"
-		if provider != "" {
-			target = provider + "/" + upModel
-		} else {
-			provider = "(none)"
-		}
-		bucket := (created + off) / bucketMs
-		b, ok := byBucket[bucket]
-		if !ok {
-			b = &statAcc{}
-			byBucket[bucket] = b
-		}
-		for _, a := range []*statAcc{&total, group(byModel, model), group(byProvider, provider), group(byTarget, target), group(byKey, keyName), b} {
-			r := &a.row
-			r.Requests++
-			if success == 1 {
-				r.Success++
-			} else {
-				r.Failed++
-			}
-			r.Fallback += int64(fallback)
-			r.InputTokens += in
-			r.OutputTokens += out
-			r.CachedTokens += cached
-			r.Cost += cost
-			if source == "" && in+out > 0 {
-				r.Unpriced++
-			}
-			a.latency += latency
-			if ttfb > 0 {
-				a.ttfbSum += ttfb
-				a.ttfbN++
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	st.Total = total.result("total")
-	st.ByModel, st.ByProvider, st.ByTarget, st.ByKey = sortedRows(byModel), sortedRows(byProvider), sortedRows(byTarget), sortedRows(byKey)
-	first, last := (since+off)/bucketMs, (time.Now().UnixMilli()+off)/bucketMs
-	layout := "01-02 15:04"
-	if bucketMs >= 24*3600*1000 {
-		layout = "2006-01-02"
-	}
-	for k := first; k <= last; k++ {
-		var r StatRow
-		if a, ok := byBucket[k]; ok {
-			r = a.result("")
-		}
-		r.Key = time.UnixMilli(k*bucketMs - off).Format(layout)
-		st.Timeline = append(st.Timeline, r)
-	}
-	return st, nil
-}
-
-// tzOffsetMs aligns day buckets to local midnight.
-func tzOffsetMs() int64 {
-	_, off := time.Now().Zone()
-	return int64(off) * 1000
-}
-
-// KeySpend returns each key's cost since the given unix ms, in the display
-// currency.
-func (s *Store) KeySpend(since int64) (map[int64]float64, error) {
-	usd, cny := s.GetSettings().CurrencyFactors()
-	rows, err := s.db.Query(`SELECT key_id, SUM(cost * CASE currency WHEN 'USD' THEN CAST(? AS DOUBLE PRECISION) WHEN 'CNY' THEN CAST(? AS DOUBLE PRECISION) ELSE 0 END) FROM request_logs WHERE created_at >= ? AND cost > 0 GROUP BY key_id`, usd, cny, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[int64]float64{}
-	for rows.Next() {
-		var id int64
-		var v float64
-		if err := rows.Scan(&id, &v); err != nil {
-			return nil, err
-		}
-		out[id] = v
-	}
-	return out, rows.Err()
-}
-
-// MonthStart is local midnight on the first day of t's month, in unix ms.
-func MonthStart(t time.Time) int64 {
-	y, m, _ := t.Date()
-	return time.Date(y, m, 1, 0, 0, 0, 0, t.Location()).UnixMilli()
 }

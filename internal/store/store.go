@@ -532,7 +532,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_model ON request_logs(public_model, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_key ON request_logs(key_id, created_at);
-`))
+` + statsSchema))
 	if err != nil {
 		return err
 	}
@@ -586,7 +586,10 @@ CREATE INDEX IF NOT EXISTS idx_logs_key ON request_logs(key_id, created_at);
 			return err
 		}
 	}
-	return s.ensureColumn("models", "tags", `TEXT NOT NULL DEFAULT '[]'`)
+	if err := s.ensureColumn("models", "tags", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
+		return err
+	}
+	return s.ensureStatsBackfilled()
 }
 
 // OpenCodeSessionHeader is the OpenCode Go preset's session header value:

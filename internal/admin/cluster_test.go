@@ -94,7 +94,10 @@ func TestClusterLockoutAndInstances(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		call([]*http.ServeMux{a, b}[i%2], "/admin/api/providers", "wrong")
 	}
-	if w := call(a, "/admin/api/providers", "the-right-token-123"); w.Code != 429 {
+	if w := call(a, "/admin/api/providers", "wrong"); w.Code != 429 {
 		t.Fatalf("10 failures over two instances should lock the IP out: %d", w.Code)
+	}
+	if w := call(b, "/admin/api/providers", "the-right-token-123"); w.Code != 200 {
+		t.Fatalf("the right token is never locked out: %d", w.Code)
 	}
 }
