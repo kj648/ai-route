@@ -175,7 +175,18 @@ type APIKey struct {
 	MaxConcurrency int   `json:"max_concurrency"`
 	CreatedAt      int64 `json:"created_at"`
 	LastUsedAt     int64 `json:"last_used_at"`
+	// UserID is the user who created the key (0 = the administrator). A
+	// user's keys are stored hashed: Key holds "sha256:<hex>" and Hint
+	// the beginning and end of the value, which is shown only once.
+	UserID int64  `json:"user_id"`
+	Hint   string `json:"hint,omitempty"`
 }
+
+// HashedKeyPrefix marks a key stored as its hash.
+const HashedKeyPrefix = "sha256:"
+
+// Hashed reports whether only the key's hash is stored.
+func (k *APIKey) Hashed() bool { return strings.HasPrefix(k.Key, HashedKeyPrefix) }
 
 // Settings are global tunables.
 type Settings struct {
@@ -220,6 +231,30 @@ type Snapshot struct {
 	Alerts      AlertConfig
 	// Captures are the capture rules with requests left (see capture.go).
 	Captures []*CaptureRule
+	// Users by id, without password hashes.
+	Users map[int64]*User
+}
+
+// LookupKey finds the API key a client presented: stored as is, or as its
+// hash. A presented value that looks like a stored hash never matches, so
+// a leaked hash is not a key.
+func (s *Snapshot) LookupKey(raw string) (*APIKey, bool) {
+	if raw == "" || strings.HasPrefix(raw, HashedKeyPrefix) {
+		return nil, false
+	}
+	if k, ok := s.Keys[raw]; ok {
+		return k, true
+	}
+	k, ok := s.Keys[HashedKeyPrefix+TokenHash(raw)]
+	return k, ok
+}
+
+// KeyUser returns the user owning a key, or nil for the administrator's.
+func (s *Snapshot) KeyUser(k *APIKey) *User {
+	if k == nil || k.UserID == 0 {
+		return nil
+	}
+	return s.Users[k.UserID]
 }
 
 // ResolveModel finds a public model by exact name, exact alias, then glob alias.
@@ -547,7 +582,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_model ON request_logs(public_model, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_key ON request_logs(key_id, created_at);
-` + statsSchema + captureSchema))
+` + statsSchema + captureSchema + usersSchema))
 	if err != nil {
 		return err
 	}
@@ -586,12 +621,24 @@ CREATE INDEX IF NOT EXISTS idx_logs_key ON request_logs(key_id, created_at);
 		{"rpm", `INTEGER NOT NULL DEFAULT 0`},
 		{"tpm", `INTEGER NOT NULL DEFAULT 0`},
 		{"max_concurrency", `INTEGER NOT NULL DEFAULT 0`},
+		{"user_id", `INTEGER NOT NULL DEFAULT 0`},
+		{"hint", `TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := s.ensureColumn("api_keys", c[0], c[1]); err != nil {
 			return err
 		}
 	}
 	if err := s.ensureColumn("request_logs", "request_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	// accounts: requests and the rollup carry the key owner's id
+	for _, t := range []string{"request_logs", "request_stats"} {
+		if err := s.ensureColumn(t, "user_id", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(s.db.ddl(`CREATE INDEX IF NOT EXISTS idx_logs_user ON request_logs(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_stats_user ON request_stats(user_id, hour);`)); err != nil {
 		return err
 	}
 	if err := s.migrateOpenCodeSession(); err != nil {
@@ -746,6 +793,15 @@ func (s *Store) buildSnapshotLocked() error {
 	if err != nil {
 		return err
 	}
+	users, err := s.listUsers()
+	if err != nil {
+		return err
+	}
+	byID := make(map[int64]*User, len(users))
+	for _, u := range users {
+		u.PasswordHash = ""
+		byID[u.ID] = u
+	}
 	var captures []*CaptureRule
 	for _, r := range rules {
 		if r.Active(now()) {
@@ -754,6 +810,7 @@ func (s *Store) buildSnapshotLocked() error {
 	}
 	snap := &Snapshot{
 		Captures:    captures,
+		Users:       byID,
 		Alerts:      alerts,
 		Providers:   map[string]*Provider{},
 		Models:      models,
@@ -1314,13 +1371,13 @@ func (s *Store) DeleteModel(id int64) error {
 
 // ---------- api keys ----------
 
-const keyCols = `id, name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at, last_used_at`
+const keyCols = `id, name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at, last_used_at, user_id, hint`
 
 func scanKey(sc interface{ Scan(...any) error }) (*APIKey, error) {
 	k := &APIKey{}
 	var allowed string
 	var enabled int
-	if err := sc.Scan(&k.ID, &k.Name, &k.Key, &enabled, &allowed, &k.ExpiresAt, &k.MonthlyBudget, &k.RPM, &k.TPM, &k.MaxConcurrency, &k.CreatedAt, &k.LastUsedAt); err != nil {
+	if err := sc.Scan(&k.ID, &k.Name, &k.Key, &enabled, &allowed, &k.ExpiresAt, &k.MonthlyBudget, &k.RPM, &k.TPM, &k.MaxConcurrency, &k.CreatedAt, &k.LastUsedAt, &k.UserID, &k.Hint); err != nil {
 		return nil, err
 	}
 	k.Enabled = enabled == 1
@@ -1407,19 +1464,36 @@ func (s *Store) UpdateKey(k *APIKey) error {
 
 // RotateKey replaces a key's value with a newly generated one; the old value
 // stops working immediately.
-func (s *Store) RotateKey(id int64) (string, error) {
+func (s *Store) RotateKey(id int64) (string, error) { return s.rotateKey(id, -1) }
+
+// rotateKey replaces a key's value; userID >= 0 limits it to that user's
+// keys. A hashed key gets a hashed new value.
+func (s *Store) rotateKey(id, userID int64) (string, error) {
 	v := NewAPIKeyValue()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`UPDATE api_keys SET key=? WHERE id=?`, v, id)
-	if err != nil {
+	var stored string
+	q, args := `SELECT key FROM api_keys WHERE id=?`, []any{id}
+	if userID >= 0 {
+		q, args = q+` AND user_id=?`, append(args, userID)
+	}
+	if err := s.db.QueryRow(q, args...).Scan(&stored); errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	} else if err != nil {
 		return "", err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return "", ErrNotFound
+	val, hint := v, ""
+	if strings.HasPrefix(stored, HashedKeyPrefix) {
+		val, hint = HashedKeyPrefix+TokenHash(v), keyHint(v)
+	}
+	if _, err := s.db.Exec(`UPDATE api_keys SET key=?, hint=? WHERE id=?`, val, hint, id); err != nil {
+		return "", err
 	}
 	return v, s.reloadLocked()
 }
+
+// keyHint is the part of a hashed key that stays visible.
+func keyHint(v string) string { return v[:13] + "…" + v[len(v)-4:] }
 
 func (s *Store) DeleteKey(id int64) error {
 	s.mu.Lock()
@@ -1536,7 +1610,10 @@ type Export struct {
 	Providers []*Provider `json:"providers"`
 	Models    []*Model    `json:"models"`
 	Keys      []*APIKey   `json:"api_keys"`
-	Settings  Settings    `json:"settings"`
+	// Users is nil in exports made before accounts existed; importing such
+	// a file keeps the current users.
+	Users    []*User  `json:"users,omitempty"`
+	Settings Settings `json:"settings"`
 	// Alerts is nil in exports made before alerts existed; importing such a
 	// file keeps the current alert configuration.
 	Alerts *AlertConfig `json:"alerts,omitempty"`
@@ -1561,7 +1638,11 @@ func (s *Store) Export() (*Export, error) {
 		x.APIKey = s.sec.seal(x.APIKey)
 	}
 	alerts := s.sec.sealAlerts(s.GetAlerts())
-	return &Export{Version: 1, Providers: p, Models: m, Keys: k, Settings: s.GetSettings(), Alerts: &alerts}, nil
+	users, err := s.listUsers() // with password hashes, so accounts survive a restore
+	if err != nil {
+		return nil, err
+	}
+	return &Export{Version: 1, Providers: p, Models: m, Keys: k, Users: users, Settings: s.GetSettings(), Alerts: &alerts}, nil
 }
 
 // Import replaces the whole configuration (providers, models, keys, settings).
@@ -1578,6 +1659,11 @@ func (s *Store) Import(e *Export) error {
 	for _, m := range e.Models {
 		if err := normalizeModel(m); err != nil {
 			return fmt.Errorf("model %q: %w", m.Name, err)
+		}
+	}
+	for _, u := range e.Users {
+		if err := normalizeUser(u); err != nil {
+			return fmt.Errorf("user %q: %w", u.Username, err)
 		}
 	}
 	if e.Alerts != nil {
@@ -1621,8 +1707,8 @@ func (s *Store) Import(e *Export) error {
 			return fmt.Errorf("api key %q: %w", k.Name, err)
 		}
 		// keep the id: request logs (and so monthly budgets) refer to it
-		cols, args := `name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at`,
-			[]any{k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.MaxConcurrency, t}
+		cols, args := `name, key, enabled, allowed_models, expires_at, monthly_budget, rpm, tpm, max_concurrency, created_at, user_id, hint`,
+			[]any{k.Name, k.Key, b2i(k.Enabled), mustJSON(k.AllowedModels), k.ExpiresAt, k.MonthlyBudget, k.RPM, k.TPM, k.MaxConcurrency, t, k.UserID, k.Hint}
 		if k.ID > 0 {
 			cols, args = "id, "+cols, append([]any{k.ID}, args...)
 		}
@@ -1632,6 +1718,23 @@ func (s *Store) Import(e *Export) error {
 	}
 	if err := tx.resetID("api_keys"); err != nil {
 		return err
+	}
+	if e.Users != nil {
+		// replaced users sign in again
+		for _, q := range []string{`DELETE FROM users`, `DELETE FROM sessions`} {
+			if _, err := tx.Exec(q); err != nil {
+				return err
+			}
+		}
+		for _, u := range e.Users {
+			if _, err := tx.Exec(`INSERT INTO users (id, username, display_name, password_hash, role, enabled, allowed_models, monthly_budget, rpm, tpm, max_keys, remark, created_at, last_login_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				u.ID, u.Username, u.DisplayName, u.PasswordHash, u.Role, b2i(u.Enabled), mustJSON(u.AllowedModels), u.MonthlyBudget, u.RPM, u.TPM, u.MaxKeys, u.Remark, u.CreatedAt, u.LastLoginAt); err != nil {
+				return friendlyErr(err)
+			}
+		}
+		if err := tx.resetID("users"); err != nil {
+			return err
+		}
 	}
 	if e.Settings != (Settings{}) {
 		if _, err := tx.Exec(`INSERT INTO settings (k, v) VALUES ('settings', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, mustJSON(normalizeSettings(e.Settings))); err != nil {

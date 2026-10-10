@@ -8,6 +8,8 @@ const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const TOKEN_KEY = 'ai_route_admin_token';
 let TOKEN = '';
+// ME is the signed-in principal from /me: { role: 'admin' | 'user', user, ... }
+let ME = null;
 try { TOKEN = localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { /* storage unavailable */ }
 
 class ApiError extends Error {
@@ -26,7 +28,9 @@ async function api(method, path, body) {
   try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
   if (res.status === 401) {
     TOKEN = '';
-    renderLogin(t('登录已失效，请重新输入管理令牌'));
+    ME = null;
+    try { localStorage.removeItem(TOKEN_KEY); } catch (e) { /* ignore */ }
+    renderLogin(t('登录已失效，请重新登录'));
     throw new ApiError(401, 'unauthorized');
   }
   if (!res.ok) throw new ApiError(res.status, (data && data.error) || res.statusText);
@@ -140,65 +144,123 @@ function confirmBox(msg) {
 // The preset catalog lives in presets.js (PRESETS, PRESET_CATEGORIES, presetById).
 
 // ---------------------------------------------------------------- shell
-const PAGES = [
-  ['dashboard', t('概览')],
-  ['providers', t('供应商')],
-  ['models', t('模型映射')],
-  ['keys', 'API Keys'],
-  ['logs', t('请求日志')],
-  ['settings', t('设置与接入')],
+const ADMIN_PAGES = [
+  ['dashboard', t('概览'), () => pageDashboard()],
+  ['providers', t('供应商'), () => pageProviders()],
+  ['models', t('模型映射'), () => pageModels()],
+  ['keys', 'API Keys', () => pageKeys()],
+  ['users', t('用户'), () => pageUsers()],
+  ['logs', t('请求日志'), () => pageLogs()],
+  ['settings', t('设置与接入'), () => pageSettings()],
 ];
+const USER_PAGES = [
+  ['overview', t('概览'), () => pageMyOverview()],
+  ['models', t('可用模型'), () => pageMyModels()],
+  ['keys', 'API Keys', () => pageMyKeys()],
+  ['logs', t('请求日志'), () => pageMyLogs()],
+  ['account', t('接入与账号'), () => pageMyAccount()],
+];
+const pagesFor = () => (ME && ME.role === 'admin' ? ADMIN_PAGES : USER_PAGES);
 
+const LOGIN_MODE_KEY = 'ai_route_login_mode';
 function renderLogin(msg) {
   closeModal();
+  let mode = 'account';
+  try { mode = localStorage.getItem(LOGIN_MODE_KEY) === 'token' ? 'token' : 'account'; } catch (e) { /* storage unavailable */ }
   $('#app').innerHTML = `
     <div class="login card">
       <div class="card-head">${t('AI Route 控制台')}${langSwitchHTML()}</div>
       <div class="card-body form">
-        ${msg ? `<div class="err-text small">${esc(msg)}</div>` : ''}
-        <div class="field">
-          <label>${t('管理令牌')}</label>
-          <input type="password" id="login-token" placeholder="${esc(t('ADMIN_TOKEN，或首次启动时日志里打印的 admin-xxx'))}">
-          <div class="help">${t('令牌只保存在本浏览器。')}</div>
+        <div class="seg" id="login-mode"><button type="button" data-m="account">${t('账号登录')}</button><button type="button" data-m="token">${t('管理令牌')}</button></div>
+        <div class="err-text small" id="login-msg">${msg ? esc(msg) : ''}</div>
+        <div id="login-account">
+          <div class="field"><label>${t('用户名')}</label><input type="text" id="login-user" autocomplete="username"></div>
+          <div class="field"><label>${t('密码')}</label><input type="password" id="login-pw" autocomplete="current-password"></div>
         </div>
-        <button class="btn primary" id="login-btn">${t('进入')}</button>
+        <div id="login-token-box">
+          <div class="field">
+            <label>${t('管理令牌')}</label>
+            <input type="password" id="login-token" placeholder="${esc(t('ADMIN_TOKEN，或首次启动时日志里打印的 admin-xxx'))}">
+            <div class="help">${t('令牌只保存在本浏览器。')}</div>
+          </div>
+        </div>
+        <button class="btn primary" id="login-btn">${t('登录')}</button>
       </div>
     </div>`;
   bindLangSwitch($('#app'));
+  const setMode = (m) => {
+    mode = m;
+    try { localStorage.setItem(LOGIN_MODE_KEY, m); } catch (e) { /* ignore */ }
+    $$('#login-mode button').forEach((b) => b.classList.toggle('on', b.dataset.m === m));
+    $('#login-account').style.display = m === 'account' ? '' : 'none';
+    $('#login-token-box').style.display = m === 'token' ? '' : 'none';
+    (m === 'account' ? $('#login-user') : $('#login-token')).focus();
+  };
+  $$('#login-mode button').forEach((b) => b.onclick = () => setMode(b.dataset.m));
+  const fail = (text) => { $('#login-msg').textContent = text; };
+  const enter = (token) => {
+    TOKEN = token;
+    ME = null;
+    try { localStorage.setItem(TOKEN_KEY, TOKEN); } catch (e) { /* ignore */ }
+    renderShell();
+  };
   const go = async () => {
-    TOKEN = $('#login-token').value.trim();
     try {
-      await api('GET', '/ping');
-      try { localStorage.setItem(TOKEN_KEY, TOKEN); } catch (e) { /* ignore */ }
-      renderShell();
-    } catch (e) { /* api() re-renders login on 401 */ }
+      if (mode === 'account') {
+        const res = await fetch('/admin/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: $('#login-user').value.trim(), password: $('#login-pw').value }) });
+        if (res.status === 401) return fail(t('用户名或密码错误'));
+        if (res.status === 429) return fail(t('失败次数太多，请稍后再试'));
+        if (!res.ok) return fail(t('登录失败：HTTP {status}', { status: res.status }));
+        enter((await res.json()).token);
+      } else {
+        const tok = $('#login-token').value.trim();
+        const res = await fetch('/admin/api/me', { headers: { Authorization: 'Bearer ' + tok } });
+        if (res.status === 401) return fail(t('管理令牌不对'));
+        if (res.status === 429) return fail(t('失败次数太多，请稍后再试'));
+        if (!res.ok) return fail(t('登录失败：HTTP {status}', { status: res.status }));
+        enter(tok);
+      }
+    } catch (e) { fail(e.message); }
   };
   $('#login-btn').onclick = go;
-  $('#login-token').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
-  $('#login-token').focus();
+  ['#login-user', '#login-pw', '#login-token'].forEach((s) => $(s).addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); }));
+  setMode(mode);
 }
 
 // the gateway's own User-Agent fingerprint (ai-route/<version>)
 let PLATFORM_UA = 'ai-route';
 
-function renderShell() {
-  api('GET', '/ping').then((r) => {
-    if (r.user_agent) PLATFORM_UA = r.user_agent;
-    if (r.version && $('#brand-ver')) $('#brand-ver').textContent = 'v' + r.version;
-  }).catch(() => {});
+let shellLoading = false;
+async function renderShell() {
+  if (shellLoading) return;
+  shellLoading = true;
+  try {
+    ME = await api('GET', '/me');
+  } catch (e) {
+    if (e.status !== 401) $('#app').innerHTML = `<div class="empty err-text">${t('加载失败：{msg}', { msg: esc(e.message) })}</div>`;
+    return;
+  } finally { shellLoading = false; }
+  const admin = ME.role === 'admin';
+  if (admin) {
+    api('GET', '/ping').then((r) => { if (r.user_agent) PLATFORM_UA = r.user_agent; }).catch(() => {});
+  }
+  const who = ME.user ? (ME.user.display_name || ME.user.username) : t('管理令牌');
   $('#app').innerHTML = `
     <div class="layout">
       <aside class="sidebar">
-        <div class="brand"><span class="dot"></span>AI Route <span class="muted small" id="brand-ver"></span></div>
-        <nav class="nav">${PAGES.map(([id, name]) => `<a href="#/${id}" data-page="${id}">${name}</a>`).join('')}</nav>
-        <div class="foot">${langSwitchHTML()}<button class="btn sm" id="logout">${t('退出登录')}</button></div>
+        <div class="brand"><span class="dot"></span>AI Route <span class="muted small" id="brand-ver">${ME.version ? 'v' + esc(ME.version) : ''}</span></div>
+        <nav class="nav">${pagesFor().map(([id, name]) => `<a href="#/${id}" data-page="${id}">${name}</a>`).join('')}</nav>
+        <div class="foot"><div class="muted small" style="margin-bottom:6px">${esc(who)}${admin && ME.user ? ` · ${t('管理员')}` : ''}</div>${langSwitchHTML()}<button class="btn sm" id="logout">${t('退出登录')}</button></div>
       </aside>
       <main class="main" id="page"></main>
     </div>`;
   bindLangSwitch($('#app'));
-  $('#logout').onclick = () => {
+  $('#logout').onclick = async () => {
+    try { await api('POST', '/logout'); } catch (e) { /* signed out anyway */ }
     try { localStorage.removeItem(TOKEN_KEY); } catch (e) { /* ignore */ }
     TOKEN = '';
+    ME = null;
     renderLogin();
   };
   route();
@@ -207,13 +269,14 @@ function renderShell() {
 let refreshTimer = null;
 function route() {
   if (!TOKEN) return renderLogin();
-  if (!$('#page')) return renderShell();
+  if (!ME || !$('#page')) return renderShell();
   clearInterval(refreshTimer);
-  const id = (location.hash.replace(/^#\//, '') || 'dashboard').split('?')[0];
-  $$('.nav a').forEach((a) => a.classList.toggle('active', a.dataset.page === id));
-  const fn = { dashboard: pageDashboard, providers: pageProviders, models: pageModels, keys: pageKeys, logs: pageLogs, settings: pageSettings }[id] || pageDashboard;
+  const pages = pagesFor();
+  const id = (location.hash.replace(/^#\//, '') || pages[0][0]).split('?')[0];
+  const page = pages.find((p) => p[0] === id) || pages[0];
+  $$('.nav a').forEach((a) => a.classList.toggle('active', a.dataset.page === page[0]));
   $('#page').innerHTML = `<div class="empty">${t('加载中…')}</div>`;
-  fn().catch((e) => {
+  page[2]().catch((e) => {
     if (e.status !== 401) $('#page').innerHTML = `<div class="empty err-text">${t('加载失败：{msg}', { msg: esc(e.message) })}</div>`;
   });
 }
@@ -1250,6 +1313,8 @@ function modelTest(m) {
 
 // ---------------------------------------------------------------- keys
 function maskApiKey(k) { return k.length > 14 ? k.slice(0, 10) + '••••••' + k.slice(-4) : k; }
+// keyLabel shows a key: masked, or its hint when only the hash is stored
+const keyLabel = (k) => (k.key ? maskApiKey(k.key) : k.hint || '');
 
 async function pageKeys() {
   const [keys, models, st] = await Promise.all([api('GET', '/keys'), api('GET', '/models'), api('GET', '/settings')]);
@@ -1275,7 +1340,7 @@ async function pageKeys() {
           const expired = k.expires_at && k.expires_at < Date.now();
           return `<tr>
             <td>${esc(k.name || '-')}</td>
-            <td class="mono small"><span class="copy" data-copy="${esc(k.key)}" title="${esc(t('点击复制完整 Key'))}">${esc(maskApiKey(k.key))}</span></td>
+            <td class="mono small">${k.key ? `<span class="copy" data-copy="${esc(k.key)}" title="${esc(t('点击复制完整 Key'))}">${esc(maskApiKey(k.key))}</span>` : `<span title="${esc(t('用户自己创建的 Key 只存哈希，看不到完整值'))}">${esc(k.hint)}</span>`}${k.owner ? `<div class="muted">${t('用户：{name}', { name: esc(k.owner) })}</div>` : ''}</td>
             <td class="small">${k.allowed_models.length ? k.allowed_models.map((x) => `<span class="badge">${esc(x)}</span>`).join(' ') : `<span class="muted">${t('全部')}</span>`}</td>
             <td class="small">${spendHTML(k)}</td>
             <td class="small">${limitsHTML(k)}</td>
@@ -1283,7 +1348,7 @@ async function pageKeys() {
             <td class="small">${fmtAgo(k.last_used_at)}</td>
             <td>${!k.enabled ? `<span class="badge">${t('停用')}</span>` : expired ? `<span class="badge err">${t('已过期')}</span>` : `<span class="badge ok">${t('启用')}</span>`}</td>
             <td><div class="btns">
-              <button class="btn sm" data-copy="${esc(k.key)}">${t('复制')}</button>
+              ${k.key ? `<button class="btn sm" data-copy="${esc(k.key)}">${t('复制')}</button>` : ''}
               <button class="btn sm" data-edit="${k.id}">${t('编辑')}</button>
               <button class="btn sm danger" data-del="${k.id}">${t('删除')}</button>
             </div></td></tr>`;
@@ -1295,7 +1360,7 @@ async function pageKeys() {
   $$('[data-edit]').forEach((b) => b.onclick = () => keyForm(keys.find((k) => k.id == b.dataset.edit), models, st));
   $$('[data-del]').forEach((b) => b.onclick = async () => {
     const k = keys.find((x) => x.id == b.dataset.del);
-    if (!(await confirmBox(t('删除 Key {name}？使用它的客户端会立即无法访问。', { name: k.name || maskApiKey(k.key) })))) return;
+    if (!(await confirmBox(t('删除 Key {name}？使用它的客户端会立即无法访问。', { name: k.name || keyLabel(k) })))) return;
     await api('DELETE', '/keys/' + k.id);
     toast(t('已删除'), 'ok');
     route();
@@ -1308,10 +1373,10 @@ function toLocalInput(ms) {
   return d.toISOString().slice(0, 16);
 }
 
-function showNewKey(title, key) {
+function showNewKey(title, key, once) {
   openModal({
     title,
-    body: `<div class="form"><div>${t('请复制并妥善保存：')}</div><pre class="box mono">${esc(key)}</pre></div>`,
+    body: `<div class="form"><div>${once ? t('请立即复制并妥善保存，关闭后无法再次查看：') : t('请复制并妥善保存：')}</div><pre class="box mono">${esc(key)}</pre></div>`,
     foot: `<button class="btn primary" id="kc-copy">${t('复制')}</button><button class="btn" data-close>${t('完成')}</button>`,
     onMount: (m2) => { $('#kc-copy', m2).onclick = () => copyText(key); },
   });
@@ -1327,7 +1392,8 @@ function keyForm(k, models, st) {
       <div class="field"><label>${t('名称')}</label><input type="text" id="kf-name" value="${esc(k.name)}" placeholder="${esc(t('如 张三-ClaudeCode'))}"></div>
       <div class="field"><label>Key</label>${isNew
         ? `<div class="help">${t('保存后由平台自动生成（sk-route-…），不支持自定义')}</div>`
-        : `<div class="toolbar"><code class="mono">${esc(maskApiKey(k.key))}</code><button type="button" class="btn sm danger" id="kf-rotate">${t('重新生成')}</button></div><div class="help">${t('重新生成后旧 Key 立即失效')}</div>`}</div>
+        : k.key ? `<div class="toolbar"><code class="mono">${esc(maskApiKey(k.key))}</code><button type="button" class="btn sm danger" id="kf-rotate">${t('重新生成')}</button></div><div class="help">${t('重新生成后旧 Key 立即失效')}</div>`
+          : `<div class="toolbar"><code class="mono">${esc(k.hint)}</code></div><div class="help">${t('用户 {name} 自己创建的 Key，只有该用户能重新生成', { name: esc(k.owner) })}</div>`}</div>
       <div class="field"><label>${t('到期时间（可选）')}</label><input type="datetime-local" id="kf-exp" value="${toLocalInput(k.expires_at)}"></div>
       <div class="row3">
         <div class="field"><label>${t('月预算（{sign}，可选）', { sign })}</label><input type="number" id="kf-budget" min="0" step="any" value="${k.monthly_budget || ''}" placeholder="${esc(t('不限'))}"><div class="help">${t('本月费用达到后拒绝请求（402），每月 1 日恢复；按“设置与接入”里的统计货币计')}</div></div>
@@ -1344,7 +1410,7 @@ function keyForm(k, models, st) {
     </div>`,
     foot: `<button class="btn" data-close>${t('取消')}</button><button class="btn primary" id="kf-save">${t('保存')}</button>`,
     onMount: (root) => {
-      if (!isNew) $('#kf-rotate', root).onclick = async () => {
+      if ($('#kf-rotate', root)) $('#kf-rotate', root).onclick = async () => {
         if (!(await confirmBox(t('重新生成 {name}？旧 Key 会立即失效，使用它的客户端需要更新配置。', { name: k.name || 'Key' })))) return;
         try {
           const r = await api('POST', `/keys/${k.id}/rotate`);
@@ -1482,7 +1548,7 @@ async function captureForm(models, caps) {
     body: `<div class="form">
       <div class="hint-box small">${t('接下来匹配的请求会完整保存：客户端发来的请求、每次发给上游的请求和上游的响应、最后返回给客户端的内容。用来排查客户端兼容和协议转换问题。报文含完整的提示词，只有管理员能看，{h} 小时后自动删除{enc}。', { h: caps.retention_hours, enc: caps.encrypted ? t('，落库时用 SECRET_KEY 加密') : '' })}</div>
       <div class="row2">
-        <div class="field"><label>API Key</label><select id="cp-key"><option value="0">${t('全部 Key')}</option>${keys.map((k) => `<option value="${k.id}">${esc(k.name || maskApiKey(k.key))}</option>`).join('')}</select></div>
+        <div class="field"><label>API Key</label><select id="cp-key"><option value="0">${t('全部 Key')}</option>${keys.map((k) => `<option value="${k.id}">${esc(k.name || keyLabel(k))}</option>`).join('')}</select></div>
         <div class="field"><label>${t('模型')}</label><select id="cp-model"><option value="">${t('全部模型')}</option>${models.map((m) => `<option>${esc(m.name)}</option>`).join('')}</select></div>
       </div>
       <div class="row2">
@@ -1845,18 +1911,20 @@ function setupWizard(box, origin, keys, models) {
     if (!ms.some((m) => m.name === state.small)) state.small = (ms.find((m) => (m.tags || []).includes('fast')) || ms[0] || {}).name || '';
     const client = CLIENTS.find((c) => c.id === state.client);
     const k = enabledKeys.find((x) => x.id == state.key);
-    const keyValue = k ? k.key : 'sk-route-xxxx';
-    const shown = state.reveal || !k ? keyValue : maskApiKey(keyValue);
+    // keys stored as hashes (users' own) cannot be filled in
+    const keyValue = k && k.key ? k.key : 'sk-route-xxxx';
+    const shown = state.reveal || !k || !k.key ? keyValue : maskApiKey(keyValue);
     const snippets = clientSnippets(state.client, origin, keyValue, state.model || t('模型名'), state.small || state.model || t('模型名'));
     box.innerHTML = `
       <div class="muted small" style="margin-bottom:8px">${t('选好客户端、Key 和模型，复制下面生成的配置即可。')}</div>
       <div class="seg" id="wz-client">${CLIENTS.map((c) => `<button type="button" data-c="${c.id}" class="${c.id === state.client ? 'on' : ''}">${esc(c.label)}</button>`).join('')}</div>
       <div class="row3" style="margin-top:10px">
-        <div class="field"><label>API Key</label><select id="wz-key">${enabledKeys.length ? enabledKeys.map((x) => `<option value="${x.id}" ${x.id == state.key ? 'selected' : ''}>${esc(x.name || maskApiKey(x.key))}</option>`).join('') : `<option value="0">${t('还没有可用的 Key，先到 API Keys 创建')}</option>`}</select></div>
+        <div class="field"><label>API Key</label><select id="wz-key">${enabledKeys.length ? enabledKeys.map((x) => `<option value="${x.id}" ${x.id == state.key ? 'selected' : ''}>${esc(x.name || keyLabel(x))}</option>`).join('') : `<option value="0">${t('还没有可用的 Key，先到 API Keys 创建')}</option>`}</select></div>
         <div class="field"><label>${t('模型')}</label><select id="wz-model">${ms.map((m) => `<option ${m.name === state.model ? 'selected' : ''}>${esc(m.name)}</option>`).join('') || `<option value="">${t('没有可用模型')}</option>`}</select></div>
         ${client.small ? `<div class="field"><label>${t('后台小模型（Haiku 位）')}</label><select id="wz-small">${ms.map((m) => `<option ${m.name === state.small ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></div>` : '<div></div>'}
       </div>
-      <label class="check small"><input type="checkbox" id="wz-reveal" ${state.reveal ? 'checked' : ''}> ${t('预览里显示完整 Key（复制时总是完整的）')}</label>
+      ${k && !k.key ? `<div class="hint-box small">${t('Key 只在创建时显示过一次：把下面的 sk-route-xxxx 换成你保存的 {hint}', { hint: esc(k.hint) })}</div>`
+        : `<label class="check small"><input type="checkbox" id="wz-reveal" ${state.reveal ? 'checked' : ''}> ${t('预览里显示完整 Key（复制时总是完整的）')}</label>`}
       ${snippets.map((sn, i) => `
         <div class="snippet">
           <div class="toolbar"><span class="muted small">${esc(sn.title)}</span><button type="button" class="btn sm" data-copy-i="${i}" style="margin-left:auto">${t('复制')}</button></div>
@@ -1866,7 +1934,7 @@ function setupWizard(box, origin, keys, models) {
     $('#wz-key', box).onchange = (e) => { state.key = e.target.value; render(); };
     $('#wz-model', box).onchange = (e) => { state.model = e.target.value; render(); };
     if ($('#wz-small', box)) $('#wz-small', box).onchange = (e) => { state.small = e.target.value; render(); };
-    $('#wz-reveal', box).onchange = (e) => { state.reveal = e.target.checked; render(); };
+    if ($('#wz-reveal', box)) $('#wz-reveal', box).onchange = (e) => { state.reveal = e.target.checked; render(); };
     $$('[data-copy-i]', box).forEach((b) => b.onclick = () => copyText(snippets[Number(b.dataset.copyI)].text));
   };
   render();

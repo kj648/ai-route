@@ -3,7 +3,6 @@
 package admin
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -193,7 +192,9 @@ func (a *Admin) Register(mux *http.ServeMux) {
 	api.HandleFunc("GET /admin/api/export", a.export)
 	api.HandleFunc("POST /admin/api/import", a.importConfig)
 
-	mux.Handle("/admin/api/", a.auth(api))
+	a.registerUserAdmin(api)
+	a.registerAccounts(mux) // sign-in and a user's own pages, outside the admin-only API
+	mux.Handle("/admin/api/", a.authAs(true, api))
 
 	static := http.FileServerFS(a.web)
 	// no-cache: embedded files carry no modification time, so without it
@@ -216,29 +217,8 @@ func (a *Admin) Register(mux *http.ServeMux) {
 	})
 }
 
-// Protect wraps a handler in the admin token check (used for /metrics).
-func (a *Admin) Protect(next http.Handler) http.Handler { return a.auth(next) }
-
-func (a *Admin) auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(tok), []byte(a.token)) == 1 {
-			// the right token is never locked out: behind a shared NAT or an
-			// untrusted proxy, someone else's failures must not shut the
-			// real administrator out
-			next.ServeHTTP(w, r)
-			return
-		}
-		ip := a.clientIP(r)
-		if locked, left := a.tooManyFailures(ip); locked {
-			w.Header().Set("Retry-After", strconv.Itoa(int(left.Seconds())+1))
-			writeErr(w, http.StatusTooManyRequests, errors.New("too many failed logins, try again later"))
-			return
-		}
-		a.recordFailure(ip)
-		writeErr(w, http.StatusUnauthorized, errors.New("unauthorized"))
-	})
-}
+// Protect wraps a handler in the administrator check (used for /metrics).
+func (a *Admin) Protect(next http.Handler) http.Handler { return a.authAs(true, next) }
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -522,10 +502,19 @@ func (a *Admin) listKeys(w http.ResponseWriter, r *http.Request) {
 	type keyView struct {
 		*store.APIKey
 		MonthCost float64 `json:"month_cost"` // month-to-date, display currency
+		Owner     string  `json:"owner"`      // username of the creating user, "" = administrator
 	}
+	users := a.store.Snapshot().Users
 	out := make([]keyView, 0, len(ks))
 	for _, k := range ks {
-		out = append(out, keyView{k, spend[k.ID]})
+		owner := ""
+		if u := users[k.UserID]; u != nil {
+			owner = u.Username
+		}
+		if k.Hashed() {
+			k.Key = "" // only the user ever saw the value
+		}
+		out = append(out, keyView{k, spend[k.ID], owner})
 	}
 	writeJSON(w, out)
 }
@@ -626,19 +615,25 @@ func (a *Admin) logs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"total": total, "items": logs})
 }
 
-func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
-	var d, bucket time.Duration
-	rng := r.URL.Query().Get("range")
+// statsRange maps a range name to its length and bucket size.
+func statsRange(rng string) (d, bucket time.Duration) {
 	switch rng {
 	case "1h":
-		d, bucket = time.Hour, 5*time.Minute
+		return time.Hour, 5 * time.Minute
 	case "7d":
-		d, bucket = 7*24*time.Hour, 6*time.Hour
+		return 7 * 24 * time.Hour, 6 * time.Hour
 	case "30d":
-		d, bucket = 30*24*time.Hour, 24*time.Hour
-	default:
-		rng, d, bucket = "24h", 24*time.Hour, time.Hour // cache by the effective range
+		return 30 * 24 * time.Hour, 24 * time.Hour
 	}
+	return 24 * time.Hour, time.Hour
+}
+
+func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
+	rng := r.URL.Query().Get("range")
+	if rng != "1h" && rng != "7d" && rng != "30d" {
+		rng = "24h" // cache by the effective range
+	}
+	d, bucket := statsRange(rng)
 	st, err := a.cachedStats(rng, time.Now().Add(-d).UnixMilli(), bucket.Milliseconds())
 	if err != nil {
 		writeErr(w, 500, err)

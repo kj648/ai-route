@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS request_stats (
 	latency_ms INTEGER NOT NULL DEFAULT 0,
 	ttfb_ms INTEGER NOT NULL DEFAULT 0,
 	ttfb_n INTEGER NOT NULL DEFAULT 0,
+	user_id INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (hour, key_id, key_name, public_model, provider, upstream_model)
 );
 CREATE INDEX IF NOT EXISTS idx_stats_key ON request_stats(key_id, hour);
@@ -47,23 +48,24 @@ CREATE INDEX IF NOT EXISTS idx_stats_provider ON request_stats(provider, hour);
 // statsUpsert adds a group's counters to its rollup row (the existing row
 // is qualified with the table name: PostgreSQL finds a bare column name
 // ambiguous, SQLite accepts both).
-const statsUpsert = `INSERT INTO request_stats (hour, key_id, key_name, public_model, provider, upstream_model, requests, success, fallback, input_tokens, output_tokens, cached_tokens, cost_usd, cost_cny, unpriced, latency_ms, ttfb_ms, ttfb_n)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+const statsUpsert = `INSERT INTO request_stats (hour, key_id, key_name, public_model, provider, upstream_model, requests, success, fallback, input_tokens, output_tokens, cached_tokens, cost_usd, cost_cny, unpriced, latency_ms, ttfb_ms, ttfb_n, user_id)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(hour, key_id, key_name, public_model, provider, upstream_model) DO UPDATE SET
 	requests = request_stats.requests + excluded.requests, success = request_stats.success + excluded.success, fallback = request_stats.fallback + excluded.fallback, input_tokens = request_stats.input_tokens + excluded.input_tokens, output_tokens = request_stats.output_tokens + excluded.output_tokens, cached_tokens = request_stats.cached_tokens + excluded.cached_tokens, cost_usd = request_stats.cost_usd + excluded.cost_usd, cost_cny = request_stats.cost_cny + excluded.cost_cny, unpriced = request_stats.unpriced + excluded.unpriced, latency_ms = request_stats.latency_ms + excluded.latency_ms, ttfb_ms = request_stats.ttfb_ms + excluded.ttfb_ms, ttfb_n = request_stats.ttfb_n + excluded.ttfb_n`
 
 // statsBackfill rebuilds the rollup from request_logs.
-const statsBackfill = `INSERT INTO request_stats (hour, key_id, key_name, public_model, provider, upstream_model, requests, success, fallback, input_tokens, output_tokens, cached_tokens, cost_usd, cost_cny, unpriced, latency_ms, ttfb_ms, ttfb_n)
+const statsBackfill = `INSERT INTO request_stats (hour, key_id, key_name, public_model, provider, upstream_model, requests, success, fallback, input_tokens, output_tokens, cached_tokens, cost_usd, cost_cny, unpriced, latency_ms, ttfb_ms, ttfb_n, user_id)
 SELECT (created_at / 3600000) * 3600000, key_id, key_name, public_model, provider, upstream_model,
 	COUNT(*), SUM(success), SUM(fallback), SUM(input_tokens), SUM(output_tokens), SUM(cached_tokens),
 	SUM(CASE WHEN currency = 'USD' THEN cost ELSE 0 END), SUM(CASE WHEN currency = 'CNY' THEN cost ELSE 0 END),
 	SUM(CASE WHEN cost_source = '' AND input_tokens + output_tokens > 0 THEN 1 ELSE 0 END),
-	SUM(latency_ms), SUM(CASE WHEN ttfb_ms > 0 THEN ttfb_ms ELSE 0 END), SUM(CASE WHEN ttfb_ms > 0 THEN 1 ELSE 0 END)
+	SUM(latency_ms), SUM(CASE WHEN ttfb_ms > 0 THEN ttfb_ms ELSE 0 END), SUM(CASE WHEN ttfb_ms > 0 THEN 1 ELSE 0 END), MAX(user_id)
 FROM request_logs GROUP BY 1, 2, 3, 4, 5, 6`
 
 type statKey struct {
 	hour, keyID                         int64
 	keyName, model, provider, upstreamM string
+	userID                              int64 // follows from keyID; not part of the primary key
 }
 
 // statGroup holds one row of counters, either from the rollup or from a
@@ -91,7 +93,7 @@ func (g *statGroup) add(o *statGroup) {
 // groupOf turns a log line into its rollup key and counters.
 func groupOf(l *RequestLog) (statKey, statGroup) {
 	k := statKey{hour: l.CreatedAt - l.CreatedAt%hourMs, keyID: l.KeyID, keyName: l.KeyName,
-		model: l.PublicModel, provider: l.Provider, upstreamM: l.UpstreamModel}
+		model: l.PublicModel, provider: l.Provider, upstreamM: l.UpstreamModel, userID: l.UserID}
 	g := statGroup{requests: 1, in: l.InputTokens, out: l.OutputTokens, cached: l.CachedTokens, latency: l.LatencyMs}
 	if l.Success {
 		g.success = 1
@@ -137,7 +139,7 @@ func (s *Store) upsertStats(tx *txx, batch []RequestLog) error {
 	for _, k := range order {
 		g := groups[k]
 		if _, err := stmt.Exec(k.hour, k.keyID, k.keyName, k.model, k.provider, k.upstreamM,
-			g.requests, g.success, g.fallback, g.in, g.out, g.cached, g.usd, g.cny, g.unpriced, g.latency, g.ttfbSum, g.ttfbN); err != nil {
+			g.requests, g.success, g.fallback, g.in, g.out, g.cached, g.usd, g.cny, g.unpriced, g.latency, g.ttfbSum, g.ttfbN, k.userID); err != nil {
 			return err
 		}
 	}
@@ -232,6 +234,11 @@ func sortedRows(m map[string]*statAcc) []StatRow {
 // (since is rounded down to the hour); shorter ones scan the raw logs.
 // Costs are converted to the display currency.
 func (s *Store) GetStats(since int64, bucketMs int64) (*Stats, error) {
+	return s.GetUserStats(since, bucketMs, 0)
+}
+
+// GetUserStats is GetStats for one user's requests (userID 0 = everyone).
+func (s *Store) GetUserStats(since int64, bucketMs int64, userID int64) (*Stats, error) {
 	settings := s.GetSettings()
 	usd, cny := settings.CurrencyFactors()
 	st := &Stats{Since: since, BucketMs: bucketMs, Currency: settings.Currency}
@@ -267,9 +274,9 @@ func (s *Store) GetStats(since int64, bucketMs int64) (*Stats, error) {
 	}
 	var err error
 	if bucketMs >= hourMs {
-		err = s.scanStatsRollup(since-since%hourMs, fold)
+		err = s.scanStatsRollup(since-since%hourMs, userID, fold)
 	} else {
-		err = s.scanStatsRaw(since, fold)
+		err = s.scanStatsRaw(since, userID, fold)
 	}
 	if err != nil {
 		return nil, err
@@ -292,10 +299,19 @@ func (s *Store) GetStats(since int64, bucketMs int64) (*Stats, error) {
 	return st, nil
 }
 
-func (s *Store) scanStatsRollup(since int64, fold func(int64, statKey, *statGroup)) error {
+// userFilter narrows a stats query to one user.
+func userFilter(userID int64, args ...any) (string, []any) {
+	if userID <= 0 {
+		return "", args
+	}
+	return " AND user_id = ?", append(args, userID)
+}
+
+func (s *Store) scanStatsRollup(since, userID int64, fold func(int64, statKey, *statGroup)) error {
+	cond, args := userFilter(userID, since)
 	rows, err := s.db.Query(`SELECT hour, key_id, key_name, public_model, provider, upstream_model, requests, success, fallback,
 		input_tokens, output_tokens, cached_tokens, cost_usd, cost_cny, unpriced, latency_ms, ttfb_ms, ttfb_n
-		FROM request_stats WHERE hour >= ?`, since)
+		FROM request_stats WHERE hour >= ?`+cond, args...)
 	if err != nil {
 		return err
 	}
@@ -312,10 +328,11 @@ func (s *Store) scanStatsRollup(since int64, fold func(int64, statKey, *statGrou
 	return rows.Err()
 }
 
-func (s *Store) scanStatsRaw(since int64, fold func(int64, statKey, *statGroup)) error {
+func (s *Store) scanStatsRaw(since, userID int64, fold func(int64, statKey, *statGroup)) error {
+	cond, args := userFilter(userID, since)
 	rows, err := s.db.Query(`SELECT created_at, key_id, key_name, public_model, provider, upstream_model, success, fallback,
 		input_tokens, output_tokens, cached_tokens, latency_ms, ttfb_ms, cost, currency, cost_source
-		FROM request_logs WHERE created_at >= ?`, since)
+		FROM request_logs WHERE created_at >= ?`+cond, args...)
 	if err != nil {
 		return err
 	}

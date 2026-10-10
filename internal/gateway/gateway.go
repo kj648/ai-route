@@ -138,20 +138,26 @@ func clientKey(r *http.Request) string {
 	return ""
 }
 
-func (g *Gateway) authenticate(r *http.Request, snap *store.Snapshot) (*store.APIKey, int, string) {
+// authenticate finds the caller's API key and the user owning it (nil
+// for the administrator's keys).
+func (g *Gateway) authenticate(r *http.Request, snap *store.Snapshot) (*store.APIKey, *store.User, int, string) {
 	raw := clientKey(r)
 	if raw == "" {
-		return nil, http.StatusUnauthorized, "missing API key"
+		return nil, nil, http.StatusUnauthorized, "missing API key"
 	}
-	k, ok := snap.Keys[raw]
+	k, ok := snap.LookupKey(raw)
 	if !ok || !k.Enabled {
-		return nil, http.StatusUnauthorized, "invalid API key"
+		return nil, nil, http.StatusUnauthorized, "invalid API key"
 	}
 	if k.ExpiresAt > 0 && time.Now().UnixMilli() > k.ExpiresAt {
-		return nil, http.StatusUnauthorized, "API key expired"
+		return nil, nil, http.StatusUnauthorized, "API key expired"
+	}
+	owner := snap.KeyUser(k)
+	if k.UserID != 0 && (owner == nil || !owner.Enabled) {
+		return nil, nil, http.StatusUnauthorized, "the account of this API key is disabled"
 	}
 	g.touch(k.ID)
-	return k, 0, ""
+	return k, owner, 0, ""
 }
 
 func (g *Gateway) touch(id int64) {
@@ -166,7 +172,11 @@ func (g *Gateway) touch(id int64) {
 	go g.store.TouchKey(id)
 }
 
-func keyAllows(k *store.APIKey, model string) bool {
+// keyAllows reports whether a key, and the user owning it, may use a model.
+func keyAllows(k *store.APIKey, owner *store.User, model string) bool {
+	if !owner.Allows(model) {
+		return false
+	}
 	if k == nil || len(k.AllowedModels) == 0 {
 		return true
 	}
@@ -277,14 +287,14 @@ func (g *Gateway) plan(snap *store.Snapshot, m *store.Model, inbound, affinity s
 
 func (g *Gateway) handle(w http.ResponseWriter, r *http.Request, inbound string) {
 	snap := g.store.Snapshot()
-	key, status, msg := g.authenticate(r, snap)
+	key, owner, status, msg := g.authenticate(r, snap)
 	if key == nil {
 		writeError(w, inbound, status, msg)
 		return
 	}
 	// limits first: a rejected request costs neither a body read nor a
 	// large log row
-	if rej := g.Limiter.Admit(key); rej != nil {
+	if rej := g.Limiter.Admit(key, owner); rej != nil {
 		g.reject(w, r, inbound, key, rej)
 		return
 	}
@@ -297,7 +307,7 @@ func (g *Gateway) handle(w http.ResponseWriter, r *http.Request, inbound string)
 	if !ok {
 		return
 	}
-	g.route(w, r, inbound, body, key)
+	g.route(w, r, inbound, body, key, owner)
 }
 
 // readBody reads the request body with a size cap and a deadline.
@@ -320,7 +330,7 @@ func readBody(w http.ResponseWriter, r *http.Request, inbound string) ([]byte, b
 // reject answers a request refused by the key's limits and logs it.
 func (g *Gateway) reject(w http.ResponseWriter, r *http.Request, inbound string, key *store.APIKey, rej *rejection) {
 	g.log(&store.RequestLog{
-		CreatedAt: time.Now().UnixMilli(), KeyID: key.ID, KeyName: key.Name,
+		CreatedAt: time.Now().UnixMilli(), KeyID: key.ID, KeyName: key.Name, UserID: key.UserID,
 		Inbound: inbound, HTTPStatus: rej.status, Error: rej.msg, ClientIP: g.clientIP(r),
 	})
 	if rej.retryAfter > 0 {
@@ -330,13 +340,14 @@ func (g *Gateway) reject(w http.ResponseWriter, r *http.Request, inbound string,
 }
 
 // route resolves the public model and tries its targets in order.
-func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, body []byte, key *store.APIKey) (entry *store.RequestLog) {
+func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, body []byte, key *store.APIKey, owner *store.User) (entry *store.RequestLog) {
 	start := time.Now()
 	snap := g.store.Snapshot()
 	entry = &store.RequestLog{
 		CreatedAt: start.UnixMilli(),
 		KeyID:     key.ID,
 		KeyName:   key.Name,
+		UserID:    key.UserID,
 		Inbound:   inbound,
 		ClientIP:  g.clientIP(r),
 		RequestID: newRequestID(),
@@ -347,7 +358,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		// count usage before queueing the log: a concurrent budget reload
 		// replaces the cached spend with the logged total, so a request is
 		// never counted twice (at worst missed until the next reload)
-		g.Limiter.Record(key, entry)
+		g.Limiter.Record(key, owner, entry)
 		g.Quotas.Record(entry)
 		g.log(entry)
 	}()
@@ -374,7 +385,7 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		return
 	}
 	entry.PublicModel = m.Name
-	if !keyAllows(key, m.Name) {
+	if !keyAllows(key, owner, m.Name) {
 		entry.HTTPStatus, entry.Error = 403, "model not allowed for key"
 		writeError(w, inbound, http.StatusForbidden, fmt.Sprintf("this API key may not use model %q", m.Name))
 		return
@@ -524,7 +535,11 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		} else if strings.Contains(a.Error, "timeout") {
 			st = "timeout"
 		}
-		parts = append(parts, a.Target+" "+st)
+		if key.UserID != 0 {
+			parts = append(parts, st) // accounts are not told where requests are routed
+		} else {
+			parts = append(parts, a.Target+" "+st)
+		}
 	}
 	entry.HTTPStatus = lastStatus
 	entry.Error = lastMsg
@@ -534,6 +549,34 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 	writeError(w, inbound, lastStatus, fmt.Sprintf("all upstream targets failed (%s); see request %s in the gateway log",
 		strings.Join(parts, ", "), entry.RequestID))
 	return entry
+}
+
+// hidesUpstream reports whether the caller must not learn where the
+// request was routed: requests made with a user's own keys.
+func hidesUpstream(ctx context.Context) bool {
+	m := metaFrom(ctx)
+	return m != nil && m.Key != nil && m.Key.UserID != 0
+}
+
+// setTargetHeader tells the administrator's keys which target answered.
+func setTargetHeader(h http.Header, ctx context.Context, target string) {
+	if !hidesUpstream(ctx) {
+		h.Set("X-Route-Target", target)
+	}
+}
+
+// maskModel replaces the upstream model name in a passed-through response
+// ("model": "<upstream>") with the public one.
+func maskModel(data, upstream, public string) string {
+	if upstream == public || !strings.Contains(data, upstream) {
+		return data
+	}
+	u, _ := json.Marshal(upstream)
+	p, _ := json.Marshal(public)
+	for _, sep := range []string{`:`, `: `} {
+		data = strings.ReplaceAll(data, `"model"`+sep+string(u), `"model"`+sep+string(p))
+	}
+	return data
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
@@ -906,8 +949,11 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 		if err != nil {
 			return fail(502, failSoft, "convert response: "+err.Error())
 		}
+		if hidesUpstream(parent) {
+			out = []byte(maskModel(string(out), c.model, publicModel))
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Route-Target", c.target)
+		setTargetHeader(w.Header(), parent, c.target)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(out)
 		res.committed = true
@@ -942,7 +988,7 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
-	h.Set("X-Route-Target", c.target)
+	setTargetHeader(h, parent, c.target)
 	committed.Store(true)
 	w.WriteHeader(http.StatusOK)
 	res.committed = true
@@ -950,9 +996,15 @@ func (g *Gateway) try(parent context.Context, w http.ResponseWriter, r *http.Req
 	rc := http.NewResponseController(w)
 
 	emitted := 0
+	hide := hidesUpstream(parent)
 	emit := func(evs []convert.SSEEvent) bool {
 		if len(evs) == 0 {
 			return true
+		}
+		if hide {
+			for i := range evs {
+				evs[i].Data = maskModel(evs[i].Data, c.model, publicModel)
+			}
 		}
 		// a client that stops reading must not hold the stream forever
 		_ = rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
@@ -1051,14 +1103,14 @@ func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("anthropic-version") != "" {
 		proto = convert.ProtoAnthropic
 	}
-	key, status, msg := g.authenticate(r, snap)
+	key, owner, status, msg := g.authenticate(r, snap)
 	if key == nil {
 		writeError(w, proto, status, msg)
 		return
 	}
 	var data []map[string]any
 	for _, m := range snap.Models {
-		if !m.Enabled || !keyAllows(key, m.Name) {
+		if !m.Enabled || !keyAllows(key, owner, m.Name) {
 			continue
 		}
 		if proto == convert.ProtoAnthropic {
@@ -1096,13 +1148,13 @@ func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 // falls back to a rough local estimate.
 func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
 	snap := g.store.Snapshot()
-	key, status, msg := g.authenticate(r, snap)
+	key, owner, status, msg := g.authenticate(r, snap)
 	if key == nil {
 		writeError(w, convert.ProtoAnthropic, status, msg)
 		return
 	}
 	// count_tokens uses the operator's upstream quota too: same limits
-	if rej := g.Limiter.Admit(key); rej != nil {
+	if rej := g.Limiter.Admit(key, owner); rej != nil {
 		g.reject(w, r, "count_tokens", key, rej)
 		return
 	}
@@ -1112,10 +1164,10 @@ func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	info, _ := convert.ParseRequestInfo(body)
 	g.log(&store.RequestLog{
-		CreatedAt: time.Now().UnixMilli(), KeyID: key.ID, KeyName: key.Name, RequestedModel: info.Model,
+		CreatedAt: time.Now().UnixMilli(), KeyID: key.ID, KeyName: key.Name, UserID: key.UserID, RequestedModel: info.Model,
 		Inbound: "count_tokens", Success: true, HTTPStatus: 200, ClientIP: g.clientIP(r), RequestID: newRequestID(),
 	})
-	if m := snap.ResolveModel(info.Model); m != nil && keyAllows(key, m.Name) {
+	if m := snap.ResolveModel(info.Model); m != nil && keyAllows(key, owner, m.Name) {
 		for _, c := range g.plan(snap, m, convert.ProtoAnthropic, "") {
 			if c.proto != convert.ProtoAnthropic || !c.openTill.IsZero() {
 				continue

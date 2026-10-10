@@ -8,7 +8,7 @@ import (
 
 // copyTables are copied in this order; ids are kept, so request logs still
 // point at their keys.
-var copyTables = []string{"providers", "models", "api_keys", "request_logs"}
+var copyTables = []string{"providers", "models", "users", "api_keys", "request_logs"}
 
 // CopyTo copies everything (configuration, admin token, request logs) into
 // dst, which must hold no providers, models, keys or logs. Used to move

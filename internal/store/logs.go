@@ -29,6 +29,7 @@ type RequestLog struct {
 	CreatedAt        int64     `json:"created_at"`
 	KeyID            int64     `json:"key_id"`
 	KeyName          string    `json:"key_name"`
+	UserID           int64     `json:"user_id"` // owner of the key, 0 = administrator
 	RequestedModel   string    `json:"requested_model"`
 	PublicModel      string    `json:"public_model"`
 	Inbound          string    `json:"inbound"`
@@ -151,6 +152,7 @@ func (s *Store) cleanupLoop() {
 			return
 		case <-t.C:
 			s.cleanupCaptures()
+			s.cleanupSessions()
 			s.cleanupLogs()
 		}
 	}
@@ -193,7 +195,7 @@ func (s *Store) logWriter() {
 	}
 }
 
-const logCols = 25
+const logCols = 26
 
 func (s *Store) insertLogs(batch []*RequestLog) error {
 	// one multi-row INSERT per batch: a round trip per row would cap the
@@ -220,10 +222,10 @@ func (s *Store) insertLogs(batch []*RequestLog) error {
 			if attempts == nil {
 				attempts = []Attempt{}
 			}
-			args = append(args, l.CreatedAt, l.KeyID, l.KeyName, l.RequestedModel, l.PublicModel, l.Inbound, b2i(l.Stream), l.Provider, l.UpstreamModel, l.UpstreamProtocol, b2i(l.Success), l.HTTPStatus, l.LatencyMs, l.TTFBMs, l.InputTokens, l.OutputTokens, l.CachedTokens, b2i(l.Fallback), mustJSON(attempts), l.Error, l.ClientIP, l.Cost, l.Currency, l.CostSource, l.RequestID)
+			args = append(args, l.CreatedAt, l.KeyID, l.KeyName, l.RequestedModel, l.PublicModel, l.Inbound, b2i(l.Stream), l.Provider, l.UpstreamModel, l.UpstreamProtocol, b2i(l.Success), l.HTTPStatus, l.LatencyMs, l.TTFBMs, l.InputTokens, l.OutputTokens, l.CachedTokens, b2i(l.Fallback), mustJSON(attempts), l.Error, l.ClientIP, l.Cost, l.Currency, l.CostSource, l.RequestID, l.UserID)
 			clipped = append(clipped, l)
 		}
-		if _, err := tx.Exec(`INSERT INTO request_logs (created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source, request_id) VALUES `+
+		if _, err := tx.Exec(`INSERT INTO request_logs (created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source, request_id, user_id) VALUES `+
 			strings.TrimSuffix(strings.Repeat(row+",", len(part)), ","), args...); err != nil {
 			return err
 		}
@@ -290,6 +292,7 @@ type LogQuery struct {
 	Model    string
 	Provider string
 	KeyID    int64
+	UserID   int64  // > 0: only this user's requests
 	Status   string // "success" | "failed" | ""
 	Fallback bool
 	Limit    int
@@ -310,6 +313,10 @@ func (q LogQuery) where() (string, []any) {
 	if q.KeyID > 0 {
 		conds = append(conds, "key_id = ?")
 		args = append(args, q.KeyID)
+	}
+	if q.UserID > 0 {
+		conds = append(conds, "user_id = ?")
+		args = append(args, q.UserID)
 	}
 	switch q.Status {
 	case "success":
@@ -335,7 +342,7 @@ func (s *Store) QueryLogs(q LogQuery) ([]*RequestLog, int64, error) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM request_logs`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.Query(`SELECT id, created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source, request_id FROM request_logs`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`,
+	rows, err := s.db.Query(`SELECT id, created_at, key_id, key_name, requested_model, public_model, inbound, stream, provider, upstream_model, upstream_protocol, success, http_status, latency_ms, ttfb_ms, input_tokens, output_tokens, cached_tokens, fallback, attempts, error, client_ip, cost, currency, cost_source, request_id, user_id FROM request_logs`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`,
 		append(args, q.Limit, q.Offset)...)
 	if err != nil {
 		return nil, 0, err
@@ -346,7 +353,7 @@ func (s *Store) QueryLogs(q LogQuery) ([]*RequestLog, int64, error) {
 		l := &RequestLog{}
 		var stream, success, fallback int
 		var attempts string
-		if err := rows.Scan(&l.ID, &l.CreatedAt, &l.KeyID, &l.KeyName, &l.RequestedModel, &l.PublicModel, &l.Inbound, &stream, &l.Provider, &l.UpstreamModel, &l.UpstreamProtocol, &success, &l.HTTPStatus, &l.LatencyMs, &l.TTFBMs, &l.InputTokens, &l.OutputTokens, &l.CachedTokens, &fallback, &attempts, &l.Error, &l.ClientIP, &l.Cost, &l.Currency, &l.CostSource, &l.RequestID); err != nil {
+		if err := rows.Scan(&l.ID, &l.CreatedAt, &l.KeyID, &l.KeyName, &l.RequestedModel, &l.PublicModel, &l.Inbound, &stream, &l.Provider, &l.UpstreamModel, &l.UpstreamProtocol, &success, &l.HTTPStatus, &l.LatencyMs, &l.TTFBMs, &l.InputTokens, &l.OutputTokens, &l.CachedTokens, &fallback, &attempts, &l.Error, &l.ClientIP, &l.Cost, &l.Currency, &l.CostSource, &l.RequestID, &l.UserID); err != nil {
 			return nil, 0, err
 		}
 		l.Stream, l.Success, l.Fallback = stream == 1, success == 1, fallback == 1

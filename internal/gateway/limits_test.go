@@ -92,7 +92,7 @@ func TestKeyMonthlyBudget(t *testing.T) {
 	// a fresh limiter (e.g. after a restart) reloads the spend from the logs
 	l := NewLimiter(h.st)
 	k := h.st.Snapshot().Keys[key]
-	if rej := l.Admit(k); rej == nil || rej.status != 402 {
+	if rej := l.Admit(k, nil); rej == nil || rej.status != 402 {
 		t.Fatalf("restarted limiter admitted an over-budget key: %+v", rej)
 	}
 	// budgets are in the display currency: in USD the same spend is far below 1.5
@@ -100,7 +100,7 @@ func TestKeyMonthlyBudget(t *testing.T) {
 	settings.Currency, settings.USDToCNY = store.CurrencyUSD, 7
 	mustNil(t, h.st.UpdateSettings(settings))
 	l.Forget()
-	if rej := l.Admit(k); rej != nil {
+	if rej := l.Admit(k, nil); rej != nil {
 		t.Fatalf("2 CNY is under 1.5 USD: %+v", rej)
 	}
 }
@@ -112,24 +112,24 @@ func TestLimiterWindowSlides(t *testing.T) {
 	t0 := time.Now().Truncate(time.Second)
 	l.now = func() time.Time { return t0 }
 	k := &store.APIKey{ID: 99, RPM: 1, TPM: 100}
-	if rej := l.Admit(k); rej != nil {
+	if rej := l.Admit(k, nil); rej != nil {
 		t.Fatal(rej)
 	}
-	l.Record(k, &store.RequestLog{InputTokens: 80, OutputTokens: 30})
+	l.Record(k, nil, &store.RequestLog{InputTokens: 80, OutputTokens: 30})
 
 	l.now = func() time.Time { return t0.Add(30 * time.Second) }
-	rej := l.Admit(k)
+	rej := l.Admit(k, nil)
 	if rej == nil || rej.status != 429 || rej.retryAfter != 30*time.Second {
 		t.Fatalf("within the window: %+v", rej)
 	}
 	k.RPM = 0 // only TPM left: 110 tokens used >= 100
-	if rej := l.Admit(k); rej == nil || !strings.Contains(rej.msg, "token") || rej.retryAfter != 30*time.Second {
+	if rej := l.Admit(k, nil); rej == nil || !strings.Contains(rej.msg, "token") || rej.retryAfter != 30*time.Second {
 		t.Fatalf("TPM within the window: %+v", rej)
 	}
 
 	k.RPM = 1
 	l.now = func() time.Time { return t0.Add(61 * time.Second) }
-	if rej := l.Admit(k); rej != nil {
+	if rej := l.Admit(k, nil); rej != nil {
 		t.Fatalf("after the window: %+v", rej)
 	}
 }
@@ -140,17 +140,17 @@ func TestBudgetNeverDoubleCountsAcrossReload(t *testing.T) {
 	h.model("coder", "oa/ok")
 	key := h.limitedKey(store.APIKey{MonthlyBudget: 100})
 	k := h.st.Snapshot().Keys[key]
-	h.gw.Limiter.Admit(k) // loads 0
+	h.gw.Limiter.Admit(k, nil) // loads 0
 	for i := 0; i < 5; i++ {
 		h.postAs(key, "/v1/chat/completions", oaReq("coder", false))
 	}
 	h.gw.Limiter.Forget() // force a reload: the logged total replaces the cached sum
-	h.gw.Limiter.Admit(k)
+	h.gw.Limiter.Admit(k, nil)
 	for i := 0; i < 3; i++ {
 		h.postAs(key, "/v1/chat/completions", oaReq("coder", false))
 	}
 	h.gw.Limiter.mu.Lock()
-	spend := h.gw.Limiter.keys[k.ID].spend
+	spend := h.gw.Limiter.keys[strconv.FormatInt(k.ID, 10)].spend
 	h.gw.Limiter.mu.Unlock()
 	if spend != 8 {
 		t.Fatalf("spend %v, want 8", spend)

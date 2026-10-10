@@ -2,10 +2,11 @@
 // Checks that the web console is fully translated (no dependencies).
 //
 //  1. Every string literal passed as the first argument of t(...) in
-//     web/app.js and web/presets.js, and every displayed Chinese string in the
+//     web/app.js, web/account.js and web/presets.js, and every displayed Chinese string in the
 //     preset catalog (names, notes, UA notes, categories, tag labels), has an
 //     English entry in I18N_EN (web/i18n.js).
-//  2. web/app.js has no Chinese text outside t(...) arguments and comments
+//  2. web/app.js and web/account.js have no Chinese text outside t(...)
+//     arguments and comments
 //     (the "中文" option of the alert language select is allowed).
 //  3. Dictionary keys nobody uses are reported as a warning.
 //
@@ -176,7 +177,7 @@ const need = (key, where) => {
   if (!Object.prototype.hasOwnProperty.call(dict, key) && !missing.has(key)) missing.set(key, where);
 };
 
-for (const file of ['web/app.js', 'web/presets.js']) {
+for (const file of ['web/app.js', 'web/account.js', 'web/presets.js']) {
   const src = read(file);
   const { calls, errors } = tCalls(src, file);
   failures.push(...errors);
@@ -219,9 +220,8 @@ for (const [key, val] of Object.entries(dict)) {
   if (tags(key) !== tags(val)) failures.push(`I18N_EN[${JSON.stringify(key)}] HTML markup differs from the source`);
 }
 
-// Chinese in web/app.js outside t() arguments and comments
-{
-  const file = 'web/app.js';
+// Chinese in web/app.js / web/account.js outside t() arguments and comments
+for (const file of ['web/app.js', 'web/account.js']) {
   const src = read(file);
   const { calls, comments, tokens, lineOf } = tCalls(src, file);
   const chars = src.split('');

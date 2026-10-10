@@ -35,16 +35,17 @@ type keyUsage struct {
 	inflight int // requests in progress (counted only for keys with MaxConcurrency)
 }
 
-// Limiter enforces per-key RPM / TPM / monthly budget / concurrency. State
-// is in memory, or shared through the database when several instances run
-// (cluster); the monthly spend is reloaded from the request logs.
+// Limiter enforces per-key RPM / TPM / monthly budget / concurrency, and
+// the RPM / TPM / budget of the user owning a key over all their keys.
+// State is in memory, or shared through the database when several
+// instances run (cluster); the monthly spend is reloaded from the logs.
 type Limiter struct {
 	store   *store.Store
 	cluster *store.Cluster
 	now     func() time.Time
 
 	mu   sync.Mutex
-	keys map[int64]*keyUsage
+	keys map[string]*keyUsage // by subject id
 	// spendMu serializes reloads of the month-to-date spend: when the
 	// cached value expires, one query refreshes every key instead of each
 	// concurrent request scanning the logs
@@ -52,10 +53,31 @@ type Limiter struct {
 }
 
 func NewLimiter(s *store.Store) *Limiter {
-	return &Limiter{store: s, cluster: s.Cluster(), now: time.Now, keys: map[int64]*keyUsage{}}
+	return &Limiter{store: s, cluster: s.Cluster(), now: time.Now, keys: map[string]*keyUsage{}}
 }
 
-func (l *Limiter) usage(id int64) *keyUsage {
+// subject is what a set of limits applies to: an API key, or the user
+// owning it.
+type subject struct {
+	id     string // "12" for key 12, "u3" for user 3: state and cluster window names
+	name   string // for warnings
+	whom   string // in rejection messages
+	rpm    int
+	tpm    int
+	budget float64
+}
+
+func (s subject) limited() bool { return s.rpm > 0 || s.tpm > 0 || s.budget > 0 }
+
+func subjects(k *store.APIKey, u *store.User) []subject {
+	out := []subject{{id: strconv.FormatInt(k.ID, 10), name: k.Name, whom: "this API key", rpm: k.RPM, tpm: k.TPM, budget: k.MonthlyBudget}}
+	if u != nil {
+		out = append(out, subject{id: "u" + strconv.FormatInt(u.ID, 10), name: u.Username, whom: "your account", rpm: u.RPM, tpm: u.TPM, budget: u.MonthlyBudget})
+	}
+	return out
+}
+
+func (l *Limiter) usage(id string) *keyUsage {
 	u, ok := l.keys[id]
 	if !ok {
 		u = &keyUsage{}
@@ -71,91 +93,106 @@ type rejection struct {
 	retryAfter time.Duration
 }
 
-// Admit checks the key's limits and, when admitted, counts the request
-// towards its RPM.
-func (l *Limiter) Admit(k *store.APIKey) *rejection {
-	if k.RPM <= 0 && k.TPM <= 0 && k.MonthlyBudget <= 0 {
+// Admit checks the limits of the key and of its owner (u, nil for the
+// administrator's keys) and, when admitted, counts the request towards
+// their RPM.
+func (l *Limiter) Admit(k *store.APIKey, u *store.User) *rejection {
+	subs := subjects(k, u)
+	limited := false
+	for _, s := range subs {
+		limited = limited || s.limited()
+	}
+	if !limited {
 		return nil
 	}
 	now := l.now()
-	if k.MonthlyBudget > 0 {
-		spend := l.monthSpend(k.ID, now)
-		if spend >= k.MonthlyBudget {
-			cur := l.store.GetSettings().Currency
-			return &rejection{status: http.StatusPaymentRequired,
-				msg: fmt.Sprintf("monthly budget exhausted for this API key (%.2f / %.2f %s); it resets on the 1st", spend, k.MonthlyBudget, cur)}
+	for _, s := range subs {
+		if s.budget > 0 {
+			if spend := l.monthSpend(s.id, now); spend >= s.budget {
+				cur := l.store.GetSettings().Currency
+				return &rejection{status: http.StatusPaymentRequired,
+					msg: fmt.Sprintf("monthly budget exhausted for %s (%.2f / %.2f %s); it resets on the 1st", s.whom, spend, s.budget, cur)}
+			}
 		}
 	}
 	if l.cluster != nil {
-		return l.admitShared(k, now.Add(l.cluster.Offset())) // windows use the database clock
+		for _, s := range subs {
+			if rej := l.admitShared(s, now.Add(l.cluster.Offset())); rej != nil { // windows use the database clock
+				return rej
+			}
+		}
+		return nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	u := l.usage(k.ID)
 	cutoff := now.Add(-time.Minute)
-	for len(u.reqs) > 0 && !u.reqs[0].After(cutoff) {
-		u.reqs = u.reqs[1:]
-	}
-	for len(u.tokens) > 0 && !u.tokens[0].at.After(cutoff) {
-		u.tokens = u.tokens[1:]
-	}
-	if k.RPM > 0 && len(u.reqs) >= k.RPM {
-		return &rejection{status: http.StatusTooManyRequests, retryAfter: u.reqs[len(u.reqs)-k.RPM].Add(time.Minute).Sub(now),
-			msg: fmt.Sprintf("rate limit exceeded for this API key: %d requests per minute", k.RPM)}
-	}
-	if k.TPM > 0 {
-		var used int64
-		for _, e := range u.tokens {
-			used += e.tokens
+	for _, s := range subs {
+		u := l.usage(s.id)
+		for len(u.reqs) > 0 && !u.reqs[0].After(cutoff) {
+			u.reqs = u.reqs[1:]
 		}
-		if used >= int64(k.TPM) {
-			// wait until enough of the window expires to get back under the limit
-			wait := time.Minute
+		for len(u.tokens) > 0 && !u.tokens[0].at.After(cutoff) {
+			u.tokens = u.tokens[1:]
+		}
+		if s.rpm > 0 && len(u.reqs) >= s.rpm {
+			return rpmRejection(s, u.reqs[len(u.reqs)-s.rpm].Add(time.Minute).Sub(now))
+		}
+		if s.tpm > 0 {
+			var used int64
 			for _, e := range u.tokens {
-				used -= e.tokens
-				if used < int64(k.TPM) {
-					wait = e.at.Add(time.Minute).Sub(now)
-					break
-				}
+				used += e.tokens
 			}
-			return &rejection{status: http.StatusTooManyRequests, retryAfter: wait,
-				msg: fmt.Sprintf("token rate limit exceeded for this API key: %d tokens per minute", k.TPM)}
+			if used >= int64(s.tpm) {
+				// wait until enough of the window expires to get back under the limit
+				wait := time.Minute
+				for _, e := range u.tokens {
+					used -= e.tokens
+					if used < int64(s.tpm) {
+						wait = e.at.Add(time.Minute).Sub(now)
+						break
+					}
+				}
+				return tpmRejection(s, wait)
+			}
 		}
 	}
-	if k.RPM > 0 {
-		u.reqs = append(u.reqs, now)
+	// admitted by every subject: count the request for each
+	for _, s := range subs {
+		if s.rpm > 0 {
+			u := l.usage(s.id)
+			u.reqs = append(u.reqs, now)
+		}
 	}
 	return nil
 }
 
-func rpmRejection(k *store.APIKey, retry time.Duration) *rejection {
+func rpmRejection(s subject, retry time.Duration) *rejection {
 	return &rejection{status: http.StatusTooManyRequests, retryAfter: retry,
-		msg: fmt.Sprintf("rate limit exceeded for this API key: %d requests per minute", k.RPM)}
+		msg: fmt.Sprintf("rate limit exceeded for %s: %d requests per minute", s.whom, s.rpm)}
 }
 
-func tpmRejection(k *store.APIKey, retry time.Duration) *rejection {
+func tpmRejection(s subject, retry time.Duration) *rejection {
 	return &rejection{status: http.StatusTooManyRequests, retryAfter: retry,
-		msg: fmt.Sprintf("token rate limit exceeded for this API key: %d tokens per minute", k.TPM)}
+		msg: fmt.Sprintf("token rate limit exceeded for %s: %d tokens per minute", s.whom, s.tpm)}
 }
 
 // admitShared is Admit's RPM / TPM check against counters shared by every
 // instance. When the database cannot be reached the request is admitted.
-func (l *Limiter) admitShared(k *store.APIKey, now time.Time) *rejection {
-	id := strconv.FormatInt(k.ID, 10)
-	if k.TPM > 0 {
-		buckets, err := l.cluster.Window("tpm:"+id, now)
+func (l *Limiter) admitShared(s subject, now time.Time) *rejection {
+	if s.tpm > 0 {
+		buckets, err := l.cluster.Window("tpm:"+s.id, now)
 		if err != nil {
-			slog.Warn("rate limit: token window check failed", "key", k.Name, "err", err)
-		} else if store.WindowSum(buckets) >= int64(k.TPM) {
-			return tpmRejection(k, store.WindowRetry(buckets, int64(k.TPM), now))
+			slog.Warn("rate limit: token window check failed", "subject", s.name, "err", err)
+		} else if store.WindowSum(buckets) >= int64(s.tpm) {
+			return tpmRejection(s, store.WindowRetry(buckets, int64(s.tpm), now))
 		}
 	}
-	if k.RPM > 0 {
-		ok, buckets, err := l.cluster.TakeWindow("rpm:"+id, int64(k.RPM), now)
+	if s.rpm > 0 {
+		ok, buckets, err := l.cluster.TakeWindow("rpm:"+s.id, int64(s.rpm), now)
 		if err != nil {
-			slog.Warn("rate limit: request window check failed", "key", k.Name, "err", err)
+			slog.Warn("rate limit: request window check failed", "subject", s.name, "err", err)
 		} else if !ok {
-			return rpmRejection(k, store.WindowRetry(buckets, int64(k.RPM), now))
+			return rpmRejection(s, store.WindowRetry(buckets, int64(s.rpm), now))
 		}
 	}
 	return nil
@@ -184,7 +221,7 @@ func (l *Limiter) Enter(k *store.APIKey) *rejection {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	u := l.usage(k.ID)
+	u := l.usage(strconv.FormatInt(k.ID, 10))
 	if u.inflight >= k.MaxConcurrency {
 		return concurrencyRejection(k)
 	}
@@ -203,38 +240,43 @@ func (l *Limiter) Leave(k *store.APIKey) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if u := l.usage(k.ID); u.inflight > 0 {
+	if u := l.usage(strconv.FormatInt(k.ID, 10)); u.inflight > 0 {
 		u.inflight--
 	}
 }
 
-// Record adds a finished request's tokens and cost.
-func (l *Limiter) Record(k *store.APIKey, e *store.RequestLog) {
-	if e == nil || k.TPM <= 0 && k.MonthlyBudget <= 0 {
+// Record adds a finished request's tokens and cost to the key and its owner.
+func (l *Limiter) Record(k *store.APIKey, owner *store.User, e *store.RequestLog) {
+	if e == nil {
 		return
 	}
 	now := l.now()
 	cost := l.store.GetSettings().ToDisplayCurrency(e.Cost, e.Currency)
 	t := e.InputTokens + e.OutputTokens
-	if l.cluster != nil && k.TPM > 0 && t > 0 {
-		if err := l.cluster.AddWindow("tpm:"+strconv.FormatInt(k.ID, 10), t, now.Add(l.cluster.Offset())); err != nil {
-			slog.Warn("rate limit: recording tokens failed", "key", k.Name, "err", err)
+	for _, s := range subjects(k, owner) {
+		if s.tpm <= 0 && s.budget <= 0 {
+			continue
 		}
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	u := l.usage(k.ID)
-	if l.cluster == nil && k.TPM > 0 && t > 0 {
-		u.tokens = append(u.tokens, tokenEvent{at: now, tokens: t})
-	}
-	if u.spendMonth == store.MonthStart(now) {
-		u.spend += cost
+		if l.cluster != nil && s.tpm > 0 && t > 0 {
+			if err := l.cluster.AddWindow("tpm:"+s.id, t, now.Add(l.cluster.Offset())); err != nil {
+				slog.Warn("rate limit: recording tokens failed", "subject", s.name, "err", err)
+			}
+		}
+		l.mu.Lock()
+		u := l.usage(s.id)
+		if l.cluster == nil && s.tpm > 0 && t > 0 {
+			u.tokens = append(u.tokens, tokenEvent{at: now, tokens: t})
+		}
+		if u.spendMonth == store.MonthStart(now) {
+			u.spend += cost
+		}
+		l.mu.Unlock()
 	}
 }
 
 // monthSpend returns the key's month-to-date spend, reloading it from the
 // logs when stale.
-func (l *Limiter) monthSpend(id int64, now time.Time) float64 {
+func (l *Limiter) monthSpend(id string, now time.Time) float64 {
 	month := store.MonthStart(now)
 	l.mu.Lock()
 	u := l.usage(id)
@@ -260,7 +302,18 @@ func (l *Limiter) monthSpend(id int64, now time.Time) float64 {
 	l.mu.Unlock()
 
 	l.store.FlushLogsTimeout(2 * time.Second) // so the query sees every finished request
-	spend, err := l.store.KeySpend(month)
+	spend := map[string]float64{}
+	keys, err := l.store.KeySpend(month)
+	if err == nil {
+		var users map[int64]float64
+		users, err = l.store.UserSpend(month)
+		for id, v := range keys {
+			spend[strconv.FormatInt(id, 10)] = v
+		}
+		for id, v := range users {
+			spend["u"+strconv.FormatInt(id, 10)] = v
+		}
+	}
 	if err != nil {
 		slog.Warn("rate limit: loading month-to-date spend failed", "err", err)
 		l.mu.Lock()

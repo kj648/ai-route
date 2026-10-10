@@ -131,7 +131,7 @@ func (g *Gateway) TestModel(ctx context.Context, model, proto string, stream boo
 	rec := httptest.NewRecorder()
 	start := time.Now()
 	key := &store.APIKey{Name: "(admin test)", Enabled: true}
-	entry := g.route(rec, r, proto, body, key)
+	entry := g.route(rec, r, proto, body, key, nil)
 	res := TestResult{
 		Attempts:   entry.Attempts,
 		HTTPStatus: rec.Code,
