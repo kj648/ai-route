@@ -7,7 +7,8 @@ import (
 )
 
 // RewriteModel replaces the "model" field of a JSON request body, leaving the
-// rest of the body untouched. For OpenAI streaming requests it also enables
+// rest of the body untouched, except sampling fields the model rejects
+// (fixedSampling). For OpenAI streaming requests it also enables
 // stream_options.include_usage so token usage can be recorded; the returned
 // bool reports whether the client had asked for usage itself.
 func RewriteModel(body []byte, model string, proto string) ([]byte, bool, error) {
@@ -16,6 +17,11 @@ func RewriteModel(body []byte, model string, proto string) ([]byte, bool, error)
 		return nil, false, fmt.Errorf("invalid JSON body: %w", err)
 	}
 	m["model"], _ = json.Marshal(model)
+	if fixedSampling(model) {
+		for _, k := range samplingFields {
+			delete(m, k)
+		}
+	}
 	clientUsage := false
 	if proto == ProtoAnthropic {
 		if msgs, changed := stripConvertedThinking(m["messages"]); changed {

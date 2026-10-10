@@ -404,6 +404,11 @@ type EmitOptions struct {
 
 // EmitRequest writes the IR as a request body in proto.
 func EmitRequest(proto string, r *Request, opts EmitOptions) ([]byte, error) {
+	if fixedSampling(opts.Model) && (r.Temperature != nil || r.TopP != nil) {
+		rr := *r
+		rr.Temperature, rr.TopP = nil, nil
+		r = &rr
+	}
 	switch proto {
 	case ProtoAnthropic:
 		return emitAnthropicRequest(r, opts)
