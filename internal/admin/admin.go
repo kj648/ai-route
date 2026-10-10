@@ -603,6 +603,7 @@ func (a *Admin) logs(w http.ResponseWriter, r *http.Request) {
 		Provider: q.Get("provider"),
 		Status:   q.Get("status"),
 		Fallback: q.Get("fallback") == "1",
+		Session:  q.Get("session"),
 	}
 	lq.KeyID, _ = strconv.ParseInt(q.Get("key_id"), 10, 64)
 	lq.Limit, _ = strconv.Atoi(q.Get("limit"))

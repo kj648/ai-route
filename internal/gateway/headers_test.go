@@ -124,20 +124,66 @@ func TestGeneratedSessionHeader(t *testing.T) {
 	if l.Attempts[0].Headers["x-opencode-session"] != s3 || !strings.HasPrefix(l.RequestID, "req_") {
 		t.Fatalf("log: %+v", l)
 	}
-	// Codex's native session-id is used as well
-	h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"Session-Id": "codex-9"})
-	if got := h.mock.lastHdr["ok"].Get("x-opencode-session"); got != "codex-9" {
-		t.Fatalf("Codex session: %q", got)
+	// a caller's session id gives the same $session whatever the messages,
+	// and the raw id never reaches the upstream
+	sessionOf := func(hdr map[string]string, first string) string {
+		req := oaReq("coder", false)
+		req["messages"] = []map[string]any{{"role": "user", "content": first}}
+		resp, _ := h.postWith("/v1/chat/completions", req, hdr)
+		if resp.StatusCode != 200 {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		got := h.mock.lastHdr["ok"]
+		if got.Get("X-Session-Id") != "" {
+			t.Fatal("X-Session-Id forwarded upstream")
+		}
+		return got.Get("x-opencode-session")
 	}
-	// Claude Code's own session id beats the generated one
-	h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"X-Claude-Code-Session-Id": "cc-123"})
-	if got := h.mock.lastHdr["ok"].Get("x-opencode-session"); got != "cc-123" {
-		t.Fatalf("Claude Code session: %q", got)
+	job1 := sessionOf(map[string]string{"X-Session-Id": "job-1"}, "outline")
+	if job1 == "job-1" || !strings.HasPrefix(job1, "ses_") || job1 == s3 {
+		t.Fatalf("job session: %q", job1)
 	}
-	// and the caller's explicit x-opencode-session beats both
-	resp, _ := h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"x-opencode-session": "conv_X", "X-Claude-Code-Session-Id": "cc-123"})
-	if resp.StatusCode != 200 || h.mock.lastHdr["ok"].Get("x-opencode-session") != "conv_X" {
-		t.Fatal("caller session not forwarded")
+	if sessionOf(map[string]string{"X-Session-Id": "job-1"}, "write page 2") != job1 {
+		t.Fatal("one session id must keep one $session across different prompts")
+	}
+	if sessionOf(map[string]string{"X-Session-Id": "job-2"}, "outline") == job1 {
+		t.Fatal("different session ids must differ")
+	}
+	// clients' native session headers count too; X-Session-Id wins over them
+	cc := sessionOf(map[string]string{"X-Claude-Code-Session-Id": "cc-123"}, "x")
+	codex := sessionOf(map[string]string{"Session-Id": "codex-9"}, "x")
+	oc := sessionOf(map[string]string{"x-opencode-session": "conv_X"}, "x")
+	if cc == codex || cc == oc || !strings.HasPrefix(cc, "ses_") || oc == "conv_X" {
+		t.Fatalf("native sessions: %q %q %q", cc, codex, oc)
+	}
+	if sessionOf(map[string]string{"X-Session-Id": "job-1", "X-Claude-Code-Session-Id": "cc-123"}, "y") != job1 {
+		t.Fatal("X-Session-Id must win over native session headers")
+	}
+	// the log keeps the caller's own id, and can be filtered by it
+	h.logs() // flush
+	logs, total, err := h.st.QueryLogs(store.LogQuery{Session: "job-1"})
+	if err != nil || total != 3 || logs[0].SessionID != "job-1" {
+		t.Fatalf("session logs: %d %v", total, err)
+	}
+}
+
+// The same session id sent with two API keys is two sessions.
+func TestSessionScopedToKey(t *testing.T) {
+	h := newHarness(t)
+	h.setProvider("oa", func(p *store.Provider) {
+		p.Headers = map[string]string{"x-opencode-session": store.OpenCodeSessionHeader}
+	})
+	h.model("coder", "oa/ok")
+	h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"X-Session-Id": "job-1"})
+	a := h.mock.lastHdr["ok"].Get("x-opencode-session")
+	other := &store.APIKey{Name: "other", Enabled: true}
+	if err := h.st.CreateKey(other); err != nil {
+		t.Fatal(err)
+	}
+	h.key = other.Key
+	h.postWith("/v1/chat/completions", oaReq("coder", false), map[string]string{"X-Session-Id": "job-1"})
+	if b := h.mock.lastHdr["ok"].Get("x-opencode-session"); a == "" || a == b {
+		t.Fatalf("sessions across keys: %q %q", a, b)
 	}
 }
 

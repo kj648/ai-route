@@ -323,6 +323,7 @@ async function pageMyLogs() {
       body: `<div class="form"><div class="kv">
         <div class="k">${t('时间')}</div><div>${fmtTime(l.created_at)}</div>
         <div class="k">${t('请求 ID')}</div><div class="mono small">${esc(l.request_id || '-')} <span class="muted">${t('（反馈问题时请提供）')}</span></div>
+        ${l.session_id ? `<div class="k">${t('会话')}</div><div class="mono small">${esc(l.session_id)}</div>` : ''}
         <div class="k">API Key</div><div>${esc(l.key_name || '-')}</div>
         <div class="k">${t('模型')}</div><div>${esc(l.requested_model)}${l.public_model && l.public_model !== l.requested_model ? ' → ' + esc(l.public_model) : ''}</div>
         <div class="k">${t('协议')}</div><div>${esc(l.inbound)}${l.stream ? t('（流式）') : ''}</div>

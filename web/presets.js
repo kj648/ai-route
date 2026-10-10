@@ -130,10 +130,10 @@ const PRESETS = [
       'minimax-*': 'anthropic', 'qwen*': 'anthropic', 'claude-*': 'anthropic',
       'gpt-*': 'responses', 'grok-*': 'responses', 'muse-*': 'responses',
     },
-    // the caller's own session id, else Claude Code's, else a stable id per conversation
-    headers: { 'x-opencode-session': '{{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}' },
+    // the gateway's session id: from the caller's X-Session-Id (or its client's own session header), else per conversation
+    headers: { 'x-opencode-session': '{{$session}}' },
     docs: 'https://opencode.ai/docs/go/', keyUrl: 'https://opencode.ai/go',
-    note: '月订阅。MiniMax / Qwen 只走 /messages，GLM / Kimi / DeepSeek / MiMo 走 chat，已预填“模型协议规则”；官方要求每个会话带稳定的 x-opencode-session 头：已预填为调用方传了就透传，否则用 Claude Code 的会话 ID（x-claude-code-session-id），或 Codex 的会话 ID（session-id），再没有由网关按会话生成。GPT Luna、Grok、Muse Spark 走 /responses，Claude Haiku 走 /messages，已预填协议规则。',
+    note: '月订阅。MiniMax / Qwen 只走 /messages，GLM / Kimi / DeepSeek / MiMo 走 chat，已预填“模型协议规则”；官方要求每个会话带稳定的 x-opencode-session 头：已预填为网关的会话 ID（$session），调用方带 X-Session-Id 就按它区分会话，Claude Code、Codex 自带的会话头也能识别，都没有由网关按会话生成。GPT Luna、Grok、Muse Spark 走 /responses，Claude Haiku 走 /messages，已预填协议规则。',
     ua: { mode: 'passthrough', note: '官方要求客户端用自己的 UA（如 my-agent/1.0），不要用 SDK / HTTP 库的默认 UA。透传客户端即可；客户端没带 UA 时使用平台标识 ai-route/版本号。' },
   },
   {

@@ -5,6 +5,7 @@
 //	X-Session: {{header.X-Session-Id}}                  from the caller, required
 //	X-Session: {{header.X-Session-Id?}}                 from the caller, optional
 //	X-Session: {{header.X-Session-Id ?? $conversation}} caller's value, else generated
+//	X-Session: {{$session}}                             the gateway's session id
 //	X-Trace: ai-route-{{$requestId}}                    built-in variable
 //	X-Agent: {{header.X-Agent ?? "ai-route"}}           quoted literal fallback
 //
@@ -26,6 +27,7 @@ import (
 
 // Vars lists the built-in variables and what they hold.
 var Vars = map[string]string{
+	"session":      "stable per session: ses_ + hash of API key and the caller's X-Session-Id (or its client's native session header); $conversation when the caller sent none",
 	"conversation": "stable per conversation: ses_ + hash of API key and first user message (random when there is none)",
 	"uuid":         "new random UUID for every request",
 	"requestId":    "the gateway's request id (shown in the request log)",
@@ -158,6 +160,7 @@ func (t *Template) Dynamic() bool {
 // Context is what expressions are evaluated against. Any field may be empty.
 type Context struct {
 	Header       http.Header // the caller's request headers
+	Session      string      // already formatted, e.g. ses_...
 	Conversation string      // already formatted, e.g. ses_...
 	RequestID    string
 	KeyName      string
@@ -204,6 +207,8 @@ func (c *Context) lookup(s source) (string, bool) {
 		return v, v != ""
 	}
 	switch s.name {
+	case "session":
+		return c.Session, c.Session != ""
 	case "conversation":
 		return c.Conversation, c.Conversation != ""
 	case "uuid":

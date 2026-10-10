@@ -344,6 +344,7 @@ type myLog struct {
 	Cost           float64 `json:"cost"` // display currency
 	Error          string  `json:"error"`
 	RequestID      string  `json:"request_id"`
+	SessionID      string  `json:"session_id"`
 }
 
 // userError is what a user may see of a failure: the gateway's own
@@ -367,7 +368,7 @@ func (a *Admin) myLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	lq := store.LogQuery{UserID: u.ID, Model: q.Get("model"), Status: q.Get("status")}
+	lq := store.LogQuery{UserID: u.ID, Model: q.Get("model"), Status: q.Get("status"), Session: q.Get("session")}
 	lq.KeyID, _ = strconv.ParseInt(q.Get("key_id"), 10, 64)
 	lq.Limit, _ = strconv.Atoi(q.Get("limit"))
 	lq.Offset, _ = strconv.Atoi(q.Get("offset"))
@@ -382,7 +383,7 @@ func (a *Admin) myLogs(w http.ResponseWriter, r *http.Request) {
 		items = append(items, myLog{ID: l.ID, CreatedAt: l.CreatedAt, KeyID: l.KeyID, KeyName: l.KeyName, RequestedModel: l.RequestedModel,
 			PublicModel: l.PublicModel, Inbound: l.Inbound, Stream: l.Stream, Success: l.Success, HTTPStatus: l.HTTPStatus,
 			LatencyMs: l.LatencyMs, TTFBMs: l.TTFBMs, InputTokens: l.InputTokens, OutputTokens: l.OutputTokens, CachedTokens: l.CachedTokens,
-			Cost: st.ToDisplayCurrency(l.Cost, l.Currency), Error: userError(l), RequestID: l.RequestID})
+			Cost: st.ToDisplayCurrency(l.Cost, l.Currency), Error: userError(l), RequestID: l.RequestID, SessionID: l.SessionID})
 	}
 	writeJSON(w, map[string]any{"total": total, "items": items, "currency": st.Currency})
 }

@@ -395,11 +395,16 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request, inbound string, 
 		writeError(w, inbound, http.StatusBadRequest, msg)
 		return
 	}
-	affinity := ""
-	if conv := convert.ConversationKey(body, inbound); conv != "" {
-		affinity = strconv.FormatInt(key.ID, 10) + "\x00" + conv
+	// a session keeps its requests on one upstream; without a session id the
+	// first user message marks the conversation
+	firstMessage := convert.ConversationKey(body, inbound)
+	entry.SessionID = clientSession(r.Header)
+	affinity := sessionAffinity(key.ID, entry.SessionID, firstMessage)
+	conversation := conversationID(sessionAffinity(key.ID, "", firstMessage))
+	meta := &requestMeta{RequestID: entry.RequestID, Session: conversation, Conversation: conversation, Key: key, Header: r.Header}
+	if entry.SessionID != "" {
+		meta.Session = conversationID(affinity)
 	}
-	meta := &requestMeta{RequestID: entry.RequestID, Conversation: conversationID(affinity), Key: key, Header: r.Header}
 	if cp := g.startCapture(snap, w, key, m.Name, inbound, entry.RequestID, body); cp != nil {
 		meta.capture, w = cp, cp.client
 		defer g.saveCapture(cp)

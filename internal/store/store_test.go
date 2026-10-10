@@ -604,6 +604,8 @@ func TestProviderHeaderTemplates(t *testing.T) {
 		Headers: map[string]string{"x-opencode-session": "my-own"}}))
 	mustNil(t, st.CreateProvider(&Provider{Prefix: "v030", Vendor: "opencode-go", OpenAIBaseURL: "https://opencode.ai/zen/go/v1",
 		Headers: map[string]string{"x-opencode-session": "{{header.x-opencode-session ?? $conversation}}"}}))
+	mustNil(t, st.CreateProvider(&Provider{Prefix: "v011", Vendor: "opencode-go", OpenAIBaseURL: "https://opencode.ai/zen/go/v1",
+		Headers: map[string]string{"x-opencode-session": "{{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}"}}))
 	st.Close()
 	st, err = openLoc(dir)
 	if err != nil {
@@ -614,8 +616,10 @@ func TestProviderHeaderTemplates(t *testing.T) {
 	if p["opencode"].Headers["x-opencode-session"] != OpenCodeSessionHeader || p["opencode"].Headers["X-Other"] != "keep" {
 		t.Fatalf("not migrated: %v", p["opencode"].Headers)
 	}
-	if p["v030"].Headers["x-opencode-session"] != OpenCodeSessionHeader {
-		t.Fatalf("earlier template not migrated: %v", p["v030"].Headers)
+	for _, prefix := range []string{"v030", "v011"} {
+		if p[prefix].Headers["x-opencode-session"] != OpenCodeSessionHeader {
+			t.Fatalf("earlier template not migrated: %v", p[prefix].Headers)
+		}
 	}
 	if p["mine"].Headers["x-opencode-session"] != "my-own" {
 		t.Fatalf("custom value changed: %v", p["mine"].Headers)

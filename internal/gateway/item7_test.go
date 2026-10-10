@@ -76,3 +76,32 @@ func TestWeightedGroupFallsBackWithinGroup(t *testing.T) {
 		}
 	}
 }
+
+// Requests of one session stay on one upstream of a weighted group even
+// when their prompts share nothing (an agent job's separate stages).
+func TestWeightedGroupSticksToSession(t *testing.T) {
+	h := newHarness(t)
+	h.model("coder", "oa/ok | both/ok", "an/ok")
+	targets := map[string]bool{}
+	for job := 0; job < 20; job++ {
+		var first string
+		for stage := 0; stage < 5; stage++ {
+			req := oaReq("coder", false)
+			req["messages"] = []map[string]any{{"role": "user", "content": fmt.Sprintf("stage %d of job %d", stage, job)}}
+			resp, body := h.postWith("/v1/chat/completions", req, map[string]string{"X-Session-Id": fmt.Sprintf("job-%d", job)})
+			if resp.StatusCode != 200 {
+				t.Fatal(body)
+			}
+			target := resp.Header.Get("X-Route-Target")
+			if stage == 0 {
+				first = target
+			} else if target != first {
+				t.Fatalf("job %d moved from %s to %s", job, first, target)
+			}
+			targets[target] = true
+		}
+	}
+	if !targets["oa/ok"] || !targets["both/ok"] {
+		t.Fatalf("sessions should still spread over the group: %v", targets)
+	}
+}

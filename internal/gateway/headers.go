@@ -19,6 +19,7 @@ import (
 // in the request context so every upstream call of the request sees it.
 type requestMeta struct {
 	RequestID    string
+	Session      string // ses_...; from the caller's session id, else Conversation
 	Conversation string // ses_...; random when the request has no user message
 	Key          *store.APIKey
 	Header       http.Header // the caller's headers
@@ -42,10 +43,11 @@ func newRequestID() string {
 	return "req_" + hex.EncodeToString(b[:])
 }
 
-// conversationID turns the routing affinity (API key + first user message)
-// into a session id that stays the same for the whole conversation. Without
-// one (no user message, health checks, admin tests) it is random: upstreams
-// such as OpenCode Go reject requests without a session header.
+// conversationID turns a routing affinity (API key + session id or first
+// user message) into a session id that stays the same for the whole session
+// and does not reveal the caller's own id. Without one (no user message,
+// health checks, admin tests) it is random: upstreams such as OpenCode Go
+// reject requests without a session header.
 func conversationID(affinity string) string {
 	if affinity == "" {
 		var b [12]byte
@@ -60,7 +62,8 @@ func conversationID(affinity string) string {
 // (health checks, model lists, admin tests): a fresh request and session id,
 // and the caller headers given (if any).
 func probeMeta(h http.Header) *requestMeta {
-	return &requestMeta{RequestID: newRequestID(), Conversation: conversationID(""), Header: h}
+	ses := conversationID("")
+	return &requestMeta{RequestID: newRequestID(), Session: ses, Conversation: ses, Header: h}
 }
 
 // dropHeaders are never copied from the caller: credentials for the gateway
@@ -78,6 +81,9 @@ var dropHeaders = map[string]bool{
 	"Origin": true, "Referer": true,
 	// would select another org / project / key on the operator's account
 	"Openai-Organization": true, "Openai-Project": true, "Api-Key": true, "X-Goog-Api-Key": true,
+	// the gateway's own session header: upstreams get $session where a
+	// provider asks for it, never the caller's raw id
+	SessionHeader: true,
 }
 
 var dropPrefixes = []string{"X-Forwarded-", "Cf-", "Sec-", "Proxy-"}
@@ -121,7 +127,7 @@ func copyClientHeaders(dst, src http.Header, upstream string) {
 func applyProviderHeaders(h http.Header, p *store.Provider, model string, meta *requestMeta) map[string]string {
 	tctx := &hdrtpl.Context{Model: model, Now: time.Now()}
 	if meta != nil {
-		tctx.Header, tctx.Conversation, tctx.RequestID = meta.Header, meta.Conversation, meta.RequestID
+		tctx.Header, tctx.Session, tctx.Conversation, tctx.RequestID = meta.Header, meta.Session, meta.Conversation, meta.RequestID
 		if meta.Key != nil {
 			tctx.KeyName, tctx.KeyID = meta.Key.Name, meta.Key.ID
 		}

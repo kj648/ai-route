@@ -737,11 +737,11 @@ function providerForm(p, models, providers) {
           </div>
           <div class="row2">
             <div class="field"><label>${t('模型协议规则')}</label><textarea id="pf-protos" placeholder="minimax-* = anthropic&#10;glm-* = openai&#10;gpt-* = responses">${esc(toLines(p.model_protocols, ' ='))}</textarea><div class="help">${t('每行 <code>模型(可用*) = openai|anthropic|responses</code>，某些模型只在一种端点提供时使用（<code>responses</code> 指 OpenAI 地址下的 /responses）')}</div></div>
-            <div class="field"><label>${t('自定义请求头')}</label><textarea id="pf-headers" placeholder="X-Custom: value&#10;x-opencode-session: {{header.x-opencode-session ?? $conversation}}">${esc(toLines(p.headers, ':'))}</textarea>
+            <div class="field"><label>${t('自定义请求头')}</label><textarea id="pf-headers" placeholder="X-Custom: value&#10;x-opencode-session: {{$session}}">${esc(toLines(p.headers, ':'))}</textarea>
               <div class="help">${t('每行 <code>Header: 值</code>，覆盖调用方的同名头；值留空表示删除该头。值里可以写：')}
                 ${t('<code>{{header.X-Foo}}</code> 取调用方的头，<b>必传</b>（首选上游缺了直接报 400，候补上缺了就不发）；')}
                 ${t('<code>{{header.X-Foo?}}</code> 可选；<code>{{header.X-Foo ?? $conversation}}</code> 没传就用平台生成的；')}
-                ${t('内置变量 <code>$conversation</code>（同一会话稳定的 ses_…）、<code>$uuid</code>（每次请求新的）、<code>$requestId</code>、<code>$timestamp</code>、<code>$keyName</code>、<code>$keyId</code>、<code>$model</code>')}</div></div>
+                ${t('内置变量 <code>$session</code>（同一会话稳定的 ses_…，按调用方的 X-Session-Id）、<code>$conversation</code>（按第一条用户消息）、<code>$uuid</code>（每次请求新的）、<code>$requestId</code>、<code>$timestamp</code>、<code>$keyName</code>、<code>$keyId</code>、<code>$model</code>')}</div></div>
           </div>
           <label class="check"><input type="checkbox" id="pf-responses" ${p.responses_api ? 'checked' : ''}> ${t('OpenAI 地址也支持 Responses API（/responses）')} <span class="muted small">${t('（勾选后，Codex 等 Responses 客户端的请求原样转发；不勾选就转换成 Chat Completions 发送。多数 OpenAI 兼容厂商不支持，别乱勾）')}</span></label>
           <label class="check"><input type="checkbox" id="pf-pass-headers" ${p.drop_client_headers ? '' : 'checked'}> ${t('透传调用方的请求头')} <span class="muted small">${t('（不会转发 Authorization、x-api-key、Cookie、Accept-Encoding、X-Forwarded-*、Origin 等凭证、逐跳和隐私相关的头）')}</span></label>
@@ -1449,10 +1449,10 @@ function keyForm(k, models, st) {
 }
 
 // ---------------------------------------------------------------- logs
-const logFilter = { model: '', provider: '', status: '', fallback: false, offset: 0, limit: 50 };
+const logFilter = { model: '', provider: '', status: '', fallback: false, session: '', offset: 0, limit: 50 };
 let logsLoading = false;
 async function pageLogs() {
-  const qs = new URLSearchParams({ model: logFilter.model, provider: logFilter.provider, status: logFilter.status, fallback: logFilter.fallback ? '1' : '', offset: logFilter.offset, limit: logFilter.limit });
+  const qs = new URLSearchParams({ model: logFilter.model, provider: logFilter.provider, status: logFilter.status, fallback: logFilter.fallback ? '1' : '', session: logFilter.session, offset: logFilter.offset, limit: logFilter.limit });
   const [data, models, providers, caps] = await (async () => { logsLoading = true; try { return await Promise.all([
     api('GET', '/logs?' + qs), api('GET', '/models'), api('GET', '/providers'), api('GET', '/captures'),
   ]); } finally { logsLoading = false; } })();
@@ -1471,6 +1471,7 @@ async function pageLogs() {
           <select id="lf-provider"><option value="">${t('全部套餐')}</option>${providers.map((p) => `<option ${p.prefix === logFilter.provider ? 'selected' : ''}>${esc(p.prefix)}</option>`).join('')}</select>
           <select id="lf-status"><option value="">${t('全部状态')}</option><option value="success" ${logFilter.status === 'success' ? 'selected' : ''}>${t('成功')}</option><option value="failed" ${logFilter.status === 'failed' ? 'selected' : ''}>${t('失败')}</option></select>
           <label class="check"><input type="checkbox" id="lf-fallback" ${logFilter.fallback ? 'checked' : ''}> ${t('只看发生切换的')}</label>
+          ${logFilter.session ? `<span class="badge blue">${t('会话')} <span class="mono">${esc(logFilter.session)}</span></span><button class="btn sm" id="lf-session-clear">${t('清除')}</button>` : ''}
         </div>
       </div>
       ${items.length ? `<div class="table-wrap"><table>
@@ -1496,6 +1497,7 @@ async function pageLogs() {
   $('#lf-provider').onchange = (e) => { logFilter.provider = e.target.value; upd(); };
   $('#lf-status').onchange = (e) => { logFilter.status = e.target.value; upd(); };
   $('#lf-fallback').onchange = (e) => { logFilter.fallback = e.target.checked; upd(); };
+  if ($('#lf-session-clear')) $('#lf-session-clear').onclick = () => { logFilter.session = ''; upd(); };
   $('#log-refresh').onclick = route;
   $('#log-capture').onclick = () => captureForm(models, caps);
   $$('[data-stop-rule]').forEach((b) => b.onclick = async () => {
@@ -1525,6 +1527,7 @@ function logDetail(l, captureId) {
       <div class="kv">
         <div class="k">${t('时间')}</div><div>${fmtTime(l.created_at)}</div>
         ${l.request_id ? `<div class="k">${t('请求 ID')}</div><div class="mono small">${esc(l.request_id)} <span class="muted">${t('（响应头 X-Route-Request-Id）')}</span></div>` : ''}
+        ${l.session_id ? `<div class="k">${t('会话')}</div><div class="mono small">${esc(l.session_id)} <button type="button" class="btn sm" id="ld-session">${t('只看这个会话')}</button></div>` : ''}
         <div class="k">API Key</div><div>${esc(l.key_name || '-')}</div>
         <div class="k">${t('客户端 IP')}</div><div>${esc(l.client_ip || '-')}</div>
         <div class="k">${t('请求模型')}</div><div>${esc(l.requested_model)}${l.public_model ? ' → ' + esc(l.public_model) : ''}</div>
@@ -1539,7 +1542,10 @@ function logDetail(l, captureId) {
       ${atts ? `<div class="table-wrap"><table><tr><th>#</th><th>${t('上游')}</th><th>${t('协议')}</th><th>${t('状态')}</th><th>${t('耗时')}</th><th>${t('结果')}</th></tr>${atts}</table></div>` : ''}
     </div>`,
     foot: captureId ? `<button class="btn" id="ld-capture">${t('查看报文')}</button>` : '',
-    onMount: (m) => { if (captureId) $('#ld-capture', m).onclick = () => captureView(captureId); },
+    onMount: (m) => {
+      if (captureId) $('#ld-capture', m).onclick = () => captureView(captureId);
+      if ($('#ld-session', m)) $('#ld-session', m).onclick = () => { logFilter.session = l.session_id; logFilter.offset = 0; closeModal(); route(); };
+    },
   });
 }
 
@@ -1812,6 +1818,7 @@ const HDR_DROPPED = [
   [t('X-Forwarded-*、Forwarded、X-Real-IP、True-Client-IP、Via、CF-*'), t('反向代理和 CDN（如 Cloudflare）记录的用户真实 IP 和经过的代理，转出去会泄露用户信息')],
   [t('Origin、Referer、Sec-*'), t('浏览器自动加的头，表示请求来自网页。Anthropic 会拒绝带 Origin 的跨域请求，除非额外声明 anthropic-dangerous-direct-browser-access；网关是服务端调用，不需要它们')],
   [t('anthropic-*（上游不是 Anthropic 协议时）、openai-*（上游是 Anthropic 协议时）'), t('对面协议专属，协议转换后没有意义')],
+  ['X-Session-Id', t('网关自己的会话头。上游需要会话 ID 时用 $session 发（按 API Key 做了哈希），不把调用方的原始值带给第三方')],
 ];
 const HDR_SYNTAX = [
   ['abc', t('固定值'), t('平台写死，覆盖调用方的同名头')],
@@ -1822,7 +1829,8 @@ const HDR_SYNTAX = [
   [t('{{$变量}}'), t('平台生成'), t('可以和文字拼接，如 ai-route-{{$requestId}}')],
 ];
 const HDR_VARS = [
-  ['$conversation', t('ses_ 开头，同一会话内不变'), t('按“API Key + 会话第一条用户消息”计算，适合给不带会话 ID 的客户端兜底；调用方自己有会话头（如 Claude Code 的 x-claude-code-session-id）时优先用 header.… 取它。没有用户消息的请求（向量、重排序）取不到值，这个头就不发')],
+  ['$session', t('ses_ 开头，同一会话内不变'), t('按“API Key + 调用方的会话 ID”计算：X-Session-Id，没有就用 Claude Code、Codex、OpenCode 客户端自带的会话头。同一个会话 ID 换了 API Key 算两个会话。调用方都没带时等于 $conversation。供应商要会话 ID 时用它')],
+  ['$conversation', t('ses_ 开头，同一对话内不变'), t('只按“API Key + 第一条用户消息”计算，不看调用方的会话头。没有用户消息的请求（向量、重排序）每次随机')],
   ['$uuid', t('每个请求一个新的 UUID'), t('请求 ID、幂等键。不要用作会话 ID')],
   ['$requestId', t('网关的请求 ID（req_…）'), t('同时出现在响应头 X-Route-Request-Id 和请求日志里，方便和上游对账')],
   ['$timestamp', t('当前 Unix 秒'), ''],
@@ -1836,9 +1844,9 @@ const HDR_RESPONSE = [
 ];
 // [vendor, requirement, how this gateway handles it, source]
 const HDR_VENDORS = [
-  ['OpenCode Go', t('每个会话带一个稳定的 x-opencode-session（官方说明用于路由和提示词缓存，没有规定格式）；客户端用自己的 User-Agent，不要用 SDK 或 HTTP 库的默认值。对 Claude Code、Codex 等客户端也能识别它们自带的会话头。GPT Luna、Grok、Muse Spark 只走 /responses'), t('预设：x-opencode-session: {{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}，UA 透传客户端；协议规则已预填（gpt-*、grok-*、muse-* = responses）'), 'https://opencode.ai/docs/go/'],
+  ['OpenCode Go', t('每个会话带一个稳定的 x-opencode-session（官方说明用于路由和提示词缓存，没有规定格式）；客户端用自己的 User-Agent，不要用 SDK 或 HTTP 库的默认值。对 Claude Code、Codex 等客户端也能识别它们自带的会话头。GPT Luna、Grok、Muse Spark 只走 /responses'), t('预设：x-opencode-session: {{$session}}，UA 透传客户端；协议规则已预填（gpt-*、grok-*、muse-* = responses）'), 'https://opencode.ai/docs/go/'],
   ['Kimi Code', t('会员条款：篡改客户端标识（User-Agent）视为违规，可能暂停会员权益。接口只接受 Kimi CLI、Claude Code、Roo Code、Kilo Code 等编码工具，其他客户端会收到 403'), t('预设 UA 透传客户端，不要改成固定 UA 或平台标识'), 'https://www.kimi.com/help/kimi-code/membership-guide'],
-  [t('Claude Code（作为调用方）'), t('发给网关的请求带 x-claude-code-session-id（当前会话的唯一 ID，v2.1.86 起），以及 anthropic-version、anthropic-beta'), t('默认透传；OpenCode Go 预设用它作为会话 ID，比按消息计算的 $conversation 更准（压缩上下文后也不变）'), 'https://code.claude.com/docs/en/llm-gateway-protocol'],
+  [t('Claude Code（作为调用方）'), t('发给网关的请求带 x-claude-code-session-id（当前会话的唯一 ID，v2.1.86 起），以及 anthropic-version、anthropic-beta'), t('默认透传；没有 X-Session-Id 时网关用它作为会话 ID（$session），比按消息计算更准（压缩上下文后也不变）'), 'https://code.claude.com/docs/en/llm-gateway-protocol'],
   [t('Anthropic 及兼容端点'), t('anthropic-version 必填（目前是 2023-06-01）；beta 功能用 anthropic-beta，多个用逗号分隔'), t('调用方带了就透传，没带补 2023-06-01；鉴权同时发 x-api-key 和 Authorization: Bearer'), 'https://platform.claude.com/docs/en/api/versioning'],
   ['OpenRouter', t('可选的应用标识：HTTP-Referer（应用网址，没有它不会生成应用页）、X-OpenRouter-Title（应用名，旧名 X-Title 仍兼容），用于在 OpenRouter 的排行和统计里显示你的应用'), t('需要的话在自定义请求头里写固定值；费用直接取响应里的 usage.cost'), 'https://openrouter.ai/docs/app-attribution'],
 ];
@@ -1853,7 +1861,8 @@ function headerDocsHTML() {
       <div class="kv" style="margin-top:8px">
         <div class="k">${t('鉴权')}</div><div>${t('<code>Authorization: Bearer sk-route-…</code> 或 <code>x-api-key: sk-route-…</code>，两种都行。只用于网关鉴权，不会转给上游')}</div>
         <div class="k">${t('Anthropic 协议')}</div><div>${t('<code>anthropic-version</code>、<code>anthropic-beta</code> 照常带，上游也是 Anthropic 协议时透传')}</div>
-        <div class="k">${t('其他头')}</div><div>${t('默认原样转给上游（见第 2 段）。供应商要求的头（比如 OpenCode Go 的会话 ID）由调用方自己带，或者由平台按下面的规则生成')}</div>
+        <div class="k">${t('会话')}</div><div>${t('<code>X-Session-Id: 任意字符串</code>，可选。值相同的请求属于同一个会话（一次对话、一个 Agent 任务）：网关让它们在同级上游里固定走同一个，换成各家要求的会话字段（比如 OpenCode Go 的 <code>x-opencode-session</code>）发给上游，并记在请求日志里，可以按会话筛选。调用方不用关心各家供应商的会话头。没带时依次认 Claude Code 的 <code>x-claude-code-session-id</code>、Codex 的 <code>session-id</code>、<code>x-opencode-session</code>，都没有就按第一条用户消息区分会话')}</div>
+        <div class="k">${t('其他头')}</div><div>${t('默认原样转给上游（见第 2 段）。供应商要求的头由平台按下面的规则生成，调用方不用自己带')}</div>
       </div>
     </details>
     <details>

@@ -641,6 +641,12 @@ CREATE INDEX IF NOT EXISTS idx_logs_key ON request_logs(key_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_stats_user ON request_stats(user_id, hour);`)); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("request_logs", "session_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(s.db.ddl(`CREATE INDEX IF NOT EXISTS idx_logs_session ON request_logs(session_id, created_at);`)); err != nil {
+		return err
+	}
 	if err := s.migrateOpenCodeSession(); err != nil {
 		return err
 	}
@@ -659,20 +665,21 @@ CREATE INDEX IF NOT EXISTS idx_stats_user ON request_stats(user_id, hour);`)); e
 }
 
 // OpenCodeSessionHeader is the OpenCode Go preset's session header value:
-// the caller's own session id, else Claude Code's (x-claude-code-session-id)
-// or Codex's (session-id) native one, else one generated per conversation.
-const OpenCodeSessionHeader = "{{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}"
+// the gateway's session id ($session: from the caller's X-Session-Id or its
+// client's native session header, else one generated per conversation).
+const OpenCodeSessionHeader = "{{$session}}"
 
 // earlier values of the preset's session header, replaced on startup
 var oldOpenCodeSessionHeaders = map[string]bool{
 	"ai-route": true, // one fixed id for all traffic
-	"{{header.x-opencode-session ?? $conversation}}":                                    true,
-	"{{header.x-opencode-session ?? header.x-claude-code-session-id ?? $conversation}}": true,
+	"{{header.x-opencode-session ?? $conversation}}":                                                         true,
+	"{{header.x-opencode-session ?? header.x-claude-code-session-id ?? $conversation}}":                      true,
+	"{{header.x-opencode-session ?? header.x-claude-code-session-id ?? header.session-id ?? $conversation}}": true,
 }
 
 // migrateOpenCodeSession replaces earlier OpenCode Go session header values
-// (a fixed id for all traffic, then a template without Claude Code's id)
-// with the current template; values the user wrote are left alone.
+// (a fixed id for all traffic, then templates reading the callers' session
+// headers one by one) with the current template; values the user wrote are left alone.
 func (s *Store) migrateOpenCodeSession() error {
 	rows, err := s.db.Query(`SELECT id, headers FROM providers WHERE vendor = 'opencode-go'`)
 	if err != nil {
