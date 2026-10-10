@@ -1450,18 +1450,20 @@ function keyForm(k, models, st) {
 
 // ---------------------------------------------------------------- logs
 const logFilter = { model: '', provider: '', status: '', fallback: false, offset: 0, limit: 50 };
+let logsLoading = false;
 async function pageLogs() {
   const qs = new URLSearchParams({ model: logFilter.model, provider: logFilter.provider, status: logFilter.status, fallback: logFilter.fallback ? '1' : '', offset: logFilter.offset, limit: logFilter.limit });
-  const [data, models, providers, caps] = await Promise.all([api('GET', '/logs?' + qs), api('GET', '/models'), api('GET', '/providers'), api('GET', '/captures')]);
+  const [data, models, providers, caps] = await (async () => { logsLoading = true; try { return await Promise.all([
+    api('GET', '/logs?' + qs), api('GET', '/models'), api('GET', '/providers'), api('GET', '/captures'),
+  ]); } finally { logsLoading = false; } })();
+  if (!location.hash.startsWith('#/logs')) return; // navigated away while loading
   const items = data.items;
   const capByReq = {};
   for (const c of caps.items) capByReq[c.request_id] = c.id;
-  const activeRules = caps.rules.filter((r) => r.remaining > 0 && r.expires_at > Date.now());
+  const rules = captureRuleViews(caps);
   $('#page').innerHTML = `
     ${head(t('请求日志'), t('共 {n} 条 · 点击行查看每次尝试的详情', { n: data.total }), `<button class="btn" id="log-capture">${t('抓取报文')}</button><button class="btn" id="log-refresh">${t('刷新')}</button>`)}
-    ${activeRules.length ? `<div class="card"><div class="card-body form">${activeRules.map((r) => `<div class="toolbar small"><span class="badge warn">${t('抓取中')}</span>
-      ${esc(captureScope(r))} · ${t('已抓 {done} / {total} 条，{left} 后结束', { done: r.total - r.remaining, total: r.total, left: fmtSecs(Math.round((r.expires_at - Date.now()) / 1000)) })}
-      <button class="btn sm" data-stop-rule="${r.id}">${t('停止')}</button></div>`).join('')}</div></div>` : ''}
+    ${rules.length ? `<div class="card"><div class="card-body form">${rules.map(captureRuleRow).join('')}</div></div>` : ''}
     <div class="card">
       <div class="card-head" style="font-weight:400">
         <div class="toolbar">
@@ -1498,7 +1500,7 @@ async function pageLogs() {
   $('#log-capture').onclick = () => captureForm(models, caps);
   $$('[data-stop-rule]').forEach((b) => b.onclick = async () => {
     await api('DELETE', '/captures/rules/' + b.dataset.stopRule);
-    toast(t('已停止抓取'), 'ok');
+    toast(b.dataset.ended ? t('已关闭') : t('已停止抓取'), 'ok');
     route();
   });
   if ($('#lp-prev')) {
@@ -1506,6 +1508,12 @@ async function pageLogs() {
     $('#lp-next').onclick = () => { logFilter.offset += logFilter.limit; route(); };
   }
   $$('tr.clickable').forEach((tr) => tr.onclick = () => { const l = items[Number(tr.dataset.i)]; logDetail(l, capByReq[l.request_id]); });
+  // while a capture is running, refresh in place (no loading placeholder, so
+  // the scroll position stays); skip a tick while a dialog is open
+  clearInterval(refreshTimer);
+  if (rules.some((v) => v.state !== 'ended')) {
+    refreshTimer = setInterval(() => { if (!$('.modal-bg') && location.hash.startsWith('#/logs') && !logsLoading) pageLogs().catch(() => {}); }, 5000);
+  }
 }
 
 function logDetail(l, captureId) {
@@ -1539,6 +1547,39 @@ function logDetail(l, captureId) {
 function captureScope(r) {
   const key = r.key_id ? r.key_name || `#${r.key_id}` : t('全部 Key');
   return `${key} · ${r.model || t('全部模型')}`;
+}
+
+// how long after a rule's end the console still waits for its running
+// requests (a capture is lost if the gateway restarts mid-request)
+const CAPTURE_GRACE_MS = 30 * 60 * 1000;
+
+// captureRuleViews pairs each rule with its progress. A request takes its
+// slot when it starts but its capture is saved only when it ends, so a rule
+// can be used up while its last requests are still running.
+function captureRuleViews(caps, now = Date.now()) {
+  const saved = {};
+  for (const c of caps.items) saved[c.rule_id] = (saved[c.rule_id] || 0) + 1;
+  return caps.rules.map((r) => {
+    const done = saved[r.id] || 0;
+    const running = Math.max(0, r.total - r.remaining - done);
+    let state = 'ended';
+    if (r.remaining > 0 && r.expires_at > now) state = 'active';
+    else if (running > 0 && now < r.expires_at + CAPTURE_GRACE_MS) state = 'finishing';
+    return { r, saved: done, running, state };
+  });
+}
+
+function captureRuleRow({ r, saved, running, state }) {
+  const left = fmtSecs(Math.round((r.expires_at - Date.now()) / 1000));
+  const badge = { active: `<span class="badge warn">${t('抓取中')}</span>`, finishing: `<span class="badge warn">${t('收尾中')}</span>`, ended: `<span class="badge ok">${t('已结束')}</span>` }[state];
+  const text = {
+    active: t('已保存 {saved} · 进行中 {running} · 待抓 {left} 条，{time} 后结束', { saved, running, left: r.remaining, time: left }),
+    finishing: t('名额已满，已保存 {saved} 条，还有 {running} 条请求未结束', { saved, running }),
+    ended: t('已保存 {saved} / {total} 条', { saved, total: r.total }),
+  }[state];
+  const btn = state === 'ended' ? `<button class="btn sm" data-stop-rule="${r.id}" data-ended="1">${t('关闭')}</button>`
+    : state === 'active' ? `<button class="btn sm" data-stop-rule="${r.id}">${t('停止')}</button>` : '';
+  return `<div class="toolbar small">${badge} ${esc(captureScope(r))} · ${text} ${btn}</div>`;
 }
 
 async function captureForm(models, caps) {
