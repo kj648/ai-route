@@ -133,6 +133,25 @@ Without `ADMIN_TOKEN`, the first start generates an `admin-xxxx` token, prints i
 | `LOG_FORMAT` | `text` | Log format; `json` for log collectors |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
+### Prebuilt image (GHCR)
+
+Every release (a pushed `v*` tag) builds `linux/amd64` and `linux/arm64` images and pushes `ghcr.io/kj648/ai-route:<tag>` and `:latest`:
+
+```bash
+docker run -d --name ai-route -p 8080:8080 -v ai-route-data:/data \
+  -e ADMIN_TOKEN=$(openssl rand -hex 24) ghcr.io/kj648/ai-route:latest
+```
+
+The container contract, which orchestration and deploy scripts can rely on:
+
+| Item | Contract |
+|---|---|
+| Port | listens on `8080` (change with `LISTEN`) |
+| Data | SQLite data directory `/data`: a volume or host directory writable by the container user (uid `10001`); not needed with PostgreSQL |
+| Configuration | environment variables only: `ADMIN_TOKEN`, `SECRET_KEY`, `DATABASE_URL`, `TRUSTED_PROXIES`, `LISTEN`; the others are in the table above |
+| Health check | `GET /healthz`, no authentication: 200 `ok`, or 503 when the database is unavailable. The image has `wget`, so compose can use `wget -qO- http://127.0.0.1:8080/healthz` |
+| Stop | on `SIGTERM` it stops taking new requests and waits up to 30 seconds for the running ones. `docker stop` waits only 10 seconds by default, so set `stop_grace_period: 30s` in compose |
+
 ### Five minutes to first request
 
 1. **Add a provider**: on *Providers*, click *Add provider*, pick a preset (e.g. OpenRouter or Kimi Code) and enter the key. The model list is fetched from the upstream; if that is not supported, type the model names.

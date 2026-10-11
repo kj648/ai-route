@@ -28,6 +28,7 @@ services:
         ALPINE_MIRROR: ${ALPINE_MIRROR:-}
     image: ai-route:latest
     restart: unless-stopped
+    stop_grace_period: 30s
     deploy:
       replicas: 3
     environment:

@@ -133,6 +133,25 @@ ADMIN_TOKEN=换成你的令牌 ./bin/ai-route                # 默认监听 :808
 | `LOG_FORMAT` | `text` | 日志格式，`json` 便于接入日志系统 |
 | `LOG_LEVEL` | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
 
+### 方式三：预构建镜像（GHCR）
+
+每次发布（推送 `v*` tag）都会构建 `linux/amd64` 和 `linux/arm64` 镜像，推到 `ghcr.io/kj648/ai-route:<tag>` 和 `:latest`：
+
+```bash
+docker run -d --name ai-route -p 8080:8080 -v ai-route-data:/data \
+  -e ADMIN_TOKEN=$(openssl rand -hex 24) ghcr.io/kj648/ai-route:latest
+```
+
+容器约定，编排和部署脚本可以依赖：
+
+| 项 | 约定 |
+|---|---|
+| 端口 | 监听 `8080`（`LISTEN` 可改） |
+| 数据 | SQLite 数据目录 `/data`，挂卷或宿主机目录（容器内用户 uid `10001`，目录要对它可写）；用 PostgreSQL 时不需要 |
+| 配置 | 全部走环境变量：`ADMIN_TOKEN`、`SECRET_KEY`、`DATABASE_URL`、`TRUSTED_PROXIES`、`LISTEN`，其余见上表 |
+| 健康检查 | `GET /healthz`，不需要鉴权；正常返回 200 `ok`，数据库不可用时返回 503。镜像里有 `wget`，compose 可以写 `wget -qO- http://127.0.0.1:8080/healthz` |
+| 停止 | 收到 `SIGTERM` 后不再接新请求，最多等 30 秒让进行中的请求结束。`docker stop` 默认只等 10 秒，compose 里请设置 `stop_grace_period: 30s` |
+
 ### 五分钟上手
 
 1. **添加供应商**：在“供应商”页面点“添加供应商”，选一个预设（比如 Kimi Code），填上 Key。模型列表会自动从上游拉取，拉不到就手动输入。

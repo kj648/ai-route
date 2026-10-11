@@ -11,6 +11,8 @@ services:
     image: ai-route:latest
     container_name: ai-route
     restart: unless-stopped
+    # the gateway waits up to 30 s for running requests on SIGTERM
+    stop_grace_period: 30s
     ports:
       - "8080:8080"
     environment:
