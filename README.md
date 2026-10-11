@@ -574,12 +574,13 @@ docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # 调整
 - **PR guard**（`.github/workflows/pr-guard.yml`）：PR 的作者没有写权限，或者改动了 workflow、Dockerfile、compose、`go.mod` / `go.sum`、`deploy/`、`scripts/` 时，必须由维护者加上 `reviewed` 标签才能通过。之后再有新提交，标签会被自动摘掉，需要重新审查。它用 `pull_request_target` 运行，执行的是 main 上的版本，PR 改不了它；它也从不检出或运行 PR 的代码。
 - **发布检查**：tag 指向的提交必须已经在 main 上，并且在这个提交上 CI 通过了，否则不构建。运行摘要会列出距上一个版本的全部提交和作者，并标出敏感文件的改动。
 - **部署审批**：调用 webhook 的 job 在 `production` 环境里运行，需要审批人在 Actions 页面看过摘要、点了批准才会执行。
+- **代码扫描**（`.github/workflows/security.yml`）：每个 PR 的每次提交、main 和每周一次自动扫描。CodeQL 静态分析 Go 代码、控制台 JavaScript 和 workflow 本身；govulncheck 检查 Go 依赖和标准库里实际被调用到的已知漏洞；dependency-review 拦住引入有漏洞依赖的 PR。扫描能发现危险写法和有漏洞的依赖，但发现不了伪装成正常代码的蓄意后门，所以仍然需要上面的人工审查和部署审批。
 - **依赖固定**：所有 action 都按提交 SHA 固定，Dependabot 每周提更新 PR，这些 PR 同样要过 PR guard。
 
 这些检查要配合 GitHub 上的设置才能生效（Settings 里配置）：
 
 1. **Environments → 新建 `production`**：Required reviewers 填自己；Deployment branches and tags 选 Selected，只允许 tag `v*`；把 `DEPLOY_WEBHOOK_SECRET`（以及可选的 `DEPLOY_WEBHOOK_URL`）放到这个环境里，**删掉仓库级的同名 Secret**。只有经过审批的部署 job 才能读到它。
-2. **Rules → 给 `main` 建分支规则**：要求通过 PR 合并，必需的状态检查选 `test`、`postgres (12)`、`postgres (17)`、`guard`；禁止强推和删除。自己直接推送 main 的话，把仓库管理员加到 bypass 列表里。
+2. **Rules → 给 `main` 建分支规则**：要求通过 PR 合并，必需的状态检查选 `test`、`postgres (12)`、`postgres (17)`、`guard`、`govulncheck`、`dependency-review`；再加一条 Require code scanning results（工具 CodeQL，高危及以上的安全告警阻止合并）；禁止强推和删除。自己直接推送 main 的话，把仓库管理员加到 bypass 列表里。
 3. **Rules → 给 tag `v*` 建规则**：限制创建、更新和删除，只有管理员（bypass 列表）能打发布 tag。
 4. **Actions → General**：外部贡献者的 PR 运行 workflow 需要审批（Require approval for all external contributors）；Workflow permissions 选只读，不允许 Actions 创建或批准 PR。
 5. **Labels**：新建 `reviewed` 标签。
