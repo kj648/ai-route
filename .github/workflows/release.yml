@@ -4,6 +4,18 @@ name: Release
 # Dockerfile, pushes ghcr.io/<owner>/ai-route:<tag> and :latest, then calls
 # the deploy webhook. Run it by hand (Actions → Release → Run workflow) to
 # build an existing tag, e.g. one pushed before this workflow existed.
+#
+# Guard rails against shipping code nobody looked at:
+# - verify: the tagged commit must be on main and have passed CI; the run
+#   summary lists every commit since the previous release and flags changes
+#   to workflows, the build and dependencies.
+# - deploy: runs in the "production" environment. Give it required
+#   reviewers and keep DEPLOY_WEBHOOK_SECRET there (not as a repository
+#   secret), so no deploy happens without someone approving it after
+#   reading that summary. See README "发布与部署安全".
+#
+# Actions are pinned to commit SHAs (tag in the comment); Dependabot
+# proposes updates.
 
 on:
   push:
@@ -18,13 +30,11 @@ on:
         type: boolean
         default: true
       deploy:
-        description: Call the deploy webhook
+        description: Call the deploy webhook (still needs approval)
         type: boolean
         default: true
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -34,64 +44,144 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/ai-route
 
 jobs:
-  image:
+  verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.rel.outputs.tag }}
+      sha: ${{ steps.rel.outputs.sha }}
     steps:
       # a manual run builds the tag, not main: the revision label and the
       # webhook's sha must be the tag's commit or the server rejects the deploy
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
-      - name: Resolve release
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the tagged commit
         id: rel
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
-          LATEST: ${{ github.event_name == 'push' || inputs.latest }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           sha=$(git rev-parse HEAD)
-          tags="$IMAGE:$TAG"
-          if [ "$LATEST" = true ]; then tags="$tags,$IMAGE:latest"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "building $TAG at $sha → $tags"
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+
+          # only reviewed history ships: a tag on a branch or a PR head is refused
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::$TAG ($sha) is not on main; only commits on main are released"
+            exit 1
+          fi
+
+          # CI must have passed on this exact commit (waits while it runs)
+          for i in $(seq 1 60); do
+            runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$sha" --json status,conclusion)
+            if echo "$runs" | jq -e 'any(.[]; .conclusion == "success")' > /dev/null; then
+              echo "CI passed on $sha"
+              break
+            fi
+            if echo "$runs" | jq -e 'length > 0 and all(.[]; .status == "completed")' > /dev/null; then
+              echo "::error::CI did not pass on $sha"
+              exit 1
+            fi
+            if [ "$i" = 60 ]; then
+              echo "::error::no successful CI run for $sha after 30 minutes"
+              exit 1
+            fi
+            sleep 30
+          done
+      - name: Summarize changes since the previous release
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+          SHA: ${{ steps.rel.outputs.sha }}
+        run: |
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$SHA^" 2>/dev/null || true)
+          range=${prev:+$prev..}$SHA
+          {
+            echo "## $TAG ($SHA)"
+            echo
+            echo "Changes since ${prev:-the first commit}. Read this before approving the deploy."
+            echo
+            echo "### Commits"
+            git log --no-merges --format='- `%h` %s — %an <%ae>' "$range"
+            echo
+            echo "### Sensitive files"
+            sensitive=$(git diff --name-only ${prev:+"$prev"} "$SHA" -- .github Dockerfile 'docker-compose*.yml' go.mod go.sum deploy scripts main.go 2>/dev/null || true)
+            if [ -n "$sensitive" ]; then
+              echo "⚠️ Workflows, build or dependencies changed; review these diffs:"
+              echo
+              echo "$sensitive" | sed 's/^/- `/; s/$/`/'
+            else
+              echo "None changed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  image:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image tags
+        id: tags
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+          LATEST: ${{ github.event_name == 'push' || inputs.latest }}
+        run: |
+          tags="$IMAGE:$TAG"
+          if [ "$LATEST" = true ]; then tags="$tags,$IMAGE:latest"; fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.rel.outputs.tags }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.rel.outputs.tag }}
-            org.opencontainers.image.revision=${{ steps.rel.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.verify.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Deploy webhook, shared with ppt-agent: POST {service, tag, sha} signed
-      # with HMAC-SHA256(secret, "<timestamp>.<body>"); 202 = accepted.
+  # Deploy webhook, shared with ppt-agent: POST {service, tag, sha} signed
+  # with HMAC-SHA256(secret, "<timestamp>.<body>"); 202 = accepted.
+  deploy:
+    needs: [verify, image]
+    if: github.event_name == 'push' || inputs.deploy
+    runs-on: ubuntu-latest
+    environment: production
+    permissions: {}
+    steps:
       - name: Trigger deploy
-        if: github.event_name == 'push' || inputs.deploy
         env:
           URL: ${{ secrets.DEPLOY_WEBHOOK_URL || 'https://ppt.intra.starlove.top/hooks/deploy' }}
           SECRET: ${{ secrets.DEPLOY_WEBHOOK_SECRET }}
-          TAG: ${{ steps.rel.outputs.tag }}
-          SHA: ${{ steps.rel.outputs.sha }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          SHA: ${{ needs.verify.outputs.sha }}
         run: |
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::notice::$TAG is not a release tag (vX.Y.Z); image pushed, deploy skipped"
             exit 0
           fi
           if [ -z "$SECRET" ]; then
-            echo "::error::repository secret DEPLOY_WEBHOOK_SECRET is not set"
+            echo "::error::DEPLOY_WEBHOOK_SECRET is not set in the production environment"
             exit 1
           fi
           body=$(printf '{"service":"ai-route","tag":"%s","sha":"%s"}' "$TAG" "$SHA")

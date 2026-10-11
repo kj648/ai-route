@@ -567,6 +567,23 @@ docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # 调整
 - **备份与迁移**：“设置与接入”里可以导出 / 导入全部配置（JSON，包含上游 Key，请妥善保管；设置了 `SECRET_KEY` 时导出的是密文）。
 - **实例数**：使用 SQLite 时只能运行一个实例；使用 PostgreSQL 时可以运行多个，见[多实例部署](#多实例部署)。重启后熔断状态清空（多实例时从其他实例同步），本月费用从日志重新统计。
 
+### 发布与部署安全
+
+推送 `v*` tag 会构建镜像并调用部署 webhook，所以一个没被注意到就合并的恶意 PR 有可能一路走到服务器上。仓库里的 workflow 分几层把关：
+
+- **PR guard**（`.github/workflows/pr-guard.yml`）：PR 的作者没有写权限，或者改动了 workflow、Dockerfile、compose、`go.mod` / `go.sum`、`deploy/`、`scripts/` 时，必须由维护者加上 `reviewed` 标签才能通过。之后再有新提交，标签会被自动摘掉，需要重新审查。它用 `pull_request_target` 运行，执行的是 main 上的版本，PR 改不了它；它也从不检出或运行 PR 的代码。
+- **发布检查**：tag 指向的提交必须已经在 main 上，并且在这个提交上 CI 通过了，否则不构建。运行摘要会列出距上一个版本的全部提交和作者，并标出敏感文件的改动。
+- **部署审批**：调用 webhook 的 job 在 `production` 环境里运行，需要审批人在 Actions 页面看过摘要、点了批准才会执行。
+- **依赖固定**：所有 action 都按提交 SHA 固定，Dependabot 每周提更新 PR，这些 PR 同样要过 PR guard。
+
+这些检查要配合 GitHub 上的设置才能生效（Settings 里配置）：
+
+1. **Environments → 新建 `production`**：Required reviewers 填自己；Deployment branches and tags 选 Selected，只允许 tag `v*`；把 `DEPLOY_WEBHOOK_SECRET`（以及可选的 `DEPLOY_WEBHOOK_URL`）放到这个环境里，**删掉仓库级的同名 Secret**。只有经过审批的部署 job 才能读到它。
+2. **Rules → 给 `main` 建分支规则**：要求通过 PR 合并，必需的状态检查选 `test`、`postgres (12)`、`postgres (17)`、`guard`；禁止强推和删除。自己直接推送 main 的话，把仓库管理员加到 bypass 列表里。
+3. **Rules → 给 tag `v*` 建规则**：限制创建、更新和删除，只有管理员（bypass 列表）能打发布 tag。
+4. **Actions → General**：外部贡献者的 PR 运行 workflow 需要审批（Require approval for all external contributors）；Workflow permissions 选只读，不允许 Actions 创建或批准 PR。
+5. **Labels**：新建 `reviewed` 标签。
+
 ### 密钥加密
 
 设置环境变量 `SECRET_KEY`（至少 16 个字符，可以用 `openssl rand -hex 32` 生成）后重启，网关会用 AES-256-GCM 加密数据库里的上游 Key、告警 Webhook 地址与签名密钥、抓取的报文；已有的明文值在启动时自动加密。没有它，拿到数据库文件或 `pg_dump` 的人就拿到了所有套餐的 Key。

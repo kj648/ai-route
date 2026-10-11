@@ -567,6 +567,23 @@ docker compose -f docker-compose.cluster.yml up -d --scale ai-route=5   # change
 - **Backup and migration**: *Settings* can export and import the whole configuration (JSON, including upstream keys — keep it safe; with `SECRET_KEY` set they are exported encrypted).
 - **Instances**: with SQLite run a single instance; with PostgreSQL you can run several, see [Multi-instance deployment](#multi-instance-deployment). After a restart breakers start fresh (or sync from the other instances) and the month's spend is recomputed from the logs.
 
+### Release and deploy safety
+
+Pushing a `v*` tag builds the image and calls the deploy webhook, so a malicious pull request merged without anyone noticing could reach the server. The workflows guard this in layers:
+
+- **PR guard** (`.github/workflows/pr-guard.yml`): a pull request from someone without write access, or one that changes workflows, the Dockerfile, compose files, `go.mod` / `go.sum`, `deploy/` or `scripts/`, passes only after a maintainer adds the `reviewed` label. New commits remove the label again, so it needs another review. It runs on `pull_request_target`, i.e. the version on main, so a pull request cannot change it, and it never checks out or runs the pull request's code.
+- **Release checks**: the tagged commit must already be on main and have passed CI, or nothing is built. The run summary lists every commit and author since the previous release and flags changes to sensitive files.
+- **Deploy approval**: the job that calls the webhook runs in the `production` environment and waits until a reviewer approves it on the Actions page after reading that summary.
+- **Pinned dependencies**: every action is pinned to a commit SHA; Dependabot opens weekly update pull requests, which go through the PR guard too.
+
+These checks only work together with the repository settings:
+
+1. **Environments → create `production`**: add yourself as a required reviewer; under deployment branches and tags allow only tags `v*`; put `DEPLOY_WEBHOOK_SECRET` (and the optional `DEPLOY_WEBHOOK_URL`) in this environment and **delete the repository-level secret of the same name**, so only approved deploy jobs can read it.
+2. **Rules → a branch ruleset for `main`**: require a pull request, require the status checks `test`, `postgres (12)`, `postgres (17)` and `guard`, block force pushes and deletion. If you push to main yourself, add the repository admin role to the bypass list.
+3. **Rules → a tag ruleset for `v*`**: restrict creation, updates and deletion so only admins (the bypass list) can tag releases.
+4. **Actions → General**: require approval for workflow runs from all external contributors; set workflow permissions to read-only and do not allow Actions to create or approve pull requests.
+5. **Labels**: create the `reviewed` label.
+
 ### Secret encryption
 
 Set `SECRET_KEY` (at least 16 characters, e.g. `openssl rand -hex 32`) and restart: the gateway then encrypts upstream keys, alert webhook URLs and signing secrets, and captured requests in the database with AES-256-GCM. Values stored in plain text before are encrypted on start. Without it, anyone holding the database file or a `pg_dump` holds every plan's key.

@@ -1,0 +1,88 @@
+name: PR guard
+
+# A pull request needs the "reviewed" label from a maintainer before it can
+# pass this check when it
+#   - comes from someone without write access, or
+#   - changes workflows, the build or dependencies (.github/, Dockerfile,
+#     compose files, go.mod / go.sum, deploy/, scripts/).
+# Commits pushed after the label was added remove it again, so what was
+# reviewed is what gets merged. Make "guard" a required status check on
+# main (README "发布与部署安全").
+#
+# pull_request_target runs this file as it is on main, so a pull request
+# cannot edit the guard to pass itself. It must never check out or run the
+# pull request's code: it only reads the PR's metadata through the API.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: pr-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # read the file list, remove a stale label
+    steps:
+      - name: Check review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          ASSOC: ${{ github.event.pull_request.author_association }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels) }}
+          LABEL: reviewed
+        run: |
+          reasons=()
+          case "$ASSOC" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *) reasons+=("author @$AUTHOR has no write access ($ASSOC)") ;;
+          esac
+          # fail closed: without the file list nothing can be judged
+          if ! files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename') || [ -z "$files" ]; then
+            echo "::error::could not list the pull request's files"
+            exit 1
+          fi
+          sensitive=$(printf '%s\n' "$files" | grep -E '^(\.github/|Dockerfile$|\.dockerignore$|docker-compose[^/]*\.ya?ml$|go\.(mod|sum)$|deploy/|scripts/)' || true)
+          if [ -n "$sensitive" ]; then
+            reasons+=("changes workflows, the build or dependencies")
+          fi
+
+          labeled=no
+          if jq -e --arg l "$LABEL" 'any(.[]; .name == $l)' <<< "$LABELS" > /dev/null; then labeled=yes; fi
+          # a label added before the latest push reviewed other code
+          if [ "$ACTION" = synchronize ] && [ "$labeled" = yes ]; then
+            gh api -X DELETE "repos/$REPO/issues/$PR/labels/$LABEL" > /dev/null || true
+            labeled=no
+            echo "::warning::new commits after review: the \"$LABEL\" label was removed"
+          fi
+
+          {
+            echo "## PR guard"
+            if [ ${#reasons[@]} -eq 0 ]; then
+              echo "No extra review needed."
+            else
+              echo "Needs the \`$LABEL\` label from a maintainer because it:"
+              printf -- '- %s\n' "${reasons[@]}"
+              if [ -n "$sensitive" ]; then
+                echo
+                echo "Sensitive files:"
+                echo "$sensitive" | sed 's/^/- `/; s/$/`/'
+              fi
+              echo
+              echo "Label: **$labeled**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ${#reasons[@]} -gt 0 ] && [ "$labeled" != yes ]; then
+            printf '::error::needs the "%s" label from a maintainer: %s\n' "$LABEL" "$(IFS=';'; echo "${reasons[*]}")"
+            exit 1
+          fi
